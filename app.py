@@ -1,0 +1,1702 @@
+import streamlit as st
+import pandas as pd
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+from src.agent.vetting_agent import VettingAgent
+from src.search.grouped_search import group_establishments, SearchResultSet, GroupedCompanyResult
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  PAGE CONFIG
+# ═══════════════════════════════════════════════════════════════════════ #
+st.set_page_config(
+    page_title="Manufacturer Compliance Intelligence",
+    page_icon="🛡️",
+    layout="wide",
+)
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  AGENT + SESSION STATE
+# ═══════════════════════════════════════════════════════════════════════ #
+@st.cache_resource
+def get_vetting_agent():
+    return VettingAgent()
+
+vetting_agent = get_vetting_agent()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "assessment" not in st.session_state:
+    st.session_state.assessment = None
+# Grouped search state
+if "search_term" not in st.session_state:
+    st.session_state.search_term = ""
+if "search_results" not in st.session_state:
+    st.session_state.search_results = None       # SearchResultSet | None
+if "selected_groups" not in st.session_state:
+    st.session_state.selected_groups = []        # List[GroupedCompanyResult] — ordered
+if "selected_group_keys" not in st.session_state:
+    st.session_state.selected_group_keys = set() # set of parent_name for O(1) lookup
+if "analysis_scope" not in st.session_state:
+    st.session_state.analysis_scope = "all"      # "all" | "one" | "custom"
+if "selected_facility_names" not in st.session_state:
+    st.session_state.selected_facility_names = []
+if "multi_group_scope" not in st.session_state:
+    st.session_state.multi_group_scope = "all"  # "all" | "custom"
+
+@st.cache_data
+def _cached_company_names():
+    return vetting_agent.get_all_company_names()
+
+all_companies = _cached_company_names()
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  GLOBAL CSS
+# ═══════════════════════════════════════════════════════════════════════ #
+st.markdown("""
+<style>
+/* ---- Base ---------------------------------------------------------------- */
+html, body { background: #EFF2F7 !important; }
+[data-testid="stAppViewContainer"] > .main { background: #EFF2F7 !important; }
+.block-container {
+    padding: 1.6rem 2.4rem 4rem 2.4rem !important;
+    max-width: 1320px !important;
+}
+
+/* ---- Sidebar ------------------------------------------------------------- */
+[data-testid="stSidebar"] {
+    background: #FFFFFF !important;
+    border-right: 1px solid #DDE4EF !important;
+}
+[data-testid="stSidebar"] .block-container {
+    padding: 1.6rem 1.2rem !important;
+    max-width: none !important;
+}
+
+/* ---- Typography ---------------------------------------------------------- */
+h2 { color: #0F2240 !important; font-size: 1.1rem !important; font-weight: 700 !important; }
+h3 { color: #2A4A6E !important; font-size: 0.96rem !important; font-weight: 600 !important; }
+
+/* ---- Inputs -------------------------------------------------------------- */
+.stTextInput > div > div > input {
+    border-radius: 9px !important;
+    border-color: #C8D5E4 !important;
+    padding: 0.58rem 0.9rem !important;
+    font-size: 0.9rem !important;
+    background: #FAFCFF !important;
+}
+.stTextInput > div > div > input:focus {
+    border-color: #1D5A8E !important;
+    box-shadow: 0 0 0 3px rgba(29,90,142,0.11) !important;
+}
+.stSelectbox > div > div { border-radius: 9px !important; }
+.stMultiSelect > div > div { border-radius: 9px !important; }
+
+/* ---- Primary button ------------------------------------------------------ */
+.stButton > button[kind="primary"] {
+    background: #1D5A8E !important;
+    border: none !important;
+    color: #FFFFFF !important;
+    border-radius: 10px !important;
+    padding: 0.6rem 1.4rem !important;
+    font-weight: 700 !important;
+    font-size: 0.88rem !important;
+    width: 100% !important;
+    transition: background 0.18s ease !important;
+}
+.stButton > button[kind="primary"]:hover { background: #144572 !important; }
+.stButton > button:not([kind="primary"]) {
+    border-radius: 9px !important;
+    border-color: #C5D3E3 !important;
+    color: #2D4A6E !important;
+    font-weight: 600 !important;
+}
+
+/* ---- Metric cards -------------------------------------------------------- */
+[data-testid="metric-container"] {
+    background: #FFFFFF !important;
+    border: 1px solid #DDE4EF !important;
+    border-radius: 12px !important;
+    padding: 1.1rem 1.2rem !important;
+    box-shadow: 0 1px 5px rgba(20,50,100,0.07) !important;
+}
+[data-testid="stMetricLabel"] {
+    color: #6B7E99 !important;
+    font-size: 0.72rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.6px !important;
+}
+[data-testid="stMetricValue"] {
+    color: #0F2240 !important;
+    font-size: 1.65rem !important;
+    font-weight: 800 !important;
+}
+
+/* ---- Bordered containers ------------------------------------------------- */
+[data-testid="stContainer"] { border-radius: 14px !important; }
+
+/* ---- Expanders ----------------------------------------------------------- */
+[data-testid="stExpander"] {
+    border: 1px solid #DDE4EF !important;
+    border-radius: 10px !important;
+    background: #FAFBFD !important;
+}
+
+/* ---- Dividers ------------------------------------------------------------ */
+hr { border-color: #E0E8F0 !important; margin: 1.4rem 0 !important; }
+
+/* ---- Alerts -------------------------------------------------------------- */
+[data-testid="stAlert"] { border-radius: 8px !important; font-size: 0.87rem !important; }
+
+/* ---- Search: company group cards ---------------------------------------- */
+.vc-group-card {
+    background:#FFFFFF;
+    border:1px solid #DDE4EF;
+    border-radius:13px;
+    padding:16px 18px;
+    margin-bottom:8px;
+    transition:border-color 0.15s ease,box-shadow 0.15s ease;
+    cursor:pointer;
+}
+.vc-group-card:hover {
+    border-color:#1D5A8E;
+    box-shadow:0 2px 8px rgba(29,90,142,0.13);
+}
+.vc-group-card.selected {
+    border-color:#1D5A8E;
+    box-shadow:0 0 0 3px rgba(29,90,142,0.12);
+    background:#F4F8FD;
+}
+.vc-badge {
+    display:inline-block;
+    padding:2px 9px;
+    border-radius:20px;
+    font-size:0.68rem;
+    font-weight:700;
+    letter-spacing:0.4px;
+}
+.vc-badge-high   { background:#D1F0DC; color:#1A6B3A; }
+.vc-badge-medium { background:#FEF3CD; color:#7A5500; }
+.vc-badge-low    { background:#EEF3FA; color:#2A4A6E; }
+.vc-badge-multi  { background:#EBF3FB; color:#1D5A8E; }
+.vc-facility-row {
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:9px 12px;
+    border-radius:8px;
+    margin-bottom:5px;
+    background:#FAFBFD;
+    border:1px solid #EEF2F8;
+    font-size:0.82rem;
+}
+.vc-scope-warning {
+    background:#FFF8E1;
+    border:1px solid #F3D77A;
+    border-radius:9px;
+    padding:10px 14px;
+    font-size:0.82rem;
+    color:#5C4A00;
+    margin-top:10px;
+}
+
+/* ---- Chat ---------------------------------------------------------------- */
+[data-testid="stChatMessage"] {
+    border-radius: 10px !important;
+    background: #F8FAFC !important;
+    border: 1px solid #E8EEF6 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  SVG LOGO
+# ═══════════════════════════════════════════════════════════════════════ #
+_LOGO_SVG = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 58" width="54" height="65">
+  <path d="M24 2 L46 10 L46 30 C46 44 36 53 24 57 C12 53 2 44 2 30 L2 10 Z"
+        fill="#C5DDF4" stroke="#5A9FD0" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M24 7 L41 14 L41 29 C41 40 33 48 24 52 C15 48 7 40 7 29 L7 14 Z"
+        fill="#EAF3FB" stroke="none"/>
+  <polyline points="15,28 22,36 33,20"
+            fill="none" stroke="#1D5A8E" stroke-width="3.4"
+            stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"""
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  SIDEBAR
+# ═══════════════════════════════════════════════════════════════════════ #
+def render_sidebar():
+    with st.sidebar:
+        st.markdown("""
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:1rem">
+            <span style="font-size:1.3rem">🛡️</span>
+            <span style="font-size:0.96rem;font-weight:700;color:#0F2240">Compliance Intel</span>
+        </div>
+        """, unsafe_allow_html=True)
+        st.divider()
+        st.markdown("**Data Source**")
+        st.caption("Source options for OSHA data retrieval.")
+        st.radio(
+            "Primary source",
+            ["Bulk cache (fast)", "Live API (fresh)"],
+            index=0,
+            label_visibility="collapsed",
+            key="sb_data_src",
+        )
+        st.divider()
+        st.markdown("**Advanced Filters**")
+        st.caption("Applied when running an assessment.")
+        st.slider("Inspection years back", 1, 15, 10, key="sb_year_range")
+        st.number_input("Min. inspections to score", min_value=1, max_value=20, value=1, key="sb_min_insp")
+        st.divider()
+        st.markdown("**Display**")
+        st.checkbox("Show raw feature vector", value=False, key="sb_show_raw")
+        st.divider()
+        with st.expander("⚙️ Debug"):
+            st.checkbox("Enable debug output", value=False, key="sb_debug")
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  HERO
+# ═══════════════════════════════════════════════════════════════════════ #
+def render_hero():
+    st.markdown(f"""
+    <div style="
+        background:#FFFFFF;
+        border:1px solid #DDE4EF;
+        border-radius:16px;
+        box-shadow:0 2px 10px rgba(15,40,90,0.08);
+        padding:26px 30px;
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:24px;
+        margin-bottom:18px;
+    ">
+        <div style="display:flex;align-items:flex-start;gap:18px;flex:1;min-width:0">
+            <div style="flex-shrink:0;margin-top:3px">{_LOGO_SVG}</div>
+            <div>
+                <div style="margin-bottom:8px">
+                    <span style="
+                        display:inline-block;
+                        background:#EBF3FB;
+                        color:#1D5A8E;
+                        font-size:0.67rem;
+                        font-weight:700;
+                        letter-spacing:0.8px;
+                        text-transform:uppercase;
+                        padding:3px 10px;
+                        border-radius:20px;
+                        border:1px solid #BED5EE;
+                    ">OSHA-Powered Risk Intelligence</span>
+                </div>
+                <h1 style="
+                    margin:0 0 7px 0;
+                    font-size:1.95rem;
+                    font-weight:800;
+                    color:#0F2240;
+                    letter-spacing:-0.5px;
+                    line-height:1.15;
+                ">Manufacturer Compliance Intelligence</h1>
+                <p style="
+                    margin:0;
+                    color:#6B7E99;
+                    font-size:0.88rem;
+                    line-height:1.55;
+                ">Evaluate OSHA inspection history, violation patterns, and injury risk for any US manufacturer<br>— powered by DOL public data and machine learning.</p>
+            </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;min-width:195px">
+            <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:#F4F7FB;border:1px solid #DDE4EF;border-radius:10px">
+                <span style="font-size:1rem">🔎</span>
+                <div>
+                    <div style="font-size:0.79rem;font-weight:700;color:#1A3558">Entity Resolution</div>
+                    <div style="font-size:0.71rem;color:#8FA4BC">Smart name + location matching</div>
+                </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:#F4F7FB;border:1px solid #DDE4EF;border-radius:10px">
+                <span style="font-size:1rem">📋</span>
+                <div>
+                    <div style="font-size:0.79rem;font-weight:700;color:#1A3558">Inspection History</div>
+                    <div style="font-size:0.71rem;color:#8FA4BC">Full OSHA violation timeline</div>
+                </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:#F4F7FB;border:1px solid #DDE4EF;border-radius:10px">
+                <span style="font-size:1rem">🤖</span>
+                <div>
+                    <div style="font-size:0.79rem;font-weight:700;color:#1A3558">Explainable Scoring</div>
+                    <div style="font-size:0.71rem;color:#8FA4BC">ML risk score with rationale</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  GROUPED SEARCH  — helper render functions
+# ═══════════════════════════════════════════════════════════════════════ #
+
+def _confidence_badge_html(label: str) -> str:
+    """Return an HTML badge span for High / Medium / Low confidence."""
+    css_class = {
+        "High":   "vc-badge-high",
+        "Medium": "vc-badge-medium",
+        "Low":    "vc-badge-low",
+    }.get(label, "vc-badge-low")
+    return f'<span class="vc-badge {css_class}">{label} confidence</span>'
+
+
+def _render_group_row(
+    group: GroupedCompanyResult,
+    key_suffix: str,
+    is_top: bool,
+    selected_keys: set,
+):
+    """
+    Render one group result row with a toggleable Add / Remove button.
+    Clicking the button adds the group to st.session_state.selected_groups
+    (or removes it if already present).
+    """
+    is_selected = group.parent_name in selected_keys
+    any_selected = bool(selected_keys)
+    n = group.total_facilities
+    badge = _confidence_badge_html(group.confidence_label)
+
+    box_bg     = "#F4F8FD" if is_selected else ("#FFFFFF" if is_top else "#FAFBFD")
+    box_border = "#1D5A8E" if is_selected else ("#DDE4EF" if is_top else "#EEF2F8")
+    pad        = "16px 18px" if is_top else "10px 14px"
+    radius     = "13px" if is_top else "10px"
+    name_size  = "1.0rem" if is_top else "0.9rem"
+    name_wt    = "700" if is_top else "600"
+    name_col   = "#0F2240" if is_top else "#1A3558"
+    check_html = (
+        '<span style="color:#1D5A8E;font-size:0.9rem;margin-right:4px;font-weight:700">✓</span>'
+        if is_selected else ""
+    )
+    multi_note = (
+        f'&nbsp;<span class="vc-badge vc-badge-multi">'
+        f'{n} related establishment{"s" if n != 1 else ""}</span>'
+    ) if n > 1 and is_top else ""
+
+    c_name, c_btn = st.columns([5, 2], gap="medium")
+    with c_name:
+        st.markdown(
+            f"""<div style="border:1px solid {box_border};border-radius:{radius};
+                background:{box_bg};padding:{pad};margin-bottom:4px">
+                {check_html}<span style="font-size:{name_size};font-weight:{name_wt};
+                color:{name_col}">🏢 {group.parent_name}</span>
+                &nbsp;&nbsp;
+                <span style="font-size:0.78rem;color:#9BAFC5">
+                    {n} establishment{"s" if n != 1 else ""}
+                </span>
+                &nbsp;{badge}{multi_note}
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    with c_btn:
+        if is_selected:
+            btn_label = "✓ Added"
+            btn_type  = "primary"
+        elif any_selected:
+            btn_label = "＋ Add"
+            btn_type  = "secondary"
+        else:
+            btn_label = "Select →" if is_top else "Select"
+            btn_type  = "primary" if is_top else "secondary"
+
+        if st.button(btn_label, key=f"btn_toggle_{key_suffix}", type=btn_type, use_container_width=True):
+            if is_selected:
+                # Deselect — remove from list
+                st.session_state.selected_group_keys.discard(group.parent_name)
+                st.session_state.selected_groups = [
+                    g for g in st.session_state.selected_groups
+                    if g.parent_name != group.parent_name
+                ]
+                if not st.session_state.selected_groups:
+                    st.session_state.analysis_scope = "all"
+                    st.session_state.selected_facility_names = []
+            else:
+                # Select — add to list
+                st.session_state.selected_group_keys.add(group.parent_name)
+                st.session_state.selected_groups.append(group)
+                # Reset scope so it is recalculated fresh
+                st.session_state.analysis_scope = "all"
+                st.session_state.selected_facility_names = []
+            st.rerun()
+
+
+def render_grouped_search_results(results: SearchResultSet):
+    """
+    Display the grouped search result set with three visual sections:
+      1. Best grouped match (parent company card)
+      2. Other possible parent groups (if any)
+      3. Lower-confidence / unmatched raw names
+
+    Every group row has a toggle button: first click selects it
+    ("Select →" / "Select"), subsequent clicks on already-selected groups
+    show "✓ Added" and clicking again deselects. Unselected groups in a
+    multi-selection context show "＋ Add".
+    """
+    selected_keys = st.session_state.selected_group_keys
+
+    if results.top_group is None and not results.other_groups and not results.unmatched:
+        st.info(
+            "No matches found in the OSHA cache for that query. "
+            "Assessment will query the DOL API directly.",
+            icon="ℹ️",
+        )
+        if st.button("Search live OSHA API →", key="btn_api_fallback"):
+            new_g = GroupedCompanyResult(
+                parent_name=results.query.title(),
+                query=results.query,
+                total_facilities=0,
+                confidence=0.0,
+                confidence_label="Low",
+            )
+            st.session_state.selected_group_keys.add(new_g.parent_name)
+            st.session_state.selected_groups.append(new_g)
+            st.rerun()
+        return
+
+    # Banner showing how many groups are currently selected
+    n_sel = len(selected_keys)
+    if n_sel:
+        names_str = " + ".join(
+            f"**{g.parent_name}**" for g in st.session_state.selected_groups
+        )
+        st.success(
+            f"{n_sel} group{'s' if n_sel > 1 else ''} selected: {names_str}  \n"
+            "Add more below, or scroll down to configure and run the analysis.",
+            icon="✅",
+        )
+
+    # ── Section 1: Best grouped match ────────────────────────────────────
+    if results.top_group:
+        st.markdown(
+            """<div style="font-size:0.65rem;font-weight:700;letter-spacing:1px;
+                        text-transform:uppercase;color:#9BAFC5;margin-bottom:6px">
+                Best match
+            </div>""",
+            unsafe_allow_html=True,
+        )
+        _render_group_row(results.top_group, key_suffix="top", is_top=True, selected_keys=selected_keys)
+
+    # ── Section 2: Other possible parent groups ───────────────────────────
+    if results.other_groups:
+        st.markdown(
+            """<div style="font-size:0.65rem;font-weight:700;letter-spacing:1px;
+                        text-transform:uppercase;color:#9BAFC5;margin:14px 0 6px">
+                Other possible matches
+            </div>""",
+            unsafe_allow_html=True,
+        )
+        for i, group in enumerate(results.other_groups):
+            _render_group_row(group, key_suffix=f"other_{i}", is_top=False, selected_keys=selected_keys)
+
+    # ── Section 3: Low-confidence / unmatched names ───────────────────────
+    if results.unmatched:
+        with st.expander(
+            f"🔍 {len(results.unmatched)} possible variant(s) — lower confidence",
+            expanded=False,
+        ):
+            st.caption(
+                "These OSHA names partially matched your search but couldn't be "
+                "confidently grouped with a parent company."
+            )
+            for raw_name in results.unmatched:
+                c_n, c_b = st.columns([5, 2], gap="small")
+                with c_n:
+                    st.markdown(
+                        f'<div style="font-size:0.83rem;color:#4A5568;padding:4px 0">{raw_name}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with c_b:
+                    if st.button(
+                        "Use this name",
+                        key=f"btn_unmatched_{raw_name[:30]}",
+                        use_container_width=True,
+                    ):
+                        from src.search.grouped_search import GroupedCompanyResult, FacilityCandidate
+                        fc = FacilityCandidate(
+                            raw_name=raw_name,
+                            display_name=raw_name,
+                            facility_code=None,
+                            city="", state="", address="",
+                            confidence=0.3,
+                            confidence_label="Low",
+                        )
+                        new_g = GroupedCompanyResult(
+                            parent_name=raw_name,
+                            query=raw_name,
+                            total_facilities=1,
+                            confidence=0.3,
+                            confidence_label="Low",
+                            high_confidence=[],
+                            medium_confidence=[],
+                            low_confidence=[fc],
+                        )
+                        st.session_state.selected_group_keys.add(raw_name)
+                        st.session_state.selected_groups.append(new_g)
+                        st.rerun()
+
+
+def render_scope_selector(group: GroupedCompanyResult):
+    """
+    Show the analysis scope radio and facility-level drill-down.
+    Returns (scope, raw_names_to_analyze) where raw_names_to_analyze
+    is None if the caller should use the standard company-level path.
+    """
+    n = group.total_facilities
+    multi = n > 1
+
+    st.markdown(
+        f"""
+        <div style="font-size:0.65rem;font-weight:700;letter-spacing:1px;
+                    text-transform:uppercase;color:#9BAFC5;margin-bottom:6px">
+            Selected company
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(border=True):
+        header_col, change_col = st.columns([5, 2], gap="medium")
+        with header_col:
+            badge = _confidence_badge_html(group.confidence_label)
+            st.markdown(
+                f"""
+                <div style="font-size:1.0rem;font-weight:700;color:#0F2240">
+                    🏢 {group.parent_name}
+                </div>
+                <div style="font-size:0.8rem;color:#6B7E99;margin-top:3px">
+                    {n} likely related OSHA establishment{"s" if n != 1 else ""}
+                    &nbsp;{badge}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with change_col:
+            if st.button("Change", key="btn_change_company", use_container_width=True):
+                st.session_state.selected_groups = []
+                st.session_state.selected_group_keys = set()
+                st.session_state.analysis_scope = "all"
+                st.session_state.selected_facility_names = []
+                st.rerun()
+
+    if not multi:
+        # Only one establishment — no scope choice needed
+        st.session_state.analysis_scope = "all"
+        return "all", None
+
+    # ── Scope radio ───────────────────────────────────────────────────────
+    st.markdown("**Analysis scope**")
+    scope = st.radio(
+        "analysis_scope_radio",
+        options=["all", "one", "custom"],
+        format_func=lambda x: {
+            "all":    f"Include all {n} likely related facilities",
+            "one":    "Analyze one specific facility only",
+            "custom": "Select specific facilities to include",
+        }[x],
+        index=["all", "one", "custom"].index(st.session_state.analysis_scope),
+        label_visibility="collapsed",
+        key="radio_scope",
+    )
+    if scope != st.session_state.analysis_scope:
+        st.session_state.analysis_scope = scope
+        st.session_state.selected_facility_names = []
+        st.rerun()
+
+    if scope == "all":
+        st.caption(
+            "Grouping is based on name similarity and facility-code pattern matching. "
+            "Establishments below 40% confidence are excluded by default."
+        )
+        return "all", None
+
+    # ── Facility picker (one or custom) ──────────────────────────────────
+    all_facilities = group.high_confidence + group.medium_confidence
+
+    if scope == "one":
+        options = [f.raw_name for f in all_facilities] or [group.parent_name]
+        chosen = st.selectbox(
+            "Choose a facility",
+            options=options,
+            format_func=lambda raw: _format_facility_option(raw, group),
+            key="sel_single_facility",
+        )
+        return "one", [chosen] if chosen else None
+
+    # custom
+    options = [f.raw_name for f in all_facilities] or [group.parent_name]
+    default = st.session_state.selected_facility_names or options[:3]
+    chosen = st.multiselect(
+        "Select facilities to include",
+        options=options,
+        default=[d for d in default if d in options],
+        format_func=lambda raw: _format_facility_option(raw, group),
+        key="ms_custom_facilities",
+    )
+    if chosen:
+        st.session_state.selected_facility_names = chosen
+    if not chosen:
+        st.caption("Pick at least one facility, or switch scope to 'Include all'.")
+    return "custom", chosen if chosen else None
+
+
+def _format_facility_option(raw_name: str, group: GroupedCompanyResult) -> str:
+    """Format a raw OSHA name into a readable dropdown option."""
+    all_fac = group.all_facilities
+    match = next((f for f in all_fac if f.raw_name == raw_name), None)
+    if match:
+        parts = [match.display_name]
+        if match.facility_code:
+            parts[0] += f" [{match.facility_code}]"
+        if match.city and match.state:
+            parts.append(f"{match.city}, {match.state}")
+        return " — ".join(parts)
+    return raw_name
+
+
+def render_facility_review_table(fac_to_show: list, title_suffix: str = ""):
+    """
+    Show a collapsible 'Review included locations' section.
+    fac_to_show: pre-filtered list of FacilityCandidate objects.
+    title_suffix: optional extra label appended to the expander header.
+    """
+    if not fac_to_show:
+        return
+
+    with st.expander(
+        f"📍 Review included locations ({len(fac_to_show)}){title_suffix}",
+        expanded=False,
+    ):
+        st.caption(
+            "These are the OSHA establishments that will be included in the analysis."
+        )
+        rows = []
+        for f in fac_to_show:
+            rows.append({
+                "Establishment":  f.display_name + (f" [{f.facility_code}]" if f.facility_code else ""),
+                "Raw OSHA Name":  f.raw_name,
+                "City":           f.city or "—",
+                "State":          f.state or "—",
+                "Address":        f.address or "—",
+                "Confidence":     f.confidence_label,
+            })
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Warn if low-confidence entries are pulled in
+        low_count = sum(1 for f in fac_to_show if f.confidence_label == "Low")
+        if low_count:
+            st.warning(
+                f"⚠️ {low_count} included establishment(s) have low confidence. "
+                "Verify they belong to this company before relying on the score.",
+                icon="⚠️",
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  SELECTION SUMMARY  — shown below search results when groups are chosen
+# ═══════════════════════════════════════════════════════════════════════ #
+def render_selection_summary() -> tuple:
+    """
+    Renders the panel that summarises what will be analysed.
+
+    Single group  → shows the existing scope selector (all / one / custom).
+    Multiple groups → shows a combined strip of selected groups with ✕ remove
+                      buttons; always uses all high+medium confidence facilities
+                      from each group merged together.
+
+    Returns (raw_names | None, display_name):
+      raw_names = None  → caller uses vet_manufacturer(display_name) (normal path)
+      raw_names = [...]  → caller uses vet_by_raw_estab_names(raw_names, display_name)
+    """
+    selected_groups = st.session_state.selected_groups
+    if not selected_groups:
+        return None, ""
+
+    st.divider()
+
+    # ── Single group: delegate to the existing scope selector ────────────
+    if len(selected_groups) == 1:
+        group = selected_groups[0]
+        scope, chosen_raw_names = render_scope_selector(group)
+
+        # Build pre-filtered list for the review table
+        all_fac = group.all_facilities
+        if scope == "all":
+            fac_to_show = [f for f in all_fac if f.confidence >= 0.40]
+        elif chosen_raw_names:
+            chosen_set = set(chosen_raw_names)
+            fac_to_show = [f for f in all_fac if f.raw_name in chosen_set]
+        else:
+            fac_to_show = []
+
+        render_facility_review_table(fac_to_show)
+
+        n_included = len(fac_to_show)
+        if n_included > 1:
+            st.markdown(
+                f"""<div class="vc-scope-warning">
+                    <strong>ℹ️ Aggregated analysis:</strong> This analysis combines
+                    <strong>{n_included} likely related establishments</strong> and may
+                    not represent a single physical site.
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        return chosen_raw_names, group.parent_name
+
+        # ── Multiple groups: combined summary strip ───────────────────────────
+    st.markdown(
+        """<div style="font-size:0.65rem;font-weight:700;letter-spacing:1px;
+                    text-transform:uppercase;color:#9BAFC5;margin-bottom:8px">
+            Selected for combined analysis
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # Collect all high+medium confidence facilities across every selected group
+    all_fac_objects = []
+    for group in selected_groups:
+        fac = [f for f in group.all_facilities if f.confidence >= 0.40]
+        all_fac_objects.extend(fac)
+
+    # Render a row per group with ✕ remove button
+    for group in selected_groups:
+        fac = [f for f in group.all_facilities if f.confidence >= 0.40]
+        n = len(fac)
+        badge = _confidence_badge_html(group.confidence_label)
+        c_label, c_remove = st.columns([8, 1], gap="small")
+        with c_label:
+            st.markdown(
+                f"""<div style="border:1px solid #C8D9EE;border-radius:9px;
+                    background:#F4F8FD;padding:10px 14px;margin-bottom:5px">
+                    <span style="font-size:0.9rem;font-weight:600;color:#0F2240">
+                        ✅ 🏢 {group.parent_name}
+                    </span>
+                    &nbsp;
+                    <span style="font-size:0.77rem;color:#9BAFC5">
+                        {n} establishment{"s" if n != 1 else ""}
+                    </span>
+                    &nbsp;{badge}
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        with c_remove:
+            if st.button(
+                "✕",
+                key=f"btn_remove_{group.parent_name[:20]}",
+                use_container_width=True,
+                help=f"Remove {group.parent_name} from selection",
+            ):
+                st.session_state.selected_group_keys.discard(group.parent_name)
+                st.session_state.selected_groups = [
+                    g for g in st.session_state.selected_groups
+                    if g.parent_name != group.parent_name
+                ]
+                # If removing a group leaves only one, reset multi scope
+                if len(st.session_state.selected_groups) <= 1:
+                    st.session_state.multi_group_scope = "all"
+                    st.session_state.selected_facility_names = []
+                st.rerun()
+
+    display_name = " + ".join(g.parent_name for g in selected_groups)
+    total_fac = len(all_fac_objects)
+
+    # ── Facility scope selector ───────────────────────────────────────────
+    st.markdown("**Facility scope**")
+    multi_scope = st.radio(
+        "multi_group_scope_radio",
+        options=["all", "custom"],
+        format_func=lambda x: {
+            "all":    f"Include all {total_fac} facilities from selected groups",
+            "custom": "Select specific facilities to include",
+        }[x],
+        index=0 if st.session_state.multi_group_scope == "all" else 1,
+        label_visibility="collapsed",
+        key="radio_multi_scope",
+    )
+    if multi_scope != st.session_state.multi_group_scope:
+        st.session_state.multi_group_scope = multi_scope
+        st.session_state.selected_facility_names = []
+        st.rerun()
+
+    if multi_scope == "all":
+        st.caption(
+            "All high- and medium-confidence facilities from each selected group "
+            "will be merged into a single analysis."
+        )
+        final_raw_names = [f.raw_name for f in all_fac_objects]
+        fac_to_show = all_fac_objects
+
+    else:
+        # Build option list labelled by group so the user can distinguish
+        # e.g. "Walmart / Walmart Supercenter — Dallas, TX"
+        option_raw_names = [f.raw_name for f in all_fac_objects]
+
+        def _multi_format(raw: str) -> str:
+            for g in selected_groups:
+                match = next((f for f in g.all_facilities if f.raw_name == raw), None)
+                if match:
+                    label = match.display_name
+                    if match.facility_code:
+                        label += f" [{match.facility_code}]"
+                    if match.city and match.state:
+                        label += f" — {match.city}, {match.state}"
+                    return f"{g.parent_name}  /  {label}"
+            return raw
+
+        default_sel = (
+            st.session_state.selected_facility_names
+            if st.session_state.selected_facility_names
+            else option_raw_names
+        )
+        chosen = st.multiselect(
+            "Select facilities to include",
+            options=option_raw_names,
+            default=[d for d in default_sel if d in option_raw_names],
+            format_func=_multi_format,
+            key="ms_multi_facilities",
+        )
+        if chosen:
+            st.session_state.selected_facility_names = chosen
+        else:
+            st.caption("Pick at least one facility, or switch to 'Include all'.")
+
+        chosen_set = set(chosen)
+        final_raw_names = chosen if chosen else []
+        fac_to_show = [f for f in all_fac_objects if f.raw_name in chosen_set]
+
+    # Combined facility review table
+    render_facility_review_table(
+        fac_to_show,
+        title_suffix=f" across {len(selected_groups)} groups",
+    )
+
+    n_final = len(final_raw_names)
+    st.markdown(
+        f"""<div class="vc-scope-warning">
+            <strong>ℹ️ Combined analysis:</strong> This merges
+            <strong>{n_final} establishment{"s" if n_final != 1 else ""}</strong> across
+            <strong>{len(selected_groups)} selected groups</strong>.
+            Results reflect the aggregated OSHA footprint and may span
+            multiple distinct company entities.
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    return final_raw_names if final_raw_names else None, display_name
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  SEARCH CARD  (grouped entity-resolution UX with multi-group selection)
+# ═══════════════════════════════════════════════════════════════════════ #
+def render_search_card():
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div style="margin-bottom:14px">
+                <div style="font-size:0.65rem;font-weight:700;letter-spacing:1px;
+                            text-transform:uppercase;color:#9BAFC5;margin-bottom:5px">
+                    Manufacturer Lookup
+                </div>
+                <div style="font-size:1.05rem;font-weight:700;color:#0F2240;margin-bottom:3px">
+                    Vet a Manufacturer
+                </div>
+                <div style="font-size:0.83rem;color:#7B8FA8;line-height:1.5">
+                    Search by company name — select one or more groups to analyse together.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        left_col, right_col = st.columns([7, 3], gap="large")
+
+        # State that survives across the phase-A / phase-B split
+        raw_names_to_use = None
+        display_name = ""
+
+        with left_col:
+            # ── Search input ──────────────────────────────────────────────
+            search_term = st.text_input(
+                "Company name",
+                value=st.session_state.search_term,
+                placeholder="Enter company name — e.g. Amazon, Fastenal, Parker Hannifin",
+                label_visibility="collapsed",
+                key="txt_search_term",
+            )
+
+            # Only reset search results when term changes — NOT selected_groups,
+            # so the user can search multiple times to build a multi-group selection.
+            if search_term != st.session_state.search_term:
+                st.session_state.search_term = search_term
+                st.session_state.search_results = None
+
+            if search_term and len(search_term.strip()) >= 2:
+                if st.session_state.search_results is None:
+                    osha_client = vetting_agent.get_osha_client()
+                    st.session_state.search_results = group_establishments(
+                        query=search_term,
+                        all_company_names=_cached_company_names(),
+                        osha_client=osha_client,
+                    )
+
+            results: SearchResultSet | None = st.session_state.search_results
+
+            # ── Phase A: always show grouped results while a term is active
+            if results is not None:
+                render_grouped_search_results(results)
+
+            # ── Phase B: selection summary (scope / combined strip) ───────
+            if st.session_state.selected_groups:
+                raw_names_to_use, display_name = render_selection_summary()
+
+        # ── Run button (right column) ─────────────────────────────────────
+        with right_col:
+            st.markdown("<div style='height:2px'></div>", unsafe_allow_html=True)
+            has_selection = bool(st.session_state.selected_groups)
+            n_groups = len(st.session_state.selected_groups)
+
+            btn_label = (
+                f"Run Assessment ({n_groups} groups) →"
+                if n_groups > 1 else "Run Assessment →"
+            )
+            run_clicked = st.button(
+                btn_label,
+                type="primary",
+                use_container_width=True,
+                key="btn_run_assessment",
+                disabled=not has_selection,
+            )
+
+            if has_selection:
+                # Show a compact summary of what will be scored
+                total_estabs = sum(
+                    max(len([f for f in g.all_facilities if f.confidence >= 0.40]), 1)
+                    for g in st.session_state.selected_groups
+                )
+                st.markdown(
+                    f'<div style="font-size:0.73rem;color:#1D5A8E;margin-top:9px;'
+                    f'line-height:1.6;text-align:center;font-weight:600">'
+                    f'{n_groups} group{"s" if n_groups > 1 else ""}'
+                    f'&nbsp;·&nbsp;~{total_estabs} establishment{"s" if total_estabs != 1 else ""}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    """<div style="font-size:0.73rem;color:#9BAFC5;margin-top:9px;
+                        line-height:1.5;text-align:center">
+                        Returns risk score, inspection signals,<br>
+                        and explainable recommendation.
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+        # ── Trigger analysis ──────────────────────────────────────────────
+        if run_clicked and st.session_state.selected_groups:
+            display_name = display_name or st.session_state.selected_groups[0].parent_name
+            n_g = len(st.session_state.selected_groups)
+
+            if n_g == 1 and raw_names_to_use is None:
+                label = st.session_state.selected_groups[0].parent_name
+            elif n_g == 1 and raw_names_to_use:
+                label = f"{st.session_state.selected_groups[0].parent_name} ({len(raw_names_to_use)} facilities)"
+            else:
+                label = f"{display_name} ({n_g} groups combined)"
+
+            with st.spinner(f"Retrieving OSHA data and scoring {label}…"):
+                try:
+                    if raw_names_to_use is None and n_g == 1:
+                        # Standard single-company name-resolution path
+                        assessment = vetting_agent.vet_manufacturer(
+                            st.session_state.selected_groups[0].parent_name,
+                            locations=None,
+                        )
+                    else:
+                        # Targeted multi-facility or multi-group path
+                        names = raw_names_to_use or [
+                            f.raw_name
+                            for g in st.session_state.selected_groups
+                            for f in g.all_facilities
+                            if f.confidence >= 0.40
+                        ]
+                        assessment = vetting_agent.vet_by_raw_estab_names(
+                            raw_names=names,
+                            display_name=display_name,
+                        )
+
+                    st.session_state.assessment = assessment
+                    st.session_state.messages = []
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Assessment failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  FEATURE PREVIEW CARDS  (shown when no assessment loaded)
+# ═══════════════════════════════════════════════════════════════════════ #
+def render_feature_cards():
+    st.markdown("""
+    <div style="margin:24px 0 10px">
+        <div style="font-size:0.65rem;font-weight:700;letter-spacing:1px;
+                    text-transform:uppercase;color:#9BAFC5;margin-bottom:10px">What you'll get</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    _card = (
+        "background:#FFFFFF;border:1px solid #DDE4EF;border-radius:12px;"
+        "padding:22px 20px;box-shadow:0 1px 4px rgba(20,50,100,0.06);height:100%"
+    )
+    c1, c2, c3 = st.columns(3, gap="medium")
+    with c1:
+        st.markdown(f"""
+        <div style="{_card}">
+            <div style="font-size:1.8rem;margin-bottom:10px">📊</div>
+            <div style="font-size:0.92rem;font-weight:700;color:#0F2240;margin-bottom:6px">Risk Score</div>
+            <div style="font-size:0.81rem;color:#7B8FA8;line-height:1.55">
+                ML-calibrated 0–100 risk rating benchmarked against the full DOL inspection population.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""
+        <div style="{_card}">
+            <div style="font-size:1.8rem;margin-bottom:10px">📋</div>
+            <div style="font-size:0.92rem;font-weight:700;color:#0F2240;margin-bottom:6px">OSHA Record Summary</div>
+            <div style="font-size:0.81rem;color:#7B8FA8;line-height:1.55">
+                Full inspection history — violations, penalties, repeat offenses, injury reports, and fatalities.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""
+        <div style="{_card}">
+            <div style="font-size:1.8rem;margin-bottom:10px">🔍</div>
+            <div style="font-size:0.92rem;font-weight:700;color:#0F2240;margin-bottom:6px">Explainable Recommendation</div>
+            <div style="font-size:0.81rem;color:#7B8FA8;line-height:1.55">
+                AI-generated compliance narrative with key risk drivers ranked by learned feature importance.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  HOW IT WORKS  (shown when no assessment loaded)
+# ═══════════════════════════════════════════════════════════════════════ #
+def render_how_it_works():
+    _step_num = (
+        "width:28px;height:28px;min-width:28px;border-radius:50%;"
+        "background:#1D5A8E;color:white;font-size:0.78rem;font-weight:700;"
+        "display:flex;align-items:center;justify-content:center;margin-top:1px"
+    )
+    st.markdown(f"""
+    <div style="
+        background:#FFFFFF;border:1px solid #DDE4EF;border-radius:14px;
+        padding:22px 26px;margin-top:16px;
+        box-shadow:0 1px 5px rgba(20,50,100,0.06);
+    ">
+        <div style="font-size:0.65rem;font-weight:700;letter-spacing:1px;
+                    text-transform:uppercase;color:#9BAFC5;margin-bottom:14px">How it works</div>
+        <div style="display:flex;gap:0;align-items:flex-start">
+            <div style="flex:1;display:flex;align-items:flex-start;gap:12px;
+                        padding-right:20px;border-right:1px solid #EEF2F8">
+                <div style="{_step_num}">1</div>
+                <div>
+                    <div style="font-size:0.87rem;font-weight:700;color:#0F2240;margin-bottom:3px">Resolve Entity</div>
+                    <div style="font-size:0.78rem;color:#7B8FA8;line-height:1.45">Match the company name to OSHA establishment records using fuzzy name and location resolution.</div>
+                </div>
+            </div>
+            <div style="flex:1;display:flex;align-items:flex-start;gap:12px;
+                        padding:0 20px;border-right:1px solid #EEF2F8">
+                <div style="{_step_num}">2</div>
+                <div>
+                    <div style="font-size:0.87rem;font-weight:700;color:#0F2240;margin-bottom:3px">Retrieve OSHA History</div>
+                    <div style="font-size:0.78rem;color:#7B8FA8;line-height:1.45">Pull all inspections, violations, accident reports, and injury data from the DOL API or bulk cache.</div>
+                </div>
+            </div>
+            <div style="flex:1;display:flex;align-items:flex-start;gap:12px;padding-left:20px">
+                <div style="{_step_num}">3</div>
+                <div>
+                    <div style="font-size:0.87rem;font-weight:700;color:#0F2240;margin-bottom:3px">Score &amp; Explain Risk</div>
+                    <div style="font-size:0.78rem;color:#7B8FA8;line-height:1.45">ML model scores the manufacturer relative to the population and generates an explainable risk narrative.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  EMPTY STATE
+# ═══════════════════════════════════════════════════════════════════════ #
+def render_empty_state():
+    st.markdown("""
+    <div style="text-align:center;padding:44px 24px;color:#9BAFC5;margin-top:8px">
+        <div style="font-size:2.6rem;margin-bottom:12px">🛡️</div>
+        <div style="font-size:0.9rem;font-weight:600;color:#6B7E99;margin-bottom:6px">No assessment loaded</div>
+        <div style="font-size:0.82rem;color:#9BAFC5;line-height:1.6">
+            Run an assessment above to view compliance risk,<br>
+            full inspection history, and an explainable recommendation.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  VIOLATION DASHBOARD  helpers
+# ═══════════════════════════════════════════════════════════════════════ #
+
+# Theme definition: (code_prefixes, theme_name, short_description, icon)
+_THEME_DEFS = [
+    (["19100147", "29100147"],
+     "Lockout / Tagout",
+     "Failure to de-energize equipment during maintenance — risk of fatal crush or amputation.", "⚡"),
+    (["19100212", "19100213", "19100214", "19100215", "19100216", "19100217",
+      "19100218", "19100219"],
+     "Machine Guarding",
+     "Exposed moving parts, unguarded blades or gears — amputation and entanglement risk.", "⚙️"),
+    (["19100303", "19100304", "19100305", "19100334", "19100330", "19100331"],
+     "Electrical Safety",
+     "Unguarded live conductors, improper wiring, or lack of arc-flash protection.", "🔌"),
+    (["19100022", "19100023", "19100024", "19100025", "19100028", "19100029",
+      "19260501", "19260502", "19260503", "19260451"],
+     "Fall Protection / Walking Surfaces",
+     "Unguarded floor openings, improper scaffolding, or absence of fall-arrest systems.", "🧗"),
+    (["19100106", "19100157", "19100101", "19100110"],
+     "Fire / Flammables / Compressed Gas",
+     "Improper storage or handling of flammable liquids, gases, or compressed cylinders.", "🔥"),
+    (["19101200"],
+     "Hazard Communication / Chemical Safety",
+     "Missing SDS, unlabeled containers, or failure to train workers on chemical hazards.", "☣️"),
+    (["19100132", "19100133", "19100134", "19100135", "19100136", "19100138", "19100140"],
+     "Personal Protective Equipment",
+     "Failure to provide or require appropriate PPE for identified hazards.", "🦺"),
+    (["19100095", "19100096"],
+     "Noise / Hearing Conservation",
+     "Inadequate hearing protection or noise-level monitoring in high-decibel environments.", "👂"),
+    (["19100139", "19260352"],
+     "Welding / Hot Work",
+     "Fire ignition hazards from uncontrolled hot-work operations.", "🔩"),
+    (["19101050", "19101001", "19260062", "19101025", "19260055"],
+     "Toxic Substances (Lead / Asbestos / Silica)",
+     "Exposure to carcinogenic or acutely toxic industrial materials.", "☢️"),
+    (["19100020"],
+     "Recordkeeping",
+     "Failure to maintain OSHA-required injury and illness logs.", "📋"),
+    (["5A1", "5(A)(1)", "OSHACT", "SECTION5", "GENERALDUTY"],
+     "General Duty Clause",
+     "Broad safety management failure — employer did not address recognized serious hazards.", "⚠️"),
+    (["19260050", "19260051", "19260100", "19260150", "19260200", "19260250",
+      "19260300", "19260350", "19260400", "19260450", "19260600"],
+     "Construction Safety",
+     "Violations of construction-specific OSHA standards (subparts C–R).", "🏗️"),
+]
+
+
+def _map_standard_to_theme(code: str):
+    """Return (theme_name, icon) for an OSHA standard code string."""
+    import re as _re
+    code_up = _re.sub(r'[\s.\-/()\']', '', (code or "").upper())
+    for prefixes, theme, _, icon in _THEME_DEFS:
+        for p in prefixes:
+            p_clean = _re.sub(r'[\s.\-/()\']', '', p.upper())
+            if code_up.startswith(p_clean):
+                return theme, icon
+    return "Other Safety Issues", "📌"
+
+
+def _theme_description(theme: str) -> str:
+    for _, t, desc, _ in _THEME_DEFS:
+        if t == theme:
+            return desc
+    return "Various OSHA regulatory violations."
+
+
+def _build_violations_df(assessment) -> "pd.DataFrame":
+    """Flatten all violations across all records into one enriched DataFrame."""
+    rows = []
+    for rec in assessment.records:
+        fat_linked = bool(rec.severe_injury_or_fatality) or any(a.fatality for a in rec.accidents)
+        for v in rec.violations:
+            theme, icon = _map_standard_to_theme(v.category)
+            try:
+                gravity_val = float(v.gravity) if v.gravity else 0.0
+            except (ValueError, TypeError):
+                gravity_val = 0.0
+            priority = (
+                (100 if fat_linked else 0) +
+                (50 if v.is_willful else 0) +
+                (30 if v.is_repeat else 0) +
+                (10 if v.severity == "Serious" else 0) +
+                min(gravity_val, 10) +
+                min(v.penalty_amount / 10_000, 20)
+            )
+            rows.append({
+                "inspection_id": rec.inspection_id,
+                "inspection_date": rec.date_opened,
+                "standard_code": v.category or "Unknown",
+                "hazard_theme": theme,
+                "theme_icon": icon,
+                "hazard_label": (v.description or v.category or "")[:180],
+                "severity": v.severity,
+                "gravity": gravity_val,
+                "penalty": v.penalty_amount,
+                "is_willful": bool(v.is_willful),
+                "is_repeat": bool(v.is_repeat),
+                "fatality_linked": fat_linked,
+                "nr_exposed": float(v.nr_exposed or 0),
+                "_priority": priority,
+            })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["inspection_date"] = pd.to_datetime(df["inspection_date"])
+    return df.sort_values("_priority", ascending=False).reset_index(drop=True)
+
+
+def _render_theme_summary_cards(theme_agg: "pd.DataFrame"):
+    """3-column grid of hazard theme summary cards sorted by severity."""
+    themes = theme_agg.sort_values(
+        ["fatality_linked_count", "willful_count", "repeat_count", "serious_count", "total_penalty"],
+        ascending=False,
+    ).head(6)
+    cols = st.columns(3, gap="medium")
+    for i, (_, row) in enumerate(themes.iterrows()):
+        is_critical = row["fatality_linked_count"] > 0 or row["willful_count"] > 0
+        is_warn = row["repeat_count"] > 0 and not is_critical
+        bg = "#F5E8E8" if is_critical else ("#FFFBEA" if is_warn else "#EEF3FA")
+        fg = "#8B1A24" if is_critical else ("#7A5500" if is_warn else "#1A3558")
+        border = "#E8B4B8" if is_critical else ("#F3D77A" if is_warn else "#C8D9EE")
+        severe_badge = (
+            f"<span style='background:#F8D7DA;border-radius:6px;padding:2px 8px;"
+            f"font-size:0.71rem;font-weight:600;color:#8B1A24'>⚠ {int(row['severe_count'])} severe</span> "
+        ) if row["severe_count"] > 0 else ""
+        fat_badge = (
+            "<span style='background:#F8D7DA;border-radius:6px;padding:2px 8px;"
+            "font-size:0.71rem;font-weight:600;color:#8B1A24'>☠ fatality-linked</span>"
+        ) if row["fatality_linked_count"] > 0 else ""
+        pen_line = (
+            f"<div style='margin-top:6px;font-size:0.73rem;font-weight:600;color:{fg}'>"
+            f"${row['total_penalty']:,.0f} in penalties</div>"
+        ) if row["total_penalty"] > 0 else ""
+        cite_word = 's' if row['total_citations'] != 1 else ''
+        cite_count = int(row['total_citations'])
+        card_html = (
+            f'<div style="background:{bg};border:1px solid {border};border-radius:12px;padding:16px 18px;margin-bottom:8px">'
+            f'<div style="font-size:1.3rem;margin-bottom:5px">{row["icon"]}</div>'
+            f'<div style="font-size:0.87rem;font-weight:700;color:{fg};margin-bottom:7px">{row["theme"]}</div>'
+            f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:7px">'
+            f'<span style="background:rgba(255,255,255,0.65);border-radius:6px;padding:2px 8px;font-size:0.71rem;font-weight:600;color:#444">{cite_count} citation{cite_word}</span>'
+            f'{severe_badge}{fat_badge}'
+            f'</div>'
+            f'<div style="font-size:0.75rem;color:#6B7E99;line-height:1.45">{row["description"]}</div>'
+            f'{pen_line}'
+            f'</div>'
+        )
+        with cols[i % 3]:
+            st.markdown(card_html, unsafe_allow_html=True)
+
+
+def _render_top_findings(df: "pd.DataFrame"):
+    """Compact alert-style rows for the top-8 most critical violations."""
+    _sev_color = {
+        "Willful": ("#FDE0E3", "#8B1A24"),
+        "Repeat":  ("#FEF3CD", "#7A5500"),
+        "Serious": ("#FFFAE6", "#6B5300"),
+        "Other":   ("#F4F7FB", "#4A5568"),
+    }
+    for _, row in df.head(8).iterrows():
+        if row["fatality_linked"]:
+            icon, (bg, fg) = "☠️", ("#FDE0E3", "#8B1A24")
+        elif row["is_willful"]:
+            icon, (bg, fg) = "🔴", ("#FDE0E3", "#8B1A24")
+        elif row["is_repeat"]:
+            icon, (bg, fg) = "🟠", ("#FEF3CD", "#7A5500")
+        else:
+            icon = "🟡" if row["severity"] == "Serious" else "⚪"
+            bg, fg = _sev_color.get(row["severity"], _sev_color["Other"])
+        date_str = row["inspection_date"].strftime("%b %Y") if pd.notna(row["inspection_date"]) else "—"
+        penalty_str = f"${row['penalty']:,.0f}" if row["penalty"] > 0 else "—"
+        fat_note = ("&nbsp;&nbsp;<b style='color:#8B1A24'>☠ Fatality-linked</b>"
+                    if row["fatality_linked"] else "")
+        html = (
+            f"<div style='display:flex;align-items:flex-start;gap:12px;"
+            f"background:{bg};border:1px solid #DDE4EF;"
+            f"border-left:4px solid {fg};"
+            f"border-radius:9px;padding:12px 16px;margin-bottom:7px'>"
+            f"<div style='font-size:1.1rem;margin-top:1px'>{icon}</div>"
+            f"<div style='flex:1;min-width:0'>"
+            f"<div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:3px'>"
+            f"<span style='font-size:0.82rem;font-weight:700;color:{fg}'>{row['severity']}</span>"
+            f"<span style='font-size:0.78rem;color:#4A5568'>{row['hazard_theme']}</span>"
+            f"<code style='font-size:0.71rem;color:#7B8FA8'>{row['standard_code']}</code>"
+            f"{fat_note}"
+            f"</div>"
+            f"<div style='font-size:0.8rem;color:#2D3748;line-height:1.4'>{row['hazard_label'][:160]}</div>"
+            f"</div>"
+            f"<div style='text-align:right;min-width:80px;flex-shrink:0'>"
+            f"<div style='font-size:0.8rem;font-weight:700;color:#1A3558'>{penalty_str}</div>"
+            f"<div style='font-size:0.72rem;color:#9BAFC5'>{date_str}</div>"
+            f"</div>"
+            f"</div>"
+        )
+        st.markdown(html, unsafe_allow_html=True)
+
+
+def render_violation_dashboard(assessment, llm_breakdown_text: str = None):
+    """Render the full structured violation dashboard inside a collapsed expander."""
+    df = _build_violations_df(assessment)
+
+    with st.expander("📋 Violation Breakdown", expanded=False):
+        if df.empty:
+            st.caption("No structured violation data available.")
+            if llm_breakdown_text:
+                st.markdown(llm_breakdown_text)
+            return
+
+        # ── Build theme aggregation ──────────────────────────────────────
+        theme_agg = (
+            df.groupby(["hazard_theme", "theme_icon"]).agg(
+                total_citations=("standard_code", "count"),
+                severe_count=("severity", lambda x: x.isin(["Serious", "Willful", "Repeat"]).sum()),
+                willful_count=("is_willful", "sum"),
+                repeat_count=("is_repeat", "sum"),
+                serious_count=("severity", lambda x: (x == "Serious").sum()),
+                fatality_linked_count=("fatality_linked", "sum"),
+                total_penalty=("penalty", "sum"),
+            )
+            .reset_index()
+            .rename(columns={"hazard_theme": "theme", "theme_icon": "icon"})
+        )
+        theme_agg["description"] = theme_agg["theme"].map(_theme_description)
+
+        # ── Summary metrics row ──────────────────────────────────────────
+        total_cit   = len(df)
+        serious_ct  = int((df["severity"] == "Serious").sum())
+        willful_ct  = int(df["is_willful"].sum())
+        repeat_ct   = int(df["is_repeat"].sum())
+        fat_ct      = int(df["fatality_linked"].sum())
+        total_pen   = df["penalty"].sum()
+        n_themes    = len(theme_agg)
+
+        m1, m2, m3, m4, m5 = st.columns(5, gap="small")
+        m1.metric("Hazard Themes",         n_themes)
+        m2.metric("Total Citations",        total_cit)
+        m3.metric("Serious / Willful / Repeat", f"{serious_ct} / {willful_ct} / {repeat_ct}")
+        m4.metric("Fatality-Linked",        fat_ct)
+        m5.metric("Total Penalties",        f"${total_pen:,.0f}")
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+        # ── Section 1: Hazard theme cards ───────────────────────────────
+        st.markdown("**Key Hazard Themes**")
+        st.caption("Citations grouped by recognized OSHA hazard category, ranked by severity.")
+        _render_theme_summary_cards(theme_agg)
+
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+
+        # ── Section 2: Top critical findings ────────────────────────────
+        with st.expander("🚨 Most Critical Findings (top 8)", expanded=False):
+            st.caption("Ranked by fatality linkage, willfulness, repeat pattern, and penalty size.")
+            _render_top_findings(df)
+
+        # ── Section 3: Grouped by theme ─────────────────────────────────
+        with st.expander("📂 Violations by Hazard Theme", expanded=False):
+            for theme in (
+                theme_agg.sort_values(
+                    ["fatality_linked_count", "willful_count", "repeat_count",
+                     "serious_count", "total_penalty"],
+                    ascending=False,
+                )["theme"]
+            ):
+                tdf = df[df["hazard_theme"] == theme]
+                row_meta = theme_agg[theme_agg["theme"] == theme].iloc[0]
+                label = (
+                    f"{row_meta['icon']} {theme} "
+                    f"({len(tdf)} citation{'s' if len(tdf) != 1 else ''})"
+                )
+                with st.expander(label, expanded=False):
+                    st.caption(_theme_description(theme))
+                    deduped = (
+                        tdf.groupby("standard_code").agg(
+                            severity=("severity", "first"),
+                            occurrences=("standard_code", "count"),
+                            total_penalty=("penalty", "sum"),
+                            first_date=("inspection_date", "min"),
+                            last_date=("inspection_date", "max"),
+                            willful=("is_willful", "any"),
+                            repeat=("is_repeat", "any"),
+                        )
+                        .reset_index()
+                        .sort_values("total_penalty", ascending=False)
+                    )
+                    deduped["Date Range"] = deduped.apply(
+                        lambda r: (
+                            r["last_date"].strftime("%b %Y")
+                            if r["first_date"] == r["last_date"]
+                            else f"{r['first_date'].strftime('%b %Y')} – {r['last_date'].strftime('%b %Y')}"
+                        ),
+                        axis=1,
+                    )
+                    deduped["Flags"] = deduped.apply(
+                        lambda r: ", ".join(
+                            x for x in (
+                                ("Willful" if r["willful"] else ""),
+                                ("Repeat"  if r["repeat"]  else ""),
+                            ) if x
+                        ),
+                        axis=1,
+                    )
+                    st.dataframe(
+                        deduped.rename(columns={
+                            "standard_code": "OSHA Code",
+                            "severity": "Severity",
+                            "occurrences": "Count",
+                            "total_penalty": "Penalty ($)",
+                        })[["OSHA Code", "Severity", "Flags", "Count", "Penalty ($)", "Date Range"]],
+                        width='stretch',
+                        hide_index=True,
+                    )
+
+        # ── Section 4: Full citation table ──────────────────────────────
+        with st.expander("🗃️ Detailed Citation Evidence", expanded=False):
+            st.caption("All citations — click a column header to sort.")
+            detail = df[[
+                "inspection_id", "inspection_date", "standard_code", "hazard_theme",
+                "severity", "gravity", "penalty", "fatality_linked", "is_willful", "is_repeat",
+            ]].copy()
+            detail["inspection_date"] = detail["inspection_date"].dt.strftime("%Y-%m-%d")
+            for col in ("fatality_linked", "is_willful", "is_repeat"):
+                detail[col] = detail[col].map({True: "Yes", False: ""})
+            st.dataframe(
+                detail.rename(columns={
+                    "inspection_id": "Inspection ID",
+                    "inspection_date": "Date",
+                    "standard_code": "OSHA Code",
+                    "hazard_theme": "Theme",
+                    "severity": "Severity",
+                    "gravity": "Gravity",
+                    "penalty": "Penalty ($)",
+                    "fatality_linked": "Fatality Linked",
+                    "is_willful": "Willful",
+                    "is_repeat": "Repeat",
+                }),
+                width='stretch',
+                hide_index=True,
+            )
+
+        # ── Section 5: Inspection timeline ──────────────────────────────
+        with st.expander("🗓️ Inspection-by-Inspection Evidence", expanded=False):
+            for rec in sorted(assessment.records, key=lambda r: r.date_opened, reverse=True):
+                fat = bool(rec.severe_injury_or_fatality) or any(a.fatality for a in rec.accidents)
+                n_v = len(rec.violations)
+                if fat:
+                    badge = f"🔴 {n_v} violations — fatality-linked"
+                elif n_v:
+                    badge = f"🟡 {n_v} violation{'s' if n_v != 1 else ''}"
+                else:
+                    badge = "✅ Clean"
+                label = (
+                    f"Inspection {rec.inspection_id} — "
+                    f"{rec.date_opened.strftime('%b %d, %Y')} — {badge}"
+                )
+                with st.expander(label, expanded=False):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Violations",     n_v)
+                    c2.metric("Total Penalty",  f"${rec.total_penalties:,.0f}")
+                    c3.metric("Accidents",      len(rec.accidents))
+                    if rec.violations:
+                        st.dataframe(
+                            pd.DataFrame([{
+                                "OSHA Code": v.category,
+                                "Theme":     _map_standard_to_theme(v.category)[0],
+                                "Severity":  v.severity,
+                                "Penalty ($)": f"${v.penalty_amount:,.0f}",
+                                "Willful":   "✓" if v.is_willful else "",
+                                "Repeat":    "✓" if v.is_repeat  else "",
+                            } for v in rec.violations]),
+                            width='stretch',
+                            hide_index=True,
+                        )
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  RESULTS
+# ═══════════════════════════════════════════════════════════════════════ #
+def render_results(assessment):
+    # ── Risk classification ─────────────────────────────────────────────
+    if assessment.risk_score < 15:
+        badge_label, badge_bg, badge_color = "Low Risk", "#D1F0DC", "#1A6B3A"
+    elif assessment.risk_score < 45:
+        badge_label, badge_bg, badge_color = "Moderate Risk", "#FEF3CD", "#7A5500"
+    else:
+        badge_label, badge_bg, badge_color = "High Risk", "#FDE0E3", "#8B1A24"
+
+    st.markdown(f"""
+    <div style="margin:6px 0 18px 0;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <div style="font-size:1.25rem;font-weight:800;color:#0F2240">{assessment.manufacturer.name}</div>
+        <div style="display:inline-block;padding:4px 14px;border-radius:20px;
+                    font-size:0.77rem;font-weight:700;
+                    background:{badge_bg};color:{badge_color}">{badge_label}</div>
+        <div style="font-size:0.77rem;color:#9BAFC5">Assessment complete</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Multi-facility aggregate notice ──────────────────────────────────
+    n_rec = len(assessment.records)
+    if n_rec > 1:
+        st.info(
+            f"**Aggregated analysis** — this score combines **{n_rec} inspections** across "
+            f"likely related establishments and may not represent a single physical site. "
+            f"Use the violation breakdown below to identify facility-specific patterns.",
+            icon="ℹ️",
+        )
+
+    # ── Row 1: KPI metrics ───────────────────────────────────────────────
+    k1, k2, k3, k4 = st.columns(4, gap="medium")
+    k1.metric("Risk Score", f"{assessment.risk_score} / 100")
+    k2.metric("Recommendation", assessment.recommendation)
+    k3.metric("Records Found", len(assessment.records))
+    k4.metric("Risk Percentile", f"{assessment.percentile_rank}%")
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # ── Split explanation into summary vs violation breakdown ─────────────
+    import re as _re
+    _VB_PATTERN = _re.compile(
+        r'(?:^|\n)(#{1,3}\s*Violation Breakdown.*|'
+        r'\*{1,2}Violation Breakdown[^*\n]*\*{0,2})',
+        _re.IGNORECASE,
+    )
+    _vb_match = _VB_PATTERN.search(assessment.explanation)
+    if _vb_match:
+        _summary_text = assessment.explanation[:_vb_match.start()].strip()
+        _breakdown_text = assessment.explanation[_vb_match.start():].strip()
+    else:
+        _summary_text = assessment.explanation.strip()
+        _breakdown_text = None
+
+    # ── Row 2: executive summary (collapsed) ─────────────────────────────
+    with st.expander("📝 Executive Summary", expanded=False):
+        st.markdown(_summary_text)
+
+    # ── Structured violation dashboard ───────────────────────────────────
+    render_violation_dashboard(assessment, llm_breakdown_text=_breakdown_text)
+
+    # ── ML feature importance (collapsed) ────────────────────────────────
+    with st.expander("📌 Key Risk Signals & Feature Importances", expanded=False):
+        if assessment.feature_weights:
+            _labels = {
+                "total_inspections": "Inspections",
+                "total_violations": "Violations",
+                "serious_violations": "Serious Viols.",
+                "willful_violations": "Willful Viols.",
+                "repeat_violations": "Repeat Viols.",
+                "total_penalties": "Total Penalties",
+                "avg_penalty": "Avg Penalty",
+                "max_penalty": "Max Penalty",
+                "recent_ratio": "Recency (1yr)",
+                "severe_incidents": "Fat/Cat Inspections",
+                "violations_per_inspection": "Viols/Inspection",
+                "accident_count": "Linked Accidents",
+                "fatality_count": "Fatalities",
+                "injury_count": "Injuries",
+                "avg_gravity": "Avg Gravity",
+                "penalties_per_inspection": "Penalty/Inspection",
+                "clean_ratio": "Clean Ratio",
+            }
+            fw_display = {_labels.get(k, k): v for k, v in assessment.feature_weights.items()}
+            fw_df = pd.DataFrame({"Feature": fw_display.keys(), "Importance": fw_display.values()})
+            fw_df = fw_df.sort_values("Importance", ascending=True).tail(8)
+            st.caption("Top ML feature importances — factors most influential to this risk score.")
+            st.bar_chart(fw_df.set_index("Feature"), height=280)
+        else:
+            st.caption("No feature weight data available.")
+        if st.session_state.get("sb_show_raw") and assessment.features:
+            st.divider()
+            fv_df = pd.DataFrame({
+                "Feature": assessment.features.keys(),
+                "Value": [round(v, 3) for v in assessment.features.values()],
+            })
+            st.caption("Raw feature values")
+            st.dataframe(fv_df, width='stretch', hide_index=True)
+
+    # ── Penalty timeline (collapsed) ──────────────────────────────────────
+    if assessment.records:
+        with st.expander("📊 Penalty Timeline", expanded=False):
+            st.caption("Inspection penalties over time — higher bars indicate costlier enforcement actions.")
+            data = [
+                {"Date": pd.to_datetime(r.date_opened), "Penalty ($)": r.total_penalties}
+                for r in assessment.records
+            ]
+            df = pd.DataFrame(data)
+            if not df.empty and df["Penalty ($)"].sum() > 0:
+                st.bar_chart(df.set_index("Date")["Penalty ($)"], height=180)
+            else:
+                st.caption("No penalty data to chart.")
+
+    # ── Accident details (collapsed) ──────────────────────────────────────
+    all_accidents = [a for r in assessment.records for a in r.accidents]
+    if all_accidents:
+        with st.expander(f"🚨 Accident & Injury Details — {len(all_accidents)} incident(s)", expanded=False):
+            for acc in all_accidents:
+                fat_label = "  🔴 **FATALITY**" if acc.fatality else ""
+                st.markdown(f"**Accident {acc.summary_nr}** &nbsp;({acc.event_date or 'unknown date'}){fat_label}")
+                if acc.event_desc:
+                    st.write(acc.event_desc)
+                if acc.injuries:
+                    inj_rows = [
+                        {
+                            "Degree": inj.get("degree", ""),
+                            "Nature": inj.get("nature", ""),
+                            "Body Part": inj.get("body_part", ""),
+                            "Age": inj.get("age", ""),
+                        }
+                        for inj in acc.injuries
+                    ]
+                    st.dataframe(pd.DataFrame(inj_rows), width='stretch', hide_index=True)
+                st.divider()
+
+    # ── Raw records (collapsed) ───────────────────────────────────────────
+    with st.expander("🗂️ Raw OSHA Records", expanded=False):
+        st.json([r.model_dump() for r in assessment.records])
+
+    st.divider()
+
+    # ── AI Chat ──────────────────────────────────────────────────────────
+    st.markdown("**💬 AI Assistant**")
+    st.caption("Ask follow-up questions about this company's compliance record.")
+    for msg in st.session_state.messages:
+        st.chat_message(msg["role"]).write(msg["content"])
+    if prompt := st.chat_input("Ask about specific risks, violations, or recommendations…"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.chat_message("user").write(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                resp = vetting_agent.discuss_assessment(assessment, prompt)
+                st.write(resp)
+                st.session_state.messages.append({"role": "assistant", "content": resp})
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════ #
+render_sidebar()
+render_hero()
+render_search_card()
+
+if st.session_state.assessment:
+    render_results(st.session_state.assessment)
+else:
+    render_feature_cards()
+    render_how_it_works()
+    render_empty_state()

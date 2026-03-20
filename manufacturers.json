@@ -1,0 +1,81 @@
+[
+    {
+        "name": "Precision Machining Inc.",
+        "location": "Dayton, OH",
+        "address": null,
+        "domain": null,
+        "capabilities": [
+            "cnc machining",
+            "milling",
+            "turning",
+            "5-axis cnc"
+        ],
+        "materials": [
+            "aluminum",
+            "steel",
+            "titanium"
+        ]
+    },
+    {
+        "name": "Advanced Aerospace Components",
+        "location": "Seattle, WA",
+        "address": null,
+        "domain": null,
+        "capabilities": [
+            "cnc machining",
+            "5-axis cnc",
+            "dm ls",
+            "additive manufacturing"
+        ],
+        "materials": [
+            "aluminum",
+            "inconel",
+            "titanium"
+        ]
+    },
+    {
+        "name": "Global Fab Works",
+        "location": "Austin, TX",
+        "address": null,
+        "domain": null,
+        "capabilities": [
+            "sheet metal",
+            "welding",
+            "laser cutting"
+        ],
+        "materials": [
+            "steel",
+            "aluminum"
+        ]
+    },
+    {
+        "name": "Rapid Proto Labs",
+        "location": "San Francisco, CA",
+        "address": null,
+        "domain": null,
+        "capabilities": [
+            "3d printing",
+            "cnc machining",
+            "3-axis cnc"
+        ],
+        "materials": [
+            "plastic",
+            "aluminum",
+            "abs"
+        ]
+    },
+    {
+        "name": "Iron Clad Manufacturing",
+        "location": "Detroit, MI",
+        "address": null,
+        "domain": null,
+        "capabilities": [
+            "casting",
+            "forging"
+        ],
+        "materials": [
+            "steel",
+            "iron"
+        ]
+    }
+]

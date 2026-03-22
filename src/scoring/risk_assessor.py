@@ -27,6 +27,11 @@ class RiskAssessor:
         features = ml_result["features"]
         reputation_score = ml_result["reputation_score"]
         news_sentiment = ml_result["news_sentiment"]
+        industry_label = ml_result.get("industry_label", "Unknown Industry")
+        industry_group = ml_result.get("industry_group")
+        industry_percentile = ml_result.get("industry_percentile", 50.0)
+        industry_comparison = ml_result.get("industry_comparison", [])
+        missing_naics = ml_result.get("missing_naics", False)
 
         # --- Recommendation ---
         if risk_score < 30:
@@ -40,6 +45,11 @@ class RiskAssessor:
         explanation_lines = self._build_explanation(
             records, reputation_data, risk_score, percentile_rank,
             feature_weights, features, news_sentiment, reputation_score,
+            industry_label=industry_label,
+            industry_group=industry_group,
+            industry_percentile=industry_percentile,
+            industry_comparison=industry_comparison,
+            missing_naics=missing_naics,
         )
 
         if not records and not reputation_data:
@@ -62,6 +72,11 @@ class RiskAssessor:
             confidence_score=confidence,
             feature_weights=feature_weights,
             percentile_rank=percentile_rank,
+            industry_label=industry_label,
+            industry_group=industry_group or "",
+            industry_percentile=industry_percentile,
+            industry_comparison=industry_comparison,
+            missing_naics=missing_naics,
         )
 
     # ------------------------------------------------------------------ #
@@ -71,7 +86,13 @@ class RiskAssessor:
     def _build_explanation(
         records, reputation_data, risk_score, percentile_rank,
         feature_weights, features, news_sentiment, reputation_score,
+        industry_label="Unknown Industry",
+        industry_group=None,
+        industry_percentile=50.0,
+        industry_comparison=None,
+        missing_naics=False,
     ) -> list:
+        industry_comparison = industry_comparison or []
         lines = []
 
         # Headline
@@ -103,12 +124,34 @@ class RiskAssessor:
             "fatality_count": "Fatalities",
             "injury_count": "Reported Injuries",
             "avg_gravity": "Avg Violation Gravity",
+            "penalties_per_inspection": "Penalties / Inspection ($)",
+            "clean_ratio": "Clean Inspection Ratio",
+            "relative_violation_rate": "Violation Rate vs. Industry (z)",
+            "relative_penalty": "Avg Penalty vs. Industry (z)",
+            "relative_serious_ratio": "Serious Ratio vs. Industry (z)",
+            "relative_willful_repeat": "Willful+Repeat Rate vs. Industry (z)",
         }
         lines.append("\n**Top Risk Drivers (ML Feature Importance):**")
         for feat, weight in top_drivers:
             label = driver_labels.get(feat, feat)
             val = features.get(feat, 0)
             lines.append(f"  - {label}: {val:.2f}  (weight: {weight:.3f})")
+
+        # Industry context block
+        lines.append("\n**Industry Context:**")
+        if missing_naics:
+            lines.append("  \u26a0\ufe0f NAICS industry code unavailable \u2014 industry comparison not possible.")
+        elif industry_label and industry_label != "Unknown Industry":
+            naics_display = f"NAICS {industry_group}" if industry_group else ""
+            label_line = f"  Industry: {industry_label}"
+            if naics_display:
+                label_line += f" ({naics_display})"
+            lines.append(label_line)
+            lines.append(f"  Risk percentile within industry: {industry_percentile:.0f}th")
+            for msg in industry_comparison:
+                lines.append(f"  \u2022 {msg}")
+        else:
+            lines.append("  Industry data not available for this NAICS code.")
 
         # OSHA record details
         if records:

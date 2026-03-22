@@ -18,6 +18,8 @@ import csv
 import json
 import glob
 import re
+import sqlite3
+import sys
 from collections import defaultdict
 from datetime import date, timedelta
 
@@ -151,6 +153,143 @@ def build_abstracts():
 
 
 # ------------------------------------------------------------------ #
+#  SQLite cache builder
+# ------------------------------------------------------------------ #
+def build_sqlite_db():
+    """
+    Build osha_cache.db from the pre-built CSVs in ml_cache/.
+    Called after all CSV/JSON files are written by main().
+    """
+    sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+    try:
+        from src.data_retrieval.osha_client import OSHAClient
+        normalize = OSHAClient.company_match_key
+    except Exception:
+        def normalize(s): return s  # fallback: no normalization
+
+    db_path = os.path.join(CACHE_DIR, "osha_cache.db")
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    print(f"\nBuilding SQLite cache \u2192 {os.path.basename(db_path)} \u2026")
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-65536")  # 64 MB page cache
+
+    def _load_csv_to_table(csv_path, table_name, extra_cols=None,
+                           row_transform=None, skip_row=None):
+        """Read a CSV into a SQLite table. Returns row count."""
+        if not os.path.exists(csv_path):
+            print(f"  WARNING: {csv_path} not found \u2014 skipping {table_name}")
+            return 0
+        csv.field_size_limit(10 * 1024 * 1024)
+        with open(csv_path, "r", newline="", encoding="utf-8") as f:
+            fieldnames = csv.DictReader(f).fieldnames or []
+        all_cols = list(fieldnames) + (extra_cols or [])
+        col_defs = ", ".join(f'"{c}" TEXT' for c in all_cols)
+        conn.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({col_defs})')
+        placeholders = ", ".join("?" for _ in all_cols)
+        insert_sql = f'INSERT INTO "{table_name}" VALUES ({placeholders})'
+        count = 0
+        with open(csv_path, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if skip_row and skip_row(row):
+                    continue
+                base_vals = [row.get(c, "") for c in fieldnames]
+                extra_vals = row_transform(row) if row_transform else []
+                conn.execute(insert_sql, base_vals + extra_vals)
+                count += 1
+                if count % 100_000 == 0:
+                    conn.commit()
+                    print(f"    {count:,} rows\u2026")
+        conn.commit()
+        return count
+
+    # ---- inspections (+ computed company_key) ----
+    company_keys: set = set()
+
+    def _insp_transform(row):
+        raw = (row.get("estab_name") or "").upper()
+        key = normalize(raw).upper() if raw else ""
+        company_keys.add(key)
+        return [key]
+
+    insp_count = _load_csv_to_table(
+        os.path.join(CACHE_DIR, "inspections_bulk.csv"),
+        "inspections",
+        extra_cols=["company_key"],
+        row_transform=_insp_transform,
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_insp_company_key ON inspections(company_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_insp_estab_name  ON inspections(estab_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_insp_activity_nr ON inspections(activity_nr)")
+    conn.commit()
+    print(f"  \u2192 {insp_count:,} inspections")
+
+    # ---- company_names ----
+    conn.execute("CREATE TABLE company_names (company_key TEXT PRIMARY KEY, name TEXT)")
+    conn.executemany(
+        "INSERT OR IGNORE INTO company_names VALUES (?, ?)",
+        [(k, k.title()) for k in sorted(company_keys) if k],
+    )
+    conn.commit()
+    print(f"  \u2192 {len([k for k in company_keys if k]):,} unique company names")
+
+    # ---- violations (skip deleted rows) ----
+    viol_count = _load_csv_to_table(
+        os.path.join(CACHE_DIR, "violations_bulk.csv"),
+        "violations",
+        skip_row=lambda r: r.get("delete_flag") == "X",
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_viol_activity_nr ON violations(activity_nr)")
+    conn.commit()
+    print(f"  \u2192 {viol_count:,} violations")
+
+    # ---- accidents ----
+    acc_count = _load_csv_to_table(
+        os.path.join(CACHE_DIR, "accidents_bulk.csv"), "accidents"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_acc_summary_nr ON accidents(summary_nr)")
+    conn.commit()
+    print(f"  \u2192 {acc_count:,} accidents")
+
+    # ---- injuries ----
+    inj_count = _load_csv_to_table(
+        os.path.join(CACHE_DIR, "accident_injuries_bulk.csv"), "injuries"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_inj_rel_insp_nr ON injuries(rel_insp_nr)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_inj_summary_nr  ON injuries(summary_nr)")
+    conn.commit()
+    print(f"  \u2192 {inj_count:,} injuries")
+
+    # ---- gen_duty_narratives ----
+    gd_count = _load_csv_to_table(
+        os.path.join(CACHE_DIR, "gen_duty_narratives_bulk.csv"), "gen_duty_narratives"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gdn_act_cit "
+        "ON gen_duty_narratives(activity_nr, citation_id)"
+    )
+    conn.commit()
+    print(f"  \u2192 {gd_count:,} gen duty narratives")
+
+    # ---- accident_abstracts ----
+    abs_count = _load_csv_to_table(
+        os.path.join(CACHE_DIR, "accident_abstracts_bulk.csv"), "accident_abstracts"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_abs_summary_nr ON accident_abstracts(summary_nr)"
+    )
+    conn.commit()
+    print(f"  \u2192 {abs_count:,} accident abstracts")
+
+    conn.close()
+    db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
+    print(f"  SQLite cache ready: {db_path} ({db_size_mb:.1f} MB)")
+
+
+# ------------------------------------------------------------------ #
 #  Main
 # ------------------------------------------------------------------ #
 def main():
@@ -234,6 +373,9 @@ def main():
             "gen_duty_narratives": gd_count,
             "complete": insp_count > 0 and viol_count > 0,
         }, f, indent=2)
+
+    # Build SQLite cache from the CSVs we just wrote
+    build_sqlite_db()
 
     # Clean stale model so it retrains on fresh data
     for stale in ["risk_model.pkl", "population_data.json"]:

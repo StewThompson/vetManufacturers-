@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from typing import List, Literal, Dict, Any
-from .manufacturer import Manufacturer
-from .osha_record import OSHARecord
+from src.models.manufacturer import Manufacturer
+from src.models.osha_record import OSHARecord
 
 class RiskAssessment(BaseModel):
     manufacturer: Manufacturer
@@ -16,3 +16,9 @@ class RiskAssessment(BaseModel):
     confidence_score: float # 0.0 to 1.0, reflecting data availability/ambiguity
     feature_weights: Dict[str, float] = {}  # ML feature importances
     percentile_rank: float = 50.0  # 0-100, risk percentile among population
+    # Industry peer context (populated when NAICS code is available)
+    industry_label: str = "Unknown Industry"
+    industry_group: str = ""
+    industry_percentile: float = 50.0  # percentile within the same NAICS group
+    industry_comparison: List[str] = []  # human-readable comparison strings
+    missing_naics: bool = False

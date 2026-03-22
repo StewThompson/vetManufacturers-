@@ -44,6 +44,8 @@ if "selected_facility_names" not in st.session_state:
     st.session_state.selected_facility_names = []
 if "multi_group_scope" not in st.session_state:
     st.session_state.multi_group_scope = "all"  # "all" | "custom"
+if "naics_check_ok" not in st.session_state:
+    st.session_state.naics_check_ok = True  # False when multi-group NAICS codes differ
 
 @st.cache_data
 def _cached_company_names():
@@ -723,6 +725,9 @@ def render_selection_summary() -> tuple:
     if not selected_groups:
         return None, ""
 
+    # Reset NAICS check on each render (single-group always OK)
+    st.session_state.naics_check_ok = True
+
     st.divider()
 
     # ── Single group: delegate to the existing scope selector ────────────
@@ -810,6 +815,23 @@ def render_selection_summary() -> tuple:
 
     display_name = " + ".join(g.parent_name for g in selected_groups)
     total_fac = len(all_fac_objects)
+
+    # ── NAICS consistency check ───────────────────────────────────────────
+    naics_codes = {g.dominant_naics for g in selected_groups if g.dominant_naics}
+    if len(naics_codes) > 1:
+        st.session_state.naics_check_ok = False
+        from src.data_retrieval.naics_lookup import get_industry_name, load_naics_map
+        _nmap = load_naics_map()
+        codes_labeled = ", ".join(
+            f"{c} ({get_industry_name(c, _nmap)})" for c in sorted(naics_codes)
+        )
+        st.error(
+            f"⚠️ **Industry mismatch:** Selected groups span different NAICS codes "
+            f"({codes_labeled}). Combined analysis is only permitted when all groups "
+            f"share the same industry. Remove dissimilar groups to continue."
+        )
+    else:
+        st.session_state.naics_check_ok = True
 
     # ── Facility scope selector ───────────────────────────────────────────
     st.markdown("**Facility scope**")
@@ -975,7 +997,7 @@ def render_search_card():
                 type="primary",
                 use_container_width=True,
                 key="btn_run_assessment",
-                disabled=not has_selection,
+                disabled=not has_selection or not st.session_state.get("naics_check_ok", True),
             )
 
             if has_selection:
@@ -1570,6 +1592,71 @@ def render_results(assessment):
     k4.metric("Risk Percentile", f"{assessment.percentile_rank}%")
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # ── Row 2: Industry peer ranking ─────────────────────────────────────
+    _show_industry = (not assessment.missing_naics
+                      and assessment.industry_label
+                      and assessment.industry_label != "Unknown Industry")
+    if _show_industry:
+        _ind_pct = assessment.industry_percentile
+        _ind_lbl = assessment.industry_label
+        _ind_grp = f"NAICS {assessment.industry_group}" if assessment.industry_group else ""
+        _risk_score = assessment.risk_score
+
+        # Clamp display severity so it never contradicts the overall risk score:
+        #   risk_score >= 60  → at least red   (treat as ≥ 75th pct)
+        #   risk_score >= 30  → at least amber  (treat as ≥ 50th pct)
+        _display_pct = _ind_pct
+        if _risk_score >= 60:
+            _display_pct = max(_ind_pct, 75.0)
+        elif _risk_score >= 30:
+            _display_pct = max(_ind_pct, 50.0)
+
+        if _display_pct >= 75:
+            _ind_bg, _ind_color, _ind_icon = "#FDE0E3", "#8B1A24", "⚠️"
+            _ind_rank_text = f"Riskier than {_display_pct:.0f}% of peers"
+        elif _display_pct >= 50:
+            _ind_bg, _ind_color, _ind_icon = "#FEF3CD", "#7A5500", "🔶"
+            _ind_rank_text = f"Riskier than {_display_pct:.0f}% of peers"
+        else:
+            _ind_bg, _ind_color, _ind_icon = "#D1F0DC", "#1A6B3A", "✅"
+            _ind_rank_text = f"Safer than {100 - _display_pct:.0f}% of peers"
+
+        # Show discrepancy note when industry violation rate looks good but
+        # the overall score is still elevated — e.g. driven by severity,
+        # willful violations, accidents, or high penalties.
+        _discrepancy_html = ""
+        if _ind_pct < 50 and _risk_score >= 30:
+            _discrepancy_note = (
+                "Violation rate is below industry average, but overall risk remains elevated "
+                "by other factors (severity, penalties, incidents, or willful/repeat violations)."
+            )
+            _discrepancy_html = (
+                f"<div style='margin-top:8px;font-size:0.82rem;color:{_ind_color};"
+                f"font-style:italic'>ℹ️ {_discrepancy_note}</div>"
+            )
+
+        _cmp_bullets = "".join(
+            f"<li style='margin:2px 0'>{c}</li>"
+            for c in (assessment.industry_comparison or [])
+        )
+        _cmp_html = f"<ul style='margin:6px 0 0 0;padding-left:18px;font-size:0.82rem;color:#444'>{_cmp_bullets}</ul>" if _cmp_bullets else ""
+
+        st.markdown(f"""
+        <div style="background:{_ind_bg};border-radius:10px;padding:14px 18px;margin-bottom:10px">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <span style="font-size:1.2rem">{_ind_icon}</span>
+                <div>
+                    <div style="font-weight:700;font-size:0.95rem;color:{_ind_color}">{_ind_rank_text}</div>
+                    <div style="font-size:0.82rem;color:#555">{_ind_lbl}{' (' + _ind_grp + ')' if _ind_grp else ''}</div>
+                </div>
+            </div>
+            {_cmp_html}
+            {_discrepancy_html}
+        </div>
+        """, unsafe_allow_html=True)
+    elif assessment.missing_naics:
+        st.info("No NAICS code available — industry peer comparison not possible.", icon="ℹ️")
 
     # ── Split explanation into summary vs violation breakdown ─────────────
     import re as _re

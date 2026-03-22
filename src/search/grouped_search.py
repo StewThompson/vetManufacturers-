@@ -17,6 +17,7 @@ entity-resolution backend (e.g. fuzzy matching against an EIN database) later.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -34,6 +35,7 @@ class FacilityCandidate:
     city: str
     state: str
     address: str
+    naics_code: str             # NAICS industry code from first inspection
     confidence: float           # 0.0–1.0, how likely this variant belongs to the parent
     confidence_label: str       # "High" / "Medium" / "Low"
 
@@ -60,6 +62,17 @@ class GroupedCompanyResult:
     @property
     def raw_osha_names(self) -> List[str]:
         return [f.raw_name for f in self.all_facilities]
+
+    @property
+    def dominant_naics(self) -> str:
+        """Most common NAICS code among high- and medium-confidence facilities."""
+        codes = [
+            f.naics_code for f in self.high_confidence + self.medium_confidence
+            if f.naics_code
+        ]
+        if not codes:
+            return ""
+        return Counter(codes).most_common(1)[0][0]
 
 
 @dataclass
@@ -229,20 +242,39 @@ def _confidence_label(score: float) -> str:
 #  Location helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _location_info_for_name(raw_name: str, osha_client) -> Tuple[str, str, str]:
+def _estab_info_for_name(raw_name: str, osha_client) -> Tuple[str, str, str, str]:
     """
-    Return (city, state, address) for the first inspection associated with
-    a raw OSHA establishment name.  Falls back to empty strings gracefully.
+    Return (city, state, address, naics_code) for the first inspection associated
+    with a raw OSHA establishment name.  Falls back to empty strings gracefully.
+    Supports both the SQLite fast path and the in-memory path.
     """
-    name_upper = raw_name.upper()
-    inspections = osha_client._inspections_by_estab.get(name_upper, [])
+    if getattr(osha_client, "_use_sqlite", False) and osha_client._db_conn is not None:
+        # company_key in SQLite is computed via company_match_key() during the build step
+        ck = osha_client.company_match_key(raw_name.upper()).upper()
+        rows = osha_client._db_rows(
+            "SELECT site_city, site_state, site_address, naics_code "
+            "FROM inspections WHERE company_key = ? LIMIT 1",
+            (ck,),
+        )
+        if rows:
+            r = rows[0]
+            return (
+                (r.get("site_city",    "") or "").strip().title(),
+                (r.get("site_state",   "") or "").strip().upper(),
+                (r.get("site_address", "") or "").strip().title(),
+                (r.get("naics_code",   "") or "").strip(),
+            )
+        return "", "", "", ""
+    inspections = osha_client._inspections_by_estab.get(raw_name.upper(), [])
     if inspections:
         insp = inspections[0]
-        city    = (insp.get("site_city",    "") or "").strip().title()
-        state   = (insp.get("site_state",   "") or "").strip().upper()
-        address = (insp.get("site_address", "") or "").strip().title()
-        return city, state, address
-    return "", "", ""
+        return (
+            (insp.get("site_city",    "") or "").strip().title(),
+            (insp.get("site_state",   "") or "").strip().upper(),
+            (insp.get("site_address", "") or "").strip().title(),
+            (insp.get("naics_code",   "") or "").strip(),
+        )
+    return "", "", "", ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -295,6 +327,44 @@ def group_establishments(
     candidates.sort(key=lambda x: (-x[1], x[0]))
     candidates = candidates[:max_results]
 
+    # ── Step 1b: Pre-fetch NAICS codes for all candidates ────────────────
+    # Batch-query dominant NAICS code per company_key so Step 2b can enforce
+    # the 2-digit sector compatibility check without per-row DB round-trips.
+    naics_by_raw: Dict[str, str] = {}
+    if getattr(osha_client, "_use_sqlite", False) and osha_client._db_conn is not None:
+        key_to_raws: Dict[str, List[str]] = {}
+        for raw, _ in candidates:
+            ck = osha_client.company_match_key(raw.upper()).upper()
+            key_to_raws.setdefault(ck, []).append(raw)
+        if key_to_raws:
+            placeholders = ",".join("?" * len(key_to_raws))
+            naics_rows = osha_client._db_rows(
+                f"SELECT company_key, naics_code FROM inspections "
+                f"WHERE company_key IN ({placeholders}) AND naics_code != ''",
+                tuple(key_to_raws.keys()),
+            )
+            key_code_counts: Dict[str, Counter] = {}
+            for r in naics_rows:
+                ck = r["company_key"]
+                nc = (r.get("naics_code") or "").strip()
+                if nc:
+                    key_code_counts.setdefault(ck, Counter())[nc] += 1
+            for ck, raws in key_to_raws.items():
+                dominant = key_code_counts.get(ck, Counter()).most_common(1)
+                code = dominant[0][0] if dominant else ""
+                for raw in raws:
+                    naics_by_raw[raw] = code
+    else:
+        for raw, _ in candidates:
+            _, _, _, nc = _estab_info_for_name(raw, osha_client)
+            naics_by_raw[raw] = nc
+
+    def _dominant_naics2_for(members: List[Tuple[str, float]]) -> str:
+        """Most common 2-digit NAICS sector code among a cluster's members."""
+        codes = [naics_by_raw.get(r, "")[:2] for r, _ in members
+                 if naics_by_raw.get(r, "")[:2]]
+        return Counter(codes).most_common(1)[0][0] if codes else ""
+
     # ── Step 2: Cluster by parent prefix ─────────────────────────────────
     # The "parent prefix" is the normalised name stripped of facility codes.
     def _parent_prefix(name: str) -> str:
@@ -315,6 +385,36 @@ def group_establishments(
     for raw, score in candidates:
         prefix = _parent_prefix(raw)
         clusters.setdefault(prefix, []).append((raw, score))
+
+    # ── Step 2b: Merge sub-prefix clusters into the primary query cluster ─
+    # e.g. query="WALMART": clusters keyed "WALMART SUPERCENTER",
+    # "WALMART DISTRIBUTION CENTER", etc. should all fold into "WALMART" so
+    # the user sees one group, not 20.  We only merge when a shorter cluster
+    # key is a proper word-boundary prefix of a longer one, preventing false
+    # merges between unrelated companies that merely share a first word
+    # (e.g. "PARKER HANNIFIN" vs "PARKER BROTHERS").
+    sorted_keys = sorted(clusters.keys(), key=len)  # shortest first
+    merged_clusters: Dict[str, List[Tuple[str, float]]] = {}
+    for key in sorted_keys:
+        # Check if an already-accepted shorter key is a word-boundary prefix
+        parent_key = None
+        for mk in merged_clusters:
+            if key.startswith(mk + " ") or key == mk:
+                # NAICS 2-digit sector guard: only merge when both clusters share
+                # the same top-level industry (e.g. don't merge "WALMART AUTO CARE
+                # CENTER" (81 = repair) into "WALMART" (45 = retail)).
+                naics_a = _dominant_naics2_for(merged_clusters[mk])
+                naics_b = _dominant_naics2_for(clusters[key])
+                if naics_a and naics_b and naics_a != naics_b:
+                    # Different sectors — keep as a separate cluster
+                    break
+                parent_key = mk
+                break
+        if parent_key is not None:
+            merged_clusters[parent_key].extend(clusters[key])
+        else:
+            merged_clusters[key] = list(clusters[key])
+    clusters = merged_clusters
 
     # ── Step 3: Build GroupedCompanyResult for each cluster ───────────────
     groups: List[GroupedCompanyResult] = []
@@ -339,7 +439,7 @@ def group_establishments(
         overall_conf = sum(top_scores) / len(top_scores)
 
         def _build_facility(raw: str, score: float) -> FacilityCandidate:
-            city, state, address = _location_info_for_name(raw, osha_client)
+            city, state, address, naics_code = _estab_info_for_name(raw, osha_client)
             code = extract_facility_code(raw)
             # Build display name: strip facility code from the end for readability
             disp = normalize_establishment_name(raw).title()
@@ -350,6 +450,7 @@ def group_establishments(
                 city=city,
                 state=state,
                 address=address,
+                naics_code=naics_code,
                 confidence=score,
                 confidence_label=_confidence_label(score),
             )

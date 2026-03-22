@@ -2,6 +2,8 @@ import os
 import csv
 import json
 import re
+import sqlite3
+import threading
 import time
 import requests
 from typing import List, Dict, Optional, Tuple
@@ -33,6 +35,7 @@ class OSHAClient:
 
     # Cache settings
     CACHE_DIR = "ml_cache"
+    DB_CACHE = "osha_cache.db"
     INSP_CACHE = "inspections_bulk.csv"
     VIOL_CACHE = "violations_bulk.csv"
     ACC_CACHE = "accidents_bulk.csv"
@@ -96,114 +99,386 @@ class OSHAClient:
         self._summaries_by_inspection: Dict[str, set] = defaultdict(set)
         self._gen_duty_narratives: Dict[str, str] = {}  # key = "activity_nr|citation_id"
 
-        # Pre-built lists for the search UI
+        # Pre-built lists for the search UI (in-memory path)
         self._company_names: List[str] = []                    # sorted, title-cased, branch-deduplicated
         self._locations_by_company: Dict[str, List[str]] = {}   # COMPANY_UPPER -> ["123 Main St, City, ST 12345", …]
         self._estab_names_for_company: Dict[str, List[str]] = {}  # COMPANY_UPPER -> [raw ESTAB_UPPER, …]
         self._cache_loaded = False
 
-    # ---- Name-normalization patterns (class-level, compiled once) ----
-    # Branch/store-number prefix: "105891 - ", "WA317974334 - ", etc.
-    _BRANCH_PREFIX = re.compile(r'^(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{5,}\s+-\s+')
-    # Trailing store/location identifiers
-    _SUFFIX_PATTERNS = [
-        re.compile(r'\s*[-\u2013]?\s*(?:STORE|DC|PDC|FC|IDC|UNIT|LOC|WAREHOUSE)\s*#?\s*\d+\s*$', re.I),
-        re.compile(r'\s*#\s*\d+\s*$'),
-        re.compile(r'\s+NO\.?\s+\d+\s*$', re.I),
-        re.compile(r'\s+\d{4,}\s*$'),          # bare trailing 4+ digit number
-        re.compile(r'\s*[-\u2013]\s*$'),        # dangling hyphen
-        re.compile(r'\s*,\s*$'),                # dangling comma
-    ]
-    # Corporate suffixes (INC, LLC, LP, etc.)
-    _CORP_SUFFIX = re.compile(
-        r'[,.]?\s*\b(?:INC\.?|LLC\.?|L\.?P\.?|CORP\.?|CO\.?|LTD\.?|'
-        r'LIMITED PARTNERSHIP|INCORPORATED|CORPORATION|COMPANY)\s*$', re.I,
+        # SQLite fast path
+        self._use_sqlite = False
+        self._db_conn: Optional["sqlite3.Connection"] = None
+        self._db_lock = threading.Lock()
+        self._api_violations: Dict[str, list] = defaultdict(list)  # API-fetched, not yet in DB
+
+    # ================================================================== #
+    #  Name-normalisation — compiled patterns (class-level, once)
+    # ================================================================== #
+
+    # NFKD / Unicode pre-clean
+    _UNICODE_QUOTES = re.compile(r'[\u2018\u2019\u201a\u201b\u2032\u2035]')  # curly apostrophes
+    _UNICODE_DASHES = re.compile(r'[\u2010-\u2015\u2212]')                   # various dashes → -
+    _CONTROL_CHARS  = re.compile(r'[\x00-\x1f\x7f]')
+    _UNICODE_AMP    = re.compile(r'\uff06')                                   # ＆ → &
+
+    # Branch/tracking prefix: "105891 - ", "WA317974334 - ", etc.
+    _BRANCH_PREFIX  = re.compile(r'^[A-Za-z0-9]{5,}\s*[-–]\s+(?=[A-Za-z])')
+
+    # Punctuation / separator normalisation
+    _SLASH_SEP      = re.compile(r'\s*/\s*')    # "A/B" → "A B"
+    _AMP_TO_AND     = re.compile(r'\s*&\s*')    # "&" → " AND "
+    _AND_SPACES     = re.compile(r'\b AND \b', re.I)  # collapse spacing after amp expansion
+    _PUNCT_CLEAN    = re.compile(r"[''`]")       # apostrophes (after NFKD)
+    _TRAILING_PUNCT = re.compile(r'[.,;:\-–/]+$')
+    _WS             = re.compile(r'\s{2,}')
+
+    # DBA / formerly-known-as clauses
+    _DBA_CLAUSE     = re.compile(r'\s+(?:D/?B/?A|F/?K/?A|A/?K/?A)\s+.+$', re.I)
+
+    # Leading/trailing articles
+    _LEADING_THE    = re.compile(r'^THE\s+', re.I)
+    _TRAILING_THE   = re.compile(r'[,.]?\s*\bTHE\s*$', re.I)
+
+    # Corporate / legal suffixes — matched at end of string, up to 4 passes
+    _CORP_SUFFIX    = re.compile(
+        r'[,.]?\s*\b(?:'
+        r'INC\.?|INCORPORATED|'
+        r'LLC\.?|L\.?L\.?C\.?|'
+        r'LLP\.?|L\.?L\.?P\.?|'
+        r'LP\.?|L\.?P\.?|'
+        r'CORP\.?|CORPORATION|'
+        r'CO\.?|COMPANY|'
+        r'LTD\.?|LIMITED(?:\s+(?:PARTNERSHIP|LIABILITY\s+COMPANY))?|'
+        r'HOLDINGS?|GROUP|ENTERPRISES?|SOLUTIONS?|INDUSTRIES?|INTERNATIONAL'
+        r')\s*$',
+        re.I,
     )
-    # DBA clauses
-    _DBA_CLAUSE = re.compile(r'\s+D/?B/?A\s+.+$', re.I)
-    # Trailing/leading English articles ("the", "a", "an") that OSHA sometimes appends
-    _TRAILING_THE = re.compile(r'[,.]?\s*\bTHE\s*$', re.I)
-    _LEADING_THE  = re.compile(r'^\s*THE\s+', re.I)
-    # Normalize spelled-out "AND" / "&" so variants collapse to one key
-    _AMP_TO_AND   = re.compile(r'\s*&\s*')
-    _AND_SPACES   = re.compile(r'\s+AND\s+', re.I)
-    # Collapse runs of whitespace
-    _WS           = re.compile(r'\s{2,}')
+
+    # Facility-noise suffixes (only stripped in match_key, not canonical_name).
+    # The number is optional: strips "STORE #123", "STORE 45", and bare "STORE".
+    _FACILITY_NOISE = re.compile(
+        r'\s*[-\u2013,]?\s*\b(?:'
+        r'PLANT|BLDG|BUILDING|UNIT|LOC|LOCATION|'
+        r'STORE|'
+        r'WAREHOUSE|WH|'
+        r'DC|PDC|FC|IDC|'
+        r'YARD|ANNEX|CAMPUS|COMPLEX|SITE|'
+        r'DIVISION|DIV'
+        r')\s*(?:#?\s*\d+)?\s*$',
+        re.I,
+    )
+    # Hash-prefixed numbers always stripped (canonical + match_key): " #1189", "#2345"
+    _TRAILING_HASH_NUM = re.compile(r'\s*#\s*\d+\s*$')
+    # Bare 4+-digit trailing numbers (store numbers without #)
+    _TRAILING_NUM   = re.compile(r'\s+\d{4,}\s*$')
+    # Dangling separator left after stripping
+    _DANGLING_SEP   = re.compile(r'\s*[-\u2013,/]\s*$')
+
+    # Token-level abbreviation canonicalisation (applied in match_key)
+    _TOKEN_CANON: Dict[str, str] = {
+        'INTL':   'INTERNATIONAL',
+        'INTNL':  'INTERNATIONAL',
+        'MFG':    'MANUFACTURING',
+        'MFGR':   'MANUFACTURING',
+        'MFR':    'MANUFACTURING',
+        'IND':    'INDUSTRIAL',
+        'INDS':   'INDUSTRIES',
+        'INDUS':  'INDUSTRIES',
+        'SVCS':   'SERVICES',
+        'SVC':    'SERVICES',
+        'TECH':   'TECHNOLOGY',
+        'TECHS':  'TECHNOLOGIES',
+        'DIST':   'DISTRIBUTION',
+        'DISTR':  'DISTRIBUTION',
+        'DISTRIB':'DISTRIBUTION',
+        'DISTRO': 'DISTRIBUTION',
+        'PKG':    'PACKAGING',
+        'PKG':    'PACKAGING',
+        'PRODS':  'PRODUCTS',
+        'PROD':   'PRODUCTS',
+        'EQUIP':  'EQUIPMENT',
+        'CORP':   '',           # already stripped by _CORP_SUFFIX, but belt-and-suspenders
+        'ASSOC':  'ASSOCIATES',
+        'ASSOCS': 'ASSOCIATES',
+        'GRP':    'GROUP',
+        'MGMT':   'MANAGEMENT',
+        'MGNT':   'MANAGEMENT',
+        'NATL':   'NATIONAL',
+        'NATL':   'NATIONAL',
+        'AMER':   'AMERICAN',
+        'AMER':   'AMERICAN',
+        'PWR':    'POWER',
+        'SYS':    'SYSTEMS',
+        'SYS':    'SYSTEMS',
+        'ENGRG':  'ENGINEERING',
+        'ENGR':   'ENGINEERING',
+        'ENG':    'ENGINEERING',
+        'CHEM':   'CHEMICAL',
+        'CHEMS':  'CHEMICALS',
+        'ELEC':   'ELECTRIC',
+        'ELECS':  'ELECTRIC',
+        'AUTH':   'AUTHORITY',
+    }
+
+    # ------------------------------------------------------------------ #
+    #  Internal helpers
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def _preclean(cls, raw: str) -> str:
+        """
+        Unicode folding + structural clean-up before any pattern matching.
+        Returns an uppercased, whitespace-normalised string.
+        """
+        import unicodedata
+        # NFKD decomposition folds ligatures, fullwidth chars, etc.
+        s = unicodedata.normalize('NFKD', raw)
+        # Drop combining diacritics (accents) so "RÉSUMÉ" → "RESUME"
+        s = ''.join(c for c in s if not unicodedata.combining(c))
+        s = cls._UNICODE_QUOTES.sub("'", s)
+        s = cls._UNICODE_DASHES.sub('-', s)
+        s = cls._UNICODE_AMP.sub('&', s)
+        s = cls._CONTROL_CHARS.sub(' ', s)
+        s = s.upper()
+        # Strip branch/tracking prefix ("105891 - ", "WA317974334 - ")
+        s = cls._BRANCH_PREFIX.sub('', s).strip()
+        # Normalise punctuation
+        s = cls._SLASH_SEP.sub(' ', s)         # "/" → space
+        s = cls._PUNCT_CLEAN.sub('', s)        # apostrophes
+        s = cls._AMP_TO_AND.sub(' AND ', s)    # & → AND
+        s = cls._WS.sub(' ', s).strip()
+        return s
 
     @classmethod
-    def _normalize_company_name(cls, raw: str) -> str:
+    def _strip_noise(cls, s: str, strip_facility: bool = False) -> str:
         """
-        Strip branch prefix, store numbers, corporate suffixes, trailing
-        articles, and canonicalize '&' ↔ 'AND' so that equivalent OSHA
-        establishment name variants collapse to the same lookup key.
-
-        Examples that all produce "GOODYEAR TIRE AND RUBBER":
-          GOODYEAR TIRE & RUBBER
-          GOODYEAR TIRE AND RUBBER
-          GOODYEAR TIRE AND RUBBER COMPANY
-          GOODYEAR TIRE & RUBBER CO THE
-          GOODYEAR TIRE & RUBBER, THE
+        Remove DBA clauses, THE articles, legal suffixes, trailing hash-numbers,
+        and optionally facility-specific noise (PLANT 1, BUILDING 4, STORE 123, etc.).
+        Runs suffix-stripping passes until stable.
         """
-        s = cls._BRANCH_PREFIX.sub('', raw).strip()
+        # DBA / FKA clause
+        s = cls._DBA_CLAUSE.sub('', s).strip()
 
-        # Iteratively strip store-number suffixes
+        # Always strip trailing " #\d+" (hash-prefixed store/unit numbers)
+        # and bare 4+ digit numbers, plus dangling separators — even in canonical.
+        always_patterns = (cls._TRAILING_HASH_NUM, cls._TRAILING_NUM, cls._DANGLING_SEP)
+        facility_patterns = (cls._FACILITY_NOISE,) if strip_facility else ()
+
         changed = True
         while changed:
             changed = False
-            for pat in cls._SUFFIX_PATTERNS:
+            for pat in always_patterns + facility_patterns:
                 new = pat.sub('', s).strip()
                 if new != s:
                     s = new
                     changed = True
 
-        # Strip DBA clause
-        s = cls._DBA_CLAUSE.sub('', s).strip()
-
-        # Strip trailing "THE" before corp-suffix pass (handles "CO THE", ", THE")
+        # Strip trailing THE before corp suffix (handles "CO THE")
         s = cls._TRAILING_THE.sub('', s).strip()
 
-        # Strip corporate suffixes (up to 4 passes for nested cases like "CO, INC.")
-        for _ in range(4):
+        # Strip corporate suffixes — up to 5 passes for stacked suffixes "CO, INC."
+        for _ in range(5):
             new = cls._CORP_SUFFIX.sub('', s).strip()
             if new == s:
                 break
             s = new
 
-        # Strip trailing "THE" again in case it was hidden behind a corp suffix
+        # Strip THE again (may have been hidden behind a corp suffix)
         s = cls._TRAILING_THE.sub('', s).strip()
-        # Strip leading "THE "
         s = cls._LEADING_THE.sub('', s).strip()
 
-        s = s.rstrip('.,;').strip()
-
-        # Canonicalize ampersand: "& " → " AND " so "Tire & Rubber" == "Tire And Rubber"
-        s = cls._AMP_TO_AND.sub(' AND ', s)
-        s = cls._AND_SPACES.sub(' AND ', s)
-
-        # Collapse any double-spaces introduced above
+        # Clean up any trailing punctuation left behind
+        s = cls._TRAILING_PUNCT.sub('', s).strip()
         s = cls._WS.sub(' ', s).strip()
-
         return s
+
+    @classmethod
+    def _canonicalize_tokens(cls, s: str) -> str:
+        """
+        Expand known abbreviations token by token.
+        Only replaces whole tokens to avoid partial matches
+        (e.g. "TECH" in "BIOTECH" must not expand).
+        Empty expansions (e.g. CORP → '') remove the token.
+        """
+        tokens = s.split()
+        result = []
+        for tok in tokens:
+            expanded = cls._TOKEN_CANON.get(tok)
+            if expanded is None:
+                result.append(tok)
+            elif expanded:          # non-empty → replace
+                result.append(expanded)
+            # empty string → drop the token entirely
+        return ' '.join(result)
+
+    # ------------------------------------------------------------------ #
+    #  Public-facing normalisation methods
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def _normalize_company_name(cls, raw: str) -> str:
+        """
+        Conservative canonical form — suitable for display, lookup keys, and
+        the SQLite ``company_key`` column.
+
+        Strips: branch prefixes, DBA clauses, THE articles, legal suffixes,
+        Unicode noise, punctuation.  Does NOT strip facility descriptors or
+        expand abbreviations (use ``company_match_key`` for that).
+
+        Examples that all produce "GOODYEAR TIRE AND RUBBER":
+          Goodyear Tire & Rubber
+          GOODYEAR TIRE AND RUBBER COMPANY
+          Goodyear Tire & Rubber, The
+          Goodyear Tire & Rubber Co THE
+        """
+        s = cls._preclean(raw)
+        s = cls._strip_noise(s, strip_facility=False)
+        return s
+
+    @classmethod
+    def company_match_key(cls, raw: str) -> str:
+        """
+        Aggressive clustering key — used for fuzzy grouping and search where
+        over-precision hurts recall more than a rare false-positive hurts.
+
+        On top of ``_normalize_company_name`` this also:
+          • strips facility descriptors  (PLANT 1, BUILDING 4, STORE 123 …)
+          • expands common abbreviations (MFG→MANUFACTURING, INTL→INTERNATIONAL …)
+          • collapses any spacing artifacts from the above
+
+        Two names that differ only in facility number, legal suffix, abbreviated
+        word, or Unicode representation will produce the same match key.
+        """
+        s = cls._preclean(raw)
+        s = cls._strip_noise(s, strip_facility=True)
+        s = cls._canonicalize_tokens(s)
+        s = cls._WS.sub(' ', s).strip()
+        return s
+
+    # ================================================================== #
+    #  SQLite helpers
+    # ================================================================== #
+    @property
+    def _db_path(self) -> str:
+        return os.path.join(self.CACHE_DIR, self.DB_CACHE)
+
+    def _init_db(self) -> bool:
+        """Open the SQLite connection. Returns True if DB exists and opens cleanly."""
+        if self._db_conn is not None:
+            return True
+        if not os.path.exists(self._db_path):
+            return False
+        try:
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("SELECT 1 FROM inspections LIMIT 1")  # sanity check
+            self._db_conn = conn
+            self._use_sqlite = True
+            self._cache_loaded = True
+            insp_count = conn.execute("SELECT COUNT(*) FROM inspections").fetchone()[0]
+            viol_count = conn.execute("SELECT COUNT(*) FROM violations").fetchone()[0]
+            print(f"Opened SQLite cache: {insp_count:,} inspections, {viol_count:,} violations.")
+            return True
+        except Exception as e:
+            print(f"SQLite cache open failed ({e}); falling back to CSV load.")
+            return False
+
+    def _db_rows(self, sql: str, params: tuple = ()) -> list:
+        """Execute a SELECT and return results as a list of plain dicts."""
+        if self._db_conn is None:
+            return []
+        return [dict(r) for r in self._db_conn.execute(sql, params).fetchall()]
+
+    def _sqlite_upsert_inspection(self, insp: dict):
+        """Insert or ignore a delta inspection into the SQLite DB."""
+        if self._db_conn is None:
+            return
+        try:
+            existing_cols = {
+                row["name"]
+                for row in self._db_conn.execute("PRAGMA table_info(inspections)").fetchall()
+            }
+            raw = (insp.get("estab_name") or "").upper()
+            company_key = self.company_match_key(raw).upper() if raw else ""
+            row_data = {k: v for k, v in insp.items() if k in existing_cols}
+            row_data["company_key"] = company_key
+            cols = list(row_data.keys())
+            col_names = ", ".join(f'"{c}"' for c in cols)
+            placeholders = ", ".join("?" for _ in cols)
+            with self._db_lock:
+                self._db_conn.execute(
+                    f"INSERT OR IGNORE INTO inspections ({col_names}) VALUES ({placeholders})",
+                    list(row_data.values()),
+                )
+                self._db_conn.execute(
+                    "INSERT OR IGNORE INTO company_names VALUES (?, ?)",
+                    (company_key, company_key.title()),
+                )
+                self._db_conn.commit()
+        except Exception as e:
+            print(f"  Delta inspection insert failed: {e}")
+
+    def _sqlite_upsert_violation(self, viol: dict):
+        """Insert or ignore a delta violation into the SQLite DB."""
+        if self._db_conn is None:
+            return
+        try:
+            existing_cols = {
+                row["name"]
+                for row in self._db_conn.execute("PRAGMA table_info(violations)").fetchall()
+            }
+            row_data = {k: v for k, v in viol.items() if k in existing_cols}
+            if not row_data:
+                return
+            cols = list(row_data.keys())
+            col_names = ", ".join(f'"{c}"' for c in cols)
+            placeholders = ", ".join("?" for _ in cols)
+            with self._db_lock:
+                self._db_conn.execute(
+                    f"INSERT OR IGNORE INTO violations ({col_names}) VALUES ({placeholders})",
+                    list(row_data.values()),
+                )
+                self._db_conn.commit()
+        except Exception as e:
+            print(f"  Delta violation insert failed: {e}")
 
     # ================================================================== #
     #  Cache loading + lightweight delta
     # ================================================================== #
     def ensure_cache(self, force: bool = False) -> bool:
         """
-        Load the pre-built bulk cache from disk.
-        The heavy fetching is done offline by build_cache.py.
-        This method only loads the cache into memory and optionally
-        fetches a small delta (records newer than cache date).
+        Open the OSHA cache (SQLite fast path) or load CSVs into memory.
+        The heavy data work is done offline by build_cache.py.
         """
         if self._cache_loaded and not force:
             return True
 
+        if force and self._db_conn is not None:
+            self._db_conn.close()
+            self._db_conn = None
+            self._use_sqlite = False
+            self._cache_loaded = False
+
+        # Fast path: SQLite DB built by build_cache.py
+        if self._init_db():
+            meta_path = os.path.join(self.CACHE_DIR, self.CACHE_META)
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    cache_date = meta.get("date")
+                    if cache_date:
+                        self._delta_fetch(cache_date)
+                except Exception as e:
+                    print(f"Delta fetch skipped: {e}")
+            return True
+
+        # Fallback: load CSVs into memory (if DB not built yet)
         self._load_cache_from_disk()
         if not self._cache_loaded:
             print("No OSHA cache found. Run build_cache.py first.")
             return False
 
-        # Lightweight delta: fetch only records newer than the cache date
         meta_path = os.path.join(self.CACHE_DIR, self.CACHE_META)
         if os.path.exists(meta_path):
             try:
@@ -219,7 +494,7 @@ class OSHAClient:
 
     def _delta_fetch(self, since_date: str):
         """
-        Fetch only records newer than since_date and merge into memory.
+        Fetch only records newer than since_date and merge into the cache.
         At most 2 lightweight API calls (inspections + violations).
         """
         print(f"  Delta fetch for records after {since_date}…")
@@ -235,8 +510,11 @@ class OSHAClient:
             "filter_object": insp_filter,
         }, timeout=15)
         for insp in new_insp:
-            name = (insp.get("estab_name") or "").upper()
-            self._inspections_by_estab[name].append(insp)
+            if self._use_sqlite:
+                self._sqlite_upsert_inspection(insp)
+            else:
+                name = (insp.get("estab_name") or "").upper()
+                self._inspections_by_estab[name].append(insp)
 
         viol_filter = json.dumps({"and": [
             {"field": "current_penalty", "operator": "gt", "value": "0"},
@@ -252,8 +530,11 @@ class OSHAClient:
         for v in new_viol:
             if v.get("delete_flag") == "X":
                 continue
-            act = str(v.get("activity_nr", ""))
-            self._violations_by_activity[act].append(v)
+            if self._use_sqlite:
+                self._sqlite_upsert_violation(v)
+            else:
+                act = str(v.get("activity_nr", ""))
+                self._violations_by_activity[act].append(v)
 
         if new_insp or new_viol:
             print(f"  Delta: +{len(new_insp)} inspections, +{len(new_viol)} violations.")
@@ -272,7 +553,7 @@ class OSHAClient:
             return list(csv.DictReader(f))
 
     def _load_cache_from_disk(self):
-        """Load cached CSV files into memory indexes (falls back to legacy JSON)."""
+        """Load cached CSV files into memory indexes (falls back to JSON)."""
         insp_path = os.path.join(self.CACHE_DIR, self.INSP_CACHE)
         viol_path = os.path.join(self.CACHE_DIR, self.VIOL_CACHE)
         inspections = self._read_csv_cache(insp_path)
@@ -362,7 +643,7 @@ class OSHAClient:
         for estab_upper in self._inspections_by_estab:
             if not estab_upper:
                 continue
-            clean = self._normalize_company_name(estab_upper).upper()
+            clean = self.company_match_key(estab_upper).upper()
             if clean:
                 company_estabs[clean].append(estab_upper)
 
@@ -420,7 +701,8 @@ class OSHAClient:
     def get_bulk_inspections(self) -> list:
         """Return all cached raw inspection dicts (for ML scorer)."""
         self.ensure_cache()
-        # Flatten the index
+        if self._use_sqlite:
+            return self._db_rows("SELECT * FROM inspections")
         all_insp = []
         for insp_list in self._inspections_by_estab.values():
             all_insp.extend(insp_list)
@@ -429,6 +711,8 @@ class OSHAClient:
     def get_bulk_violations(self) -> list:
         """Return all cached raw violation dicts (for ML scorer)."""
         self.ensure_cache()
+        if self._use_sqlite:
+            return self._db_rows("SELECT * FROM violations")
         all_viol = []
         for viol_list in self._violations_by_activity.values():
             all_viol.extend(viol_list)
@@ -437,23 +721,60 @@ class OSHAClient:
     def get_violations_for_activity(self, activity_nr: str) -> list:
         """Look up violations by activity_nr from the cache."""
         self.ensure_cache()
+        if self._use_sqlite:
+            sql_rows = self._db_rows(
+                "SELECT * FROM violations WHERE activity_nr = ?", (str(activity_nr),)
+            )
+            api_rows = self._api_violations.get(str(activity_nr), [])
+            return sql_rows + api_rows
         return self._violations_by_activity.get(str(activity_nr), [])
 
     def get_injuries_for_inspection(self, activity_nr: str) -> list:
         """Return decoded injury records linked to an inspection."""
         self.ensure_cache()
-        raw = self._injuries_by_inspection.get(str(activity_nr), [])
+        if self._use_sqlite:
+            raw = self._db_rows(
+                "SELECT * FROM injuries WHERE rel_insp_nr = ?", (str(activity_nr),)
+            )
+        else:
+            raw = self._injuries_by_inspection.get(str(activity_nr), [])
         return [self._decode_injury(inj) for inj in raw]
 
     def get_accidents_for_inspection(self, activity_nr: str) -> List[AccidentSummary]:
         """Return AccidentSummary objects linked to an inspection."""
         self.ensure_cache()
-        summaries = self._summaries_by_inspection.get(str(activity_nr), set())
+        act = str(activity_nr)
+        if self._use_sqlite:
+            summary_rows = self._db_rows(
+                "SELECT DISTINCT summary_nr FROM injuries WHERE rel_insp_nr = ?", (act,)
+            )
+            results = []
+            for sr in summary_rows:
+                snr = sr["summary_nr"]
+                acc_rows = self._db_rows("SELECT * FROM accidents WHERE summary_nr = ?", (snr,))
+                acc = acc_rows[0] if acc_rows else {}
+                inj_rows = self._db_rows(
+                    "SELECT * FROM injuries WHERE rel_insp_nr = ? AND summary_nr = ?", (act, snr)
+                )
+                injuries = [self._decode_injury(inj) for inj in inj_rows]
+                fatality_flag = str(acc.get("fatality", "")).strip()
+                is_fatality = fatality_flag in ("1", "Y", "True")
+                if not is_fatality:
+                    is_fatality = any(inj.get("degree") == "Fatality" for inj in injuries)
+                results.append(AccidentSummary(
+                    summary_nr=snr,
+                    event_date=acc.get("event_date", "")[:10] if acc.get("event_date") else None,
+                    event_desc=acc.get("event_desc", ""),
+                    fatality=is_fatality,
+                    injuries=injuries,
+                ))
+            return results
+        summaries = self._summaries_by_inspection.get(act, set())
         results = []
         for snr in summaries:
             acc = self._accidents_by_summary.get(snr, {})
             injuries = [self._decode_injury(inj)
-                        for inj in self._injuries_by_inspection.get(str(activity_nr), [])
+                        for inj in self._injuries_by_inspection.get(act, [])
                         if str(inj.get("summary_nr", "")) == snr]
             fatality_flag = str(acc.get("fatality", "")).strip()
             is_fatality = fatality_flag in ("1", "Y", "True")
@@ -496,10 +817,24 @@ class OSHAClient:
     def get_gen_duty_narrative(self, activity_nr: str, citation_id: str) -> str:
         """Return the inspector narrative for a specific Gen Duty citation (on-demand lookup)."""
         self.ensure_cache()
+        if self._use_sqlite:
+            rows = self._db_rows(
+                "SELECT narrative_text FROM gen_duty_narratives "
+                "WHERE activity_nr = ? AND citation_id = ?",
+                (str(activity_nr), str(citation_id)),
+            )
+            return rows[0]["narrative_text"] if rows else ""
         return self._gen_duty_narratives.get(f"{activity_nr}|{citation_id}", "")
 
     def get_accident_abstract(self, summary_nr: str) -> str:
-        """Load the pre-joined abstract text for a specific accident (disk read)."""
+        """Return the pre-joined abstract text for a specific accident."""
+        self.ensure_cache()
+        if self._use_sqlite:
+            rows = self._db_rows(
+                "SELECT abstract_text FROM accident_abstracts WHERE summary_nr = ?",
+                (str(summary_nr),),
+            )
+            return rows[0]["abstract_text"] if rows else ""
         abs_path = os.path.join(self.CACHE_DIR, self.ABS_CACHE)
         if not os.path.exists(abs_path):
             return ""
@@ -522,13 +857,39 @@ class OSHAClient:
     def get_accident_count_for_activity(self, activity_nr: str) -> dict:
         """Quick stats: accident count, fatalities, injuries for one inspection."""
         self.ensure_cache()
-        summaries = self._summaries_by_inspection.get(str(activity_nr), set())
+        act = str(activity_nr)
+        if self._use_sqlite:
+            summary_rows = self._db_rows(
+                "SELECT DISTINCT summary_nr FROM injuries WHERE rel_insp_nr = ?", (act,)
+            )
+            fatalities = 0
+            injury_count = 0
+            for sr in summary_rows:
+                snr = sr["summary_nr"]
+                acc_rows = self._db_rows(
+                    "SELECT fatality FROM accidents WHERE summary_nr = ?", (snr,)
+                )
+                acc = acc_rows[0] if acc_rows else {}
+                is_fatal = str(acc.get("fatality", "")).strip() in ("1", "Y", "True")
+                inj_rows = self._db_rows(
+                    "SELECT degree_of_inj FROM injuries "
+                    "WHERE rel_insp_nr = ? AND summary_nr = ?", (act, snr)
+                )
+                if not is_fatal:
+                    is_fatal = any(
+                        str(r.get("degree_of_inj", "")).startswith("1") for r in inj_rows
+                    )
+                if is_fatal:
+                    fatalities += 1
+                injury_count += len(inj_rows)
+            return {"accidents": len(summary_rows), "fatalities": fatalities, "injuries": injury_count}
+        summaries = self._summaries_by_inspection.get(act, set())
         fatalities = 0
         injury_count = 0
         for snr in summaries:
             acc = self._accidents_by_summary.get(snr, {})
             is_fatal = str(acc.get("fatality", "")).strip() in ("1", "Y", "True")
-            injs_for_snr = [inj for inj in self._injuries_by_inspection.get(str(activity_nr), [])
+            injs_for_snr = [inj for inj in self._injuries_by_inspection.get(act, [])
                             if str(inj.get("summary_nr", "")) == snr]
             # Also check injury degree for fatality
             if not is_fatal:
@@ -544,42 +905,72 @@ class OSHAClient:
     def get_all_company_names(self) -> List[str]:
         """Return sorted, branch-deduplicated company names (title-cased)."""
         self.ensure_cache()
+        if self._use_sqlite:
+            rows = self._db_rows("SELECT name FROM company_names ORDER BY name")
+            return [r["name"] for r in rows]
         return self._company_names
 
     def get_locations_for_company(self, company: str) -> List[str]:
         """Return full-address locations recorded for *company*."""
         self.ensure_cache()
+        if self._use_sqlite:
+            key = self.company_match_key(company.strip().upper()).upper()
+            rows = self._db_rows(
+                "SELECT site_address, site_city, site_state, site_zip "
+                "FROM inspections WHERE company_key = ?", (key,)
+            )
+            seen: set = set()
+            locs: List[str] = []
+            for r in rows:
+                addr = (r.get("site_address") or "").strip()
+                city = (r.get("site_city") or "").strip()
+                state = (r.get("site_state") or "").strip()
+                zip_code = (r.get("site_zip") or "").strip()
+                parts = [p for p in (addr, city, state + (" " + zip_code if zip_code else "")) if p]
+                loc = ", ".join(parts)
+                if loc and loc not in seen:
+                    seen.add(loc)
+                    locs.append(loc)
+            return locs
         return self._locations_by_company.get(company.strip().upper(), [])
 
     def _search_cache(self, name: str, locations: Optional[List[str]] = None) -> Optional[List[OSHARecord]]:
         """
         Find matching inspections in the cache by company name.
-        *name* is a branch-deduplicated company name; we look up all raw
-        estab keys that belong to it, then optionally filter by *locations*
-        (list of full-address strings the user selected).
         Returns None if no match found (caller should fall back to API).
         """
         search = name.strip().upper()
 
-        # Resolve company -> underlying estab keys
-        estab_keys = self._estab_names_for_company.get(search)
-        if not estab_keys:
-            # Fallback: try raw estab index directly
-            if search in self._inspections_by_estab:
-                estab_keys = [search]
-            else:
-                # Substring search
-                estab_keys = [e for e in self._inspections_by_estab if search in e or e in search]
-
-        if not estab_keys:
-            return None
-
-        matches = []
-        for ek in estab_keys:
-            matches.extend(self._inspections_by_estab.get(ek, []))
-
-        if not matches:
-            return None
+        if self._use_sqlite:
+            key = self.company_match_key(search).upper()
+            matches = self._db_rows(
+                "SELECT * FROM inspections WHERE company_key = ?", (key,)
+            )
+            if not matches:
+                # Substring fallback on company_key and raw estab_name
+                matches = self._db_rows(
+                    "SELECT * FROM inspections WHERE company_key LIKE ? OR estab_name LIKE ?",
+                    (f"%{key}%", f"%{search}%"),
+                )
+            if not matches:
+                return None
+        else:
+            # In-memory path
+            estab_keys = self._estab_names_for_company.get(search)
+            if not estab_keys:
+                # Fallback: try raw estab index directly
+                if search in self._inspections_by_estab:
+                    estab_keys = [search]
+                else:
+                    # Substring search
+                    estab_keys = [e for e in self._inspections_by_estab if search in e or e in search]
+            if not estab_keys:
+                return None
+            matches = []
+            for ek in estab_keys:
+                matches.extend(self._inspections_by_estab.get(ek, []))
+            if not matches:
+                return None
 
         # Filter by selected locations (full-address match)
         if locations:
@@ -612,16 +1003,15 @@ class OSHAClient:
             except ValueError:
                 date_opened = date.today()
 
-            raw_viols = self._violations_by_activity.get(activity_nr, [])
+            raw_viols = self.get_violations_for_activity(activity_nr)
             violations, total_penalties = self._parse_violations(raw_viols)
 
             # Attach inspector narratives for high-priority General Duty violations only
-            if self._gen_duty_narratives:
-                for v in violations:
-                    if self._is_gen_duty_standard(v.category) and self._is_high_priority_violation(v):
-                        narrative = self._gen_duty_narratives.get(f"{activity_nr}|{v.citation_id or ''}", "")
-                        if narrative:
-                            v.gen_duty_narrative = narrative
+            for v in violations:
+                if self._is_gen_duty_standard(v.category) and self._is_high_priority_violation(v):
+                    narrative = self.get_gen_duty_narrative(activity_nr, v.citation_id or "")
+                    if narrative:
+                        v.gen_duty_narrative = narrative
 
             # Accident data — linked via injury records
             accidents = self.get_accidents_for_inspection(activity_nr)
@@ -663,16 +1053,24 @@ class OSHAClient:
 
     def _batch_fetch_violations(self, activity_nrs: list):
         """
-        Fetch violations for a list of activity_nrs in ONE API call
-        using a compound 'or' filter with multiple 'eq' conditions.
-        Checks the in-memory cache first; only queries missing ones.
+        Fetch violations for a list of activity_nrs in ONE API call.
+        Checks the cache first; only queries missing ones.
         """
         if not activity_nrs:
             return
 
-        # Filter to only activity_nrs not already cached
-        missing = [a for a in activity_nrs
-                   if a and a not in self._violations_by_activity]
+        if self._use_sqlite:
+            missing = []
+            for a in activity_nrs:
+                if not a or a in self._api_violations:
+                    continue
+                if not self._db_rows(
+                    "SELECT 1 FROM violations WHERE activity_nr = ? LIMIT 1", (a,)
+                ):
+                    missing.append(a)
+        else:
+            missing = [a for a in activity_nrs
+                       if a and a not in self._violations_by_activity]
 
         if not missing:
             return
@@ -701,7 +1099,10 @@ class OSHAClient:
             if v.get("delete_flag") == "X":
                 continue
             act = str(v.get("activity_nr", ""))
-            self._violations_by_activity[act].append(v)
+            if self._use_sqlite:
+                self._api_violations[act].append(v)
+            else:
+                self._violations_by_activity[act].append(v)
 
     # ================================================================== #
     #  Low-level helpers

@@ -42,15 +42,42 @@ class VettingAgent:
         establishment names (e.g. individual facilities selected by the user).
         This bypasses the normal name-resolution path.
         """
-        from src.models.manufacturer import Manufacturer
         self.osha_client.ensure_cache()
 
-        # Collect all inspections for the given raw estab keys
+        # Collect all inspections for the given raw estab keys, deduplicated by activity_nr.
+        seen_activity_nrs: set = set()
         all_inspections = []
-        for raw in raw_names:
-            upper = raw.upper()
-            all_inspections.extend(self.osha_client._inspections_by_estab.get(upper, []))
 
+        if self.osha_client._use_sqlite:
+            for raw in raw_names:
+                # Use company_match_key for consistent lookup with how build_cache stores keys
+                key = self.osha_client.company_match_key(raw.upper()).upper()
+                rows = self.osha_client._db_rows(
+                    "SELECT * FROM inspections WHERE company_key = ?", (key,)
+                )
+                for row in rows:
+                    act_nr = str(row.get("activity_nr", ""))
+                    if act_nr and act_nr not in seen_activity_nrs:
+                        seen_activity_nrs.add(act_nr)
+                        all_inspections.append(row)
+        else:
+            for raw in raw_names:
+                # _inspections_by_estab is keyed by raw estab_name, not company key.
+                # Use _estab_names_for_company to expand the company key to all its
+                # individual establishment names first (same logic as _search_cache).
+                key = self.osha_client.company_match_key(raw.upper()).upper()
+                estab_names = self.osha_client._estab_names_for_company.get(key, [])
+                if not estab_names and raw.upper() in self.osha_client._inspections_by_estab:
+                    estab_names = [raw.upper()]
+                for estab in estab_names:
+                    for insp in self.osha_client._inspections_by_estab.get(estab, []):
+                        act_nr = str(insp.get("activity_nr", ""))
+                        if act_nr and act_nr not in seen_activity_nrs:
+                            seen_activity_nrs.add(act_nr)
+                            all_inspections.append(insp)
+
+        print(f"  vet_by_raw_estab_names: {len(raw_names)} selected name(s) → "
+              f"{len(seen_activity_nrs)} unique inspections")
         records = self.osha_client._build_records(all_inspections) if all_inspections else []
         manufacturer = Manufacturer(name=display_name)
         reputation_data = self.reputation_client.search_news(display_name)

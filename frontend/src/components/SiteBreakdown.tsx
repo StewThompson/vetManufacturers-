@@ -5,8 +5,8 @@ import type { SiteScoreOut } from '../types/assessment'
 
 function scoreStyle(params: { value: number }): Record<string, string | number> {
   const v = params.value as number
-  if (v >= 0.7) return { color: '#dc2626', fontWeight: 700 }
-  if (v >= 0.4) return { color: '#d97706', fontWeight: 500 }
+  if (v >= 60) return { color: '#dc2626', fontWeight: 700 }
+  if (v >= 30) return { color: '#d97706', fontWeight: 500 }
   return { color: '#059669', fontWeight: 400 }
 }
 
@@ -23,7 +23,7 @@ const COLUMN_DEFS: ColDef<SiteScoreOut>[] = [
     type: 'numericColumn',
     filter: 'agNumberColumnFilter',
     cellStyle: scoreStyle,
-    valueFormatter: (p) => (p.value as number).toFixed(3),
+    valueFormatter: (p) => `${(p.value as number).toFixed(1)} / 100`,
     sort: 'desc',
   },
 ]
@@ -35,7 +35,7 @@ export default function SiteBreakdown({ sites }: { sites: SiteScoreOut[] }) {
   )
 
   return (
-    <div className="ag-theme-alpine" style={{ height: 340, width: '100%' }}>
+    <div className="ag-theme-alpine" style={{ width: '100%' }}>
       <AgGridReact<SiteScoreOut>
         rowData={sorted}
         columnDefs={COLUMN_DEFS}
@@ -43,6 +43,7 @@ export default function SiteBreakdown({ sites }: { sites: SiteScoreOut[] }) {
         rowHeight={32}
         headerHeight={36}
         suppressCellFocus
+        domLayout="autoHeight"
       />
     </div>
   )

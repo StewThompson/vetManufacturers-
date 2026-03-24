@@ -26,6 +26,7 @@ from typing import AsyncGenerator, List, Optional
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from src.agent.vetting_agent import VettingAgent
 from src.search.grouped_search import (
@@ -275,11 +276,6 @@ async def assess(
 
             assessment = await future
 
-            # Optionally run LLM enhancement (non-streaming for now)
-            if agent.client:
-                yield _sse("progress", {"message": "✍ Generating AI summary…"})
-                agent.enhance_explanation(assessment)
-
             result = _assessment_response(assessment)
             yield _sse("result", {"data": result.model_dump()})
 
@@ -294,3 +290,112 @@ async def assess(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── Chat ──────────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    question: str
+    assessment: dict  # full AssessmentResponse payload from the client
+
+
+@app.post("/api/chat")
+async def chat(body: ChatRequest):
+    """
+    Answer a question about a completed assessment using the LLM.
+    Reconstructs just enough of the assessment to call discuss_assessment.
+    """
+    agent = _get_agent()
+    if not agent.client:
+        return {"answer": "LLM features are not enabled — set GOOGLE_API_KEY to use Q&A."}
+
+    # Rebuild a lightweight assessment stub the agent can use for Q&A
+    from src.models.manufacturer import Manufacturer
+    from src.models.assessment import RiskAssessment
+    from src.models.osha_record import OSHARecord, Violation, AccidentSummary
+    import datetime
+
+    data = body.assessment
+
+    def _rebuild_violations(raw: list) -> list:
+        out = []
+        for v in raw:
+            out.append(Violation(
+                category=v.get("category", ""),
+                severity=v.get("severity", ""),
+                penalty_amount=v.get("penalty_amount", 0.0),
+                is_repeat=v.get("is_repeat", False),
+                is_willful=v.get("is_willful", False),
+                description=v.get("description"),
+                gravity=v.get("gravity"),
+                nr_exposed=v.get("nr_exposed"),
+                citation_id=v.get("citation_id"),
+                gen_duty_narrative=v.get("gen_duty_narrative"),
+            ))
+        return out
+
+    def _rebuild_accidents(raw: list) -> list:
+        out = []
+        for a in raw:
+            out.append(AccidentSummary(
+                summary_nr=a.get("summary_nr", ""),
+                event_date=a.get("event_date"),
+                event_desc=a.get("event_desc", ""),
+                fatality=a.get("fatality", False),
+                injuries=a.get("injuries", []),
+                abstract=a.get("abstract", ""),
+            ))
+        return out
+
+    records = []
+    for r in data.get("records", []):
+        try:
+            date_opened = datetime.date.fromisoformat(r["date_opened"])
+        except Exception:
+            date_opened = datetime.date.today()
+        records.append(OSHARecord(
+            inspection_id=r.get("inspection_id", ""),
+            date_opened=date_opened,
+            violations=_rebuild_violations(r.get("violations", [])),
+            total_penalties=r.get("total_penalties", 0.0),
+            severe_injury_or_fatality=r.get("severe_injury_or_fatality", False),
+            accidents=_rebuild_accidents(r.get("accidents", [])),
+            naics_code=r.get("naics_code"),
+            nr_in_estab=r.get("nr_in_estab"),
+            estab_name=r.get("estab_name"),
+            site_city=r.get("site_city"),
+            site_state=r.get("site_state"),
+        ))
+
+    assessment = RiskAssessment(
+        manufacturer=Manufacturer(name=data.get("manufacturer_name", "")),
+        records=records,
+        risk_score=data.get("risk_score", 0.0),
+        recommendation=data.get("recommendation", ""),
+        explanation=data.get("explanation", ""),
+        confidence_score=data.get("confidence_score", 0.0),
+        feature_weights=data.get("feature_weights", {}),
+        percentile_rank=data.get("percentile_rank", 50.0),
+        industry_label=data.get("industry_label", ""),
+        industry_group=data.get("industry_group", ""),
+        industry_percentile=data.get("industry_percentile", 50.0),
+        industry_comparison=data.get("industry_comparison", []),
+        missing_naics=data.get("missing_naics", False),
+        establishment_count=data.get("establishment_count", 1),
+        site_scores=data.get("site_scores", []),
+        risk_concentration=data.get("risk_concentration", 0.0),
+        systemic_risk_flag=data.get("systemic_risk_flag", False),
+        aggregation_warning=data.get("aggregation_warning", ""),
+        concentration_warning=data.get("concentration_warning", ""),
+    )
+
+    import asyncio
+    import concurrent.futures
+    loop = asyncio.get_event_loop()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    answer = await loop.run_in_executor(
+        executor,
+        lambda: agent.discuss_assessment(assessment, body.question),
+    )
+    return {"answer": answer}
+

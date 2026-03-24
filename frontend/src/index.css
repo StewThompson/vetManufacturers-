@@ -336,7 +336,6 @@ body {
 .ag-theme-alpine .ag-root-wrapper {
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  overflow: hidden;
 }
 
 /* ── Facility list ───────────────────────────────────────────────────────── */

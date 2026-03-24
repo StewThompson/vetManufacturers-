@@ -9,6 +9,7 @@ import ProgressStream, {
 } from './components/AssessmentResult'
 import ViolationsGrid from './components/ViolationsGrid'
 import SiteBreakdown from './components/SiteBreakdown'
+import ChatBox from './components/ChatBox'
 
 type Tab = 'overview' | 'violations' | 'sites' | 'details'
 
@@ -138,7 +139,7 @@ export default function App() {
               )}
 
               {tab === 'violations' && (
-                <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+                <div className="card" style={{ padding: 0 }}>
                   <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
                     <div className="card-title" style={{ marginBottom: 0 }}>
                       All Violations — {result.records.flatMap((r) => r.violations).length} records
@@ -151,7 +152,7 @@ export default function App() {
               )}
 
               {tab === 'sites' && (
-                <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+                <div className="card" style={{ padding: 0 }}>
                   <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
                     <div className="card-title" style={{ marginBottom: 0 }}>
                       Site-Level Risk Scores
@@ -164,6 +165,8 @@ export default function App() {
               )}
 
               {tab === 'details' && <ExplanationPanel result={result} />}
+
+              <ChatBox result={result} />
             </>
           )}
         </main>

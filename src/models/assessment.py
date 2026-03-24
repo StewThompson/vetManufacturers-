@@ -22,3 +22,10 @@ class RiskAssessment(BaseModel):
     industry_percentile: float = 50.0  # percentile within the same NAICS group
     industry_comparison: List[str] = []  # human-readable comparison strings
     missing_naics: bool = False
+    # Per-establishment breakdown
+    establishment_count: int = 1
+    site_scores: List[Dict[str, Any]] = []  # [{name, score, n_inspections, naics_code}]
+    risk_concentration: float = 0.0  # fraction of sites scoring ≥ 60
+    systemic_risk_flag: bool = False
+    aggregation_warning: str = ""
+    concentration_warning: str = ""

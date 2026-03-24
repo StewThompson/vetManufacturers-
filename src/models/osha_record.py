@@ -33,3 +33,6 @@ class OSHARecord(BaseModel):
     accidents: List[AccidentSummary] = []
     naics_code: Optional[str] = None
     nr_in_estab: Optional[str] = None
+    estab_name: Optional[str] = None
+    site_city: Optional[str] = None
+    site_state: Optional[str] = None

@@ -157,12 +157,12 @@ def render_scope_selector(group: GroupedCompanyResult):
 
     if scope == "all":
         st.caption(
-            "Grouping is based on name similarity and facility-code pattern matching. "
-            "Establishments below 55% confidence are excluded by default."
+            "All establishments sharing this company’s identity in the OSHA database "
+            "will be included in the analysis."
         )
         return "all", None
 
-    all_facilities = [f for f in group.all_facilities if f.confidence >= 0.55]
+    all_facilities = group.all_facilities
 
     if scope == "one":
         options = [f.raw_name for f in all_facilities] or [group.parent_name]
@@ -205,7 +205,7 @@ def render_selection_summary() -> tuple:
 
         all_fac = group.all_facilities
         if scope == "all":
-            fac_to_show = [f for f in all_fac if f.confidence >= 0.55]
+            fac_to_show = list(all_fac)
         elif chosen_raw_names:
             chosen_set = set(chosen_raw_names)
             fac_to_show = [f for f in all_fac if f.raw_name in chosen_set]
@@ -226,7 +226,7 @@ def render_selection_summary() -> tuple:
             )
         # If filter narrowed the selection, use explicit facility names
         filtered_names = [f.raw_name for f in fac_to_show]
-        if chosen_raw_names is None and len(fac_to_show) < len([f for f in group.all_facilities if f.confidence >= 0.55]):
+        if chosen_raw_names is None and len(fac_to_show) < len(group.all_facilities):
             return filtered_names or None, group.parent_name
         return chosen_raw_names if chosen_raw_names is not None else (filtered_names or None), group.parent_name
 
@@ -240,11 +240,10 @@ def render_selection_summary() -> tuple:
 
     all_fac_objects = []
     for group in selected_groups:
-        fac = [f for f in group.all_facilities if f.confidence >= 0.55]
-        all_fac_objects.extend(fac)
+        all_fac_objects.extend(group.all_facilities)
 
     for group in selected_groups:
-        fac = [f for f in group.all_facilities if f.confidence >= 0.55]
+        fac = group.all_facilities
         n = len(fac)
         badge = confidence_badge_html(group.confidence_label)
         c_label, c_remove = st.columns([8, 1], gap="small")

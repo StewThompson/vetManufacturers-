@@ -1,2 +1,15 @@
 OshaData/
 ml_cache/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.vite/
+frontend/.env.local
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/

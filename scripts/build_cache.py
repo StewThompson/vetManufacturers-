@@ -377,18 +377,17 @@ def main():
     # Build SQLite cache from the CSVs we just wrote
     build_sqlite_db()
 
-    # Build name-normalisation index for rapidfuzz search
-    print("  Building name index for fuzzy search…")
+    # Build company-key index for search
+    print("  Building company-key index for search…")
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from src.search.grouped_search import build_name_index, save_name_index
+    from src.search.grouped_search import build_company_key_index, save_company_key_index
     from src.data_retrieval.osha_client import OSHAClient
     _client = OSHAClient()
     _client.ensure_cache()
-    _raw_names = _client.get_all_raw_estab_names()
-    _idx = build_name_index(_raw_names)
-    save_name_index(_idx)
-    print(f"  Name index: {len(_idx[1]):,} unique normalised names")
+    _idx = build_company_key_index(_client)
+    save_company_key_index(_idx)
+    print(f"  Company-key index: {len(_idx[1]):,} unique company keys")
 
     # Clean stale model so it retrains on fresh data
     for stale in ["risk_model.pkl", "population_data.json"]:

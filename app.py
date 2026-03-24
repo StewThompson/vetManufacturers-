@@ -5,7 +5,7 @@ import os
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from src.agent.vetting_agent import VettingAgent
-from src.search.grouped_search import get_or_build_name_index
+from src.search.grouped_search import get_or_build_company_key_index
 from src.ui.styles import inject_global_css
 from src.ui.components.hero import render_sidebar, render_hero, render_feature_cards, render_how_it_works, render_empty_state
 from src.ui.components.search import render_search_card
@@ -28,6 +28,7 @@ vetting_agent = _get_vetting_agent()
 for key, default in {
     "messages": [],
     "assessment": None,
+    "llm_pending": False,
     "search_term": "",
     "search_results": None,
     "selected_groups": [],
@@ -41,23 +42,17 @@ for key, default in {
         st.session_state[key] = default
 
 
-@st.cache_data
-def _cached_raw_estab_names():
-    return vetting_agent.get_osha_client().get_all_raw_estab_names()
-
-
 @st.cache_resource
-def _cached_name_index(_names):
-    return get_or_build_name_index(_names)
+def _cached_company_key_index():
+    return get_or_build_company_key_index(vetting_agent.get_osha_client())
 
 
-all_companies = _cached_raw_estab_names()
-name_index = _cached_name_index(tuple(all_companies))
+name_index = _cached_company_key_index()
 
 inject_global_css()
 render_sidebar()
 render_hero()
-render_search_card(vetting_agent, all_companies, name_index)
+render_search_card(vetting_agent, [], name_index)
 
 if st.session_state.assessment:
     render_results(st.session_state.assessment, vetting_agent)

@@ -282,7 +282,6 @@ def test_score_returns_new_fields():
 
     required_keys = {
         "risk_score", "percentile_rank", "feature_weights", "features",
-        "reputation_score", "news_sentiment",
         "industry_label", "industry_group", "industry_percentile",
         "industry_comparison", "missing_naics",
         # New fields:

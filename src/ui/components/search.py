@@ -1,3 +1,5 @@
+import time
+import threading
 import streamlit as st
 from src.search.grouped_search import (
     group_establishments, SearchResultSet, GroupedCompanyResult, FacilityCandidate,
@@ -142,6 +144,7 @@ def _render_grouped_search_results(results: SearchResultSet):
                             display_name=raw_name,
                             facility_code=None,
                             city="", state="", address="",
+                            naics_code="",
                             confidence=0.3,
                             confidence_label="Low",
                         )
@@ -161,6 +164,44 @@ def _render_grouped_search_results(results: SearchResultSet):
 
 
 def render_search_card(vetting_agent, all_companies, name_index=None):
+    # ------------------------------------------------------------------ #
+    #  Background thread polling — thread never touches st.session_state.
+    #  It only writes to a plain Python dict (_shared) captured by closure.
+    # ------------------------------------------------------------------ #
+    _shared = st.session_state.get("_assess_shared")
+
+    if _shared is not None:
+        if _shared["error"]:
+            st.error(f"Assessment failed: {_shared['error']}")
+            st.session_state.pop("_assess_shared", None)
+            _shared = None
+
+        elif _shared["done"] and _shared["result"] is not None:
+            _assessment = _shared["result"]
+            st.session_state.pop("_assess_shared", None)
+            _min_insp = st.session_state.get("sb_min_insp", 1)
+            if len(_assessment.records) < _min_insp:
+                st.warning(
+                    f"Only {len(_assessment.records)} inspection(s) found in the last "
+                    f"{st.session_state.get('sb_year_range', 10)} year(s) — below your "
+                    f"minimum threshold of {_min_insp}. Results may be unreliable."
+                )
+            for _k in [_k for _k in st.session_state if _k.startswith("_violations_df_")]:
+                del st.session_state[_k]
+            st.session_state.assessment = _assessment
+            st.session_state.llm_pending = bool(vetting_agent.client)
+            st.session_state.messages = []
+            st.rerun()
+
+        else:
+            # Still running — show progress and poll again
+            _label = _shared.get("label", "company")
+            with st.status(f"Running assessment for {_label}…", expanded=True) as _s:
+                for _msg in list(_shared["progress"]):
+                    _s.write(_msg)
+            time.sleep(0.3)
+            st.rerun()
+
     with st.container(border=True):
         st.markdown(
             '<div style="margin-bottom:14px">'
@@ -194,8 +235,7 @@ def render_search_card(vetting_agent, all_companies, name_index=None):
                     osha_client = vetting_agent.get_osha_client()
                     st.session_state.search_results = group_establishments(
                         query=search_term,
-                        all_company_names=name_index or all_companies,
-                        osha_client=osha_client,
+                        company_key_index=name_index,
                     )
 
             results: SearchResultSet | None = st.session_state.search_results
@@ -222,7 +262,7 @@ def render_search_card(vetting_agent, all_companies, name_index=None):
             )
             if has_selection:
                 total_estabs = sum(
-                    max(len([f for f in g.all_facilities if f.confidence >= 0.55]), 1)
+                    max(g.total_facilities, 1)
                     for g in st.session_state.selected_groups
                 )
                 st.markdown(
@@ -246,7 +286,6 @@ def render_search_card(vetting_agent, all_companies, name_index=None):
             display_name = display_name or st.session_state.selected_groups[0].parent_name
             n_g = len(st.session_state.selected_groups)
             years_back = st.session_state.get("sb_year_range", 10)
-            min_insp = st.session_state.get("sb_min_insp", 1)
 
             if n_g == 1 and raw_names_to_use is None:
                 label = st.session_state.selected_groups[0].parent_name
@@ -255,34 +294,51 @@ def render_search_card(vetting_agent, all_companies, name_index=None):
             else:
                 label = f"{display_name} ({n_g} groups combined)"
 
-            with st.spinner(f"Retrieving OSHA data and scoring {label}…"):
+            # Plain Python dict — the thread only ever touches this object,
+            # never st.session_state (which is not thread-safe / lacks context).
+            _shared = {
+                "label": label,
+                "progress": [],
+                "result": None,
+                "error": None,
+                "done": False,
+            }
+            st.session_state["_assess_shared"] = _shared
+
+            # Snapshot closure variables before the thread captures them
+            _raw_names = raw_names_to_use
+            _display_name = display_name
+            _n_g = n_g
+            _years_back = years_back
+            _groups = list(st.session_state.selected_groups)
+
+            def _run_assessment(_s=_shared):
+                def _cb(msg: str):
+                    _s["progress"].append(msg)
+
                 try:
-                    if raw_names_to_use is None and n_g == 1:
-                        assessment = vetting_agent.vet_manufacturer(
-                            st.session_state.selected_groups[0].parent_name,
+                    if _raw_names is None and _n_g == 1:
+                        result = vetting_agent.vet_manufacturer(
+                            _groups[0].parent_name,
                             locations=None,
-                            years_back=years_back,
+                            years_back=_years_back,
+                            progress_cb=_cb,
                         )
                     else:
-                        names = raw_names_to_use or [
-                            f.raw_name
-                            for g in st.session_state.selected_groups
-                            for f in g.all_facilities
-                            if f.confidence >= 0.40
+                        names = _raw_names or [
+                            f.raw_name for g in _groups for f in g.all_facilities
                         ]
-                        assessment = vetting_agent.vet_by_raw_estab_names(
+                        result = vetting_agent.vet_by_raw_estab_names(
                             raw_names=names,
-                            display_name=display_name,
-                            years_back=years_back,
+                            display_name=_display_name,
+                            years_back=_years_back,
+                            progress_cb=_cb,
                         )
-                    if len(assessment.records) < min_insp:
-                        st.warning(
-                            f"Only {len(assessment.records)} inspection(s) found in the last "
-                            f"{years_back} year(s) — below your minimum threshold of {min_insp}. "
-                            f"Results may be unreliable."
-                        )
-                    st.session_state.assessment = assessment
-                    st.session_state.messages = []
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Assessment failed: {e}")
+                    _s["result"] = result
+                except Exception as exc:
+                    _s["error"] = str(exc)
+                finally:
+                    _s["done"] = True
+
+            threading.Thread(target=_run_assessment, daemon=True).start()
+            st.rerun()

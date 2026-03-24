@@ -77,6 +77,21 @@ class OSHAClient:
         "20": "Strain/Sprain", "20.0": "Strain/Sprain",
         "21": "Other", "21.0": "Other", "22": "Cancer", "22.0": "Cancer",
     }
+    EVENT_TYPE_MAP = {
+        "1": "Fall from elevation", "1.0": "Fall from elevation",
+        "2": "Fall on same level", "2.0": "Fall on same level",
+        "3": "Struck by flying/falling object", "3.0": "Struck by flying/falling object",
+        "4": "Caught in/between", "4.0": "Caught in/between",
+        "5": "Struck by object", "5.0": "Struck by object",
+        "6": "Repetitive motion", "6.0": "Repetitive motion",
+        "7": "Electrical shock", "7.0": "Electrical shock",
+        "8": "Explosion/fire", "8.0": "Explosion/fire",
+        "9": "Temperature extremes", "9.0": "Temperature extremes",
+        "10": "Chemical/harmful substance contact", "10.0": "Chemical/harmful substance contact",
+        "11": "Transportation accident", "11.0": "Transportation accident",
+        "12": "Other", "12.0": "Other",
+        "13": "Contact with hazardous substance", "13.0": "Contact with hazardous substance",
+    }
     BODY_MAP = {
         "1": "Abdomen", "1.0": "Abdomen", "2": "Arm (multiple)", "2.0": "Arm (multiple)",
         "3": "Back", "3.0": "Back", "4": "Body System", "4.0": "Body System",
@@ -625,10 +640,21 @@ class OSHAClient:
 
     def _decode_injury(self, inj: dict) -> dict:
         """Decode coded injury fields into human-readable labels."""
+        def _decode(mapping, raw_val):
+            v = str(raw_val).strip() if raw_val else ""
+            if not v:
+                return "Not reported"
+            return mapping.get(v, f"Unknown (code {v})")
+
+        degree = _decode(self.DEGREE_MAP, inj.get("degree_of_inj", ""))
+        nature = _decode(self.NATURE_MAP, inj.get("nature_of_inj", ""))
+        body_part = _decode(self.BODY_MAP, inj.get("part_of_body", ""))
+        event_type = _decode(self.EVENT_TYPE_MAP, inj.get("event_type", ""))
         return {
-            "degree": self.DEGREE_MAP.get(str(inj.get("degree_of_inj", "")), "Unknown"),
-            "nature": self.NATURE_MAP.get(str(inj.get("nature_of_inj", "")), "Unknown"),
-            "body_part": self.BODY_MAP.get(str(inj.get("part_of_body", "")), "Unknown"),
+            "degree": degree,
+            "nature": nature,
+            "body_part": body_part,
+            "event_type": event_type,
             "age": inj.get("age", ""),
             "sex": inj.get("sex", ""),
         }
@@ -703,6 +729,56 @@ class OSHAClient:
             {name.title() for name in self._inspections_by_estab if name},
             key=str.casefold,
         )
+
+    def get_company_key_index(self) -> tuple:
+        """
+        Build and return the company-key search index used by group_establishments().
+
+        Returns ``(ckey_to_estabs, company_keys)`` where:
+          ckey_to_estabs  – dict mapping each company_key (uppercase) to a list of
+                            estab dicts: {raw_name, city, state, address, naics_code}
+          company_keys    – sorted list of unique company_key strings
+
+        A single SQL query retrieves all data; no per-facility lookups needed.
+        """
+        self.ensure_cache()
+        if self._use_sqlite:
+            rows = self._db_rows(
+                "SELECT company_key, estab_name, "
+                "MAX(site_city) AS city, MAX(site_state) AS state, "
+                "MAX(site_address) AS address, MAX(naics_code) AS naics_code "
+                "FROM inspections "
+                "WHERE company_key IS NOT NULL AND company_key != '' "
+                "AND estab_name IS NOT NULL AND estab_name != '' "
+                "GROUP BY company_key, estab_name "
+                "ORDER BY company_key"
+            )
+            ckey_to_estabs: Dict[str, List[dict]] = {}
+            for row in rows:
+                ck = row["company_key"]
+                ckey_to_estabs.setdefault(ck, []).append({
+                    "raw_name":   (row.get("estab_name")  or "").strip(),
+                    "city":       (row.get("city")        or "").strip().title(),
+                    "state":      (row.get("state")       or "").strip().upper(),
+                    "address":    (row.get("address")     or "").strip().title(),
+                    "naics_code": (row.get("naics_code")  or "").strip(),
+                })
+            company_keys = sorted(ckey_to_estabs.keys())
+            return ckey_to_estabs, company_keys
+        # In-memory CSV fallback
+        ckey_to_estabs_mem: Dict[str, List[dict]] = {}
+        for estab_name, inspections in self._inspections_by_estab.items():
+            ck = self.company_match_key(estab_name.upper()).upper()
+            insp = inspections[0] if inspections else {}
+            ckey_to_estabs_mem.setdefault(ck, []).append({
+                "raw_name":   estab_name.title(),
+                "city":       (insp.get("site_city",    "") or "").strip().title(),
+                "state":      (insp.get("site_state",   "") or "").strip().upper(),
+                "address":    (insp.get("site_address", "") or "").strip().title(),
+                "naics_code": (insp.get("naics_code",   "") or "").strip(),
+            })
+        company_keys_mem = sorted(ckey_to_estabs_mem.keys())
+        return ckey_to_estabs_mem, company_keys_mem
 
     def get_locations_for_company(self, company: str) -> List[str]:
         """Return full-address locations recorded for *company*."""

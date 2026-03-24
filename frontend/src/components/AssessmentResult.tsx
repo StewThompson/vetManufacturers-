@@ -83,13 +83,14 @@ export function RiskBanner({ result }: { result: AssessmentResponse }) {
           <div>
             <div className="risk-score-label">Risk Score</div>
             <div className={`risk-score-value risk-score-${color}`}>
-              {(result.risk_score * 100).toFixed(1)}
+              {result.risk_score.toFixed(1)}
+              <span style={{ fontSize: 16, fontWeight: 400, opacity: 0.7 }}>&thinsp;/ 100</span>
             </div>
           </div>
           <div>
-            <div className="risk-score-label">Percentile</div>
+            <div className="risk-score-label">{result.missing_naics ? 'Pop. Percentile' : 'Industry Percentile'}</div>
             <div className={`risk-score-value risk-score-${color}`} style={{ fontSize: 28 }}>
-              {result.percentile_rank.toFixed(0)}
+              {(result.missing_naics ? result.percentile_rank : result.industry_percentile).toFixed(0)}
               <sup style={{ fontSize: 14 }}>th</sup>
             </div>
           </div>
@@ -169,7 +170,7 @@ export function ExplanationPanel({ result }: { result: AssessmentResponse }) {
       {result.concentration_warning && (
         <div className="warning-box">⚠ {result.concentration_warning}</div>
       )}
-      {result.systemic_risk_flag && (
+      {result.systemic_risk_flag && result.risk_score >= 45 && (
         <div className="warning-box" style={{ background: 'var(--danger-bg)', borderColor: 'var(--danger-border)', color: 'var(--danger)' }}>
           ⛔ Systemic risk detected across multiple sites
         </div>

@@ -96,3 +96,21 @@ export function openAssessStream(
 export const getAssessment = (_p: AssessParams): Promise<AssessmentResponse> => {
   throw new Error('Use openAssessStream for streaming results')
 }
+
+/** Ask a question about a completed assessment. */
+export async function askQuestion(
+  question: string,
+  assessment: AssessmentResponse,
+): Promise<string> {
+  const res = await fetch(`${BASE}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question, assessment }),
+  })
+  if (!res.ok) {
+    const body = await res.text().catch(() => res.statusText)
+    throw new Error(`Chat API → ${res.status}: ${body}`)
+  }
+  const data = await res.json() as { answer: string }
+  return data.answer
+}

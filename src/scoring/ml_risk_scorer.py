@@ -718,7 +718,10 @@ class MLRiskScorer:
 
         # Systemic flag: majority of sites are high-risk …
         systemic = risk_concentration > 0.5
-        # … or willful/repeat violations span ≥ 2 distinct sites
+        # … or willful/repeat violations span >= 2 distinct sites AND the
+        # aggregate score is meaningfully elevated (>= 45). Without the
+        # score gate, companies with many sites almost always trip this
+        # condition from incidental repeat violations on a handful of sites.
         sites_with_wr = 0
         for estab_records in groups.values():
             if any(
@@ -727,7 +730,7 @@ class MLRiskScorer:
                 for v in r.violations
             ):
                 sites_with_wr += 1
-        if len(groups) >= 2 and sites_with_wr >= 2:
+        if len(groups) >= 2 and sites_with_wr >= 2 and weighted_avg >= 45:
             systemic = True
 
         # Aggregate features (all records as one blob) for display

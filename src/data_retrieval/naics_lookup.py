@@ -58,10 +58,24 @@ def load_naics_map(xlsx_path: Optional[str] = None) -> dict[str, str]:
         )
         if code_col and title_col:
             for _, row in df.dropna(subset=[code_col, title_col]).iterrows():
-                code = re.sub(r"[^0-9]", "", str(row[code_col]).strip())
-                title = str(row[title_col]).strip()
-                if 2 <= len(code) <= 6 and title:
-                    naics_map[code] = title
+                raw_code = str(row[code_col]).strip()
+                # Strip trailing Census footnote markers (e.g. "Retail TradeT" → "Retail Trade")
+                title = re.sub(r'[A-Z]$', '', str(row[title_col]).strip()).strip()
+                if not title:
+                    continue
+                # Handle combined-sector codes like "44-45", "31-33", "48-49"
+                _range = re.match(r'^(\d+)-(\d+)$', raw_code)
+                if _range:
+                    start, end = int(_range.group(1)), int(_range.group(2))
+                    width = len(_range.group(1))
+                    for n in range(start, end + 1):
+                        code_str = str(n).zfill(width)
+                        if 2 <= len(code_str) <= 6:
+                            naics_map[code_str] = title
+                else:
+                    digits = re.sub(r"[^0-9]", "", raw_code)
+                    if 2 <= len(digits) <= 6:
+                        naics_map[digits] = title
             print(f"NAICS lookup: loaded {len(naics_map)} codes from Excel.")
         else:
             raise ValueError(f"Could not find NAICS code/title columns in {target}")

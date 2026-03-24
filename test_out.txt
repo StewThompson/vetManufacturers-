@@ -1,0 +1,1 @@
+44:'Retail Trade' 45:'Retail Trade' 31:'Manufacturing' 11:'Agriculture, Forestry, Fishing and Hunting' Total:2129

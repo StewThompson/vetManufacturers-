@@ -33,13 +33,27 @@ class RiskAssessor:
         industry_comparison = ml_result.get("industry_comparison", [])
         missing_naics = ml_result.get("missing_naics", False)
 
+        # Per-establishment fields
+        establishment_count = ml_result.get("establishment_count", 1)
+        site_scores = ml_result.get("site_scores", [])
+        risk_concentration = ml_result.get("risk_concentration", 0.0)
+        systemic_risk_flag = ml_result.get("systemic_risk_flag", False)
+        aggregation_warning = ml_result.get("aggregation_warning", "")
+        concentration_warning = ml_result.get("concentration_warning", "")
+
         # --- Recommendation ---
-        if risk_score < 30:
-            recommendation = "Recommend"
-        elif risk_score < 60:
-            recommendation = "Proceed with Caution"
-        else:
+        # For multi-establishment companies, "Do Not Recommend" requires
+        # systemic risk — not just one bad site inflating the aggregate.
+        if risk_score >= 60 and (establishment_count <= 1 or systemic_risk_flag):
             recommendation = "Do Not Recommend"
+        elif risk_score >= 60:
+            # High aggregate but risk not systemic — flag caution with
+            # per-site context instead of a blanket rejection.
+            recommendation = "Proceed with Caution"
+        elif risk_score < 30:
+            recommendation = "Recommend"
+        else:
+            recommendation = "Proceed with Caution"
 
         # --- Explanation ---
         explanation_lines = self._build_explanation(
@@ -77,6 +91,12 @@ class RiskAssessor:
             industry_percentile=industry_percentile,
             industry_comparison=industry_comparison,
             missing_naics=missing_naics,
+            establishment_count=establishment_count,
+            site_scores=site_scores,
+            risk_concentration=risk_concentration,
+            systemic_risk_flag=systemic_risk_flag,
+            aggregation_warning=aggregation_warning,
+            concentration_warning=concentration_warning,
         )
 
     # ------------------------------------------------------------------ #
@@ -103,18 +123,21 @@ class RiskAssessor:
         else:
             lines.append("High risk! Significant enforcement activity, penalties, or negative reputation.")
 
-        lines.append(f"\n**ML Risk Score: {risk_score}/100** (Percentile: {percentile_rank}% — higher means riskier than more peers)")
+        if not missing_naics and industry_percentile != 50.0:
+            lines.append(f"\n**ML Risk Score: {risk_score}/100** (Industry Percentile: {industry_percentile:.0f}%)")
+        else:
+            lines.append(f"\n**ML Risk Score: {risk_score}/100** (Population Percentile: {percentile_rank}%)")
 
         # Top feature drivers
         sorted_weights = sorted(feature_weights.items(), key=lambda kv: kv[1], reverse=True)
         top_drivers = sorted_weights[:3]
         driver_labels = {
-            "total_inspections": "Inspection Count",
-            "total_violations": "Violation Count",
+            "log_inspections": "Inspection Count (log)",
+            "log_violations": "Violation Count (log)",
             "serious_violations": "Serious Violations",
             "willful_violations": "Willful Violations",
             "repeat_violations": "Repeat Violations",
-            "total_penalties": "Total Penalties ($)",
+            "log_penalties": "Total Penalties (log $)",
             "avg_penalty": "Avg Penalty ($)",
             "max_penalty": "Max Single Penalty ($)",
             "recent_ratio": "Recent Activity Ratio",

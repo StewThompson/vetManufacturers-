@@ -7,12 +7,19 @@ import threading
 import time
 import requests
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from collections import defaultdict
 from dotenv import load_dotenv
 
 from src.models.manufacturer import Manufacturer
 from src.models.osha_record import OSHARecord, Violation, AccidentSummary
+from src.data_retrieval.normalization.company_names import (
+    normalize_company_name,
+    company_match_key,
+    preclean as _preclean,
+    strip_noise as _strip_noise,
+    canonicalize_tokens as _canonicalize_tokens,
+)
 
 load_dotenv()
 
@@ -112,246 +119,15 @@ class OSHAClient:
         self._api_violations: Dict[str, list] = defaultdict(list)  # API-fetched, not yet in DB
 
     # ================================================================== #
-    #  Name-normalisation — compiled patterns (class-level, once)
+    #  Name-normalisation — delegated to normalization module
     # ================================================================== #
-
-    # NFKD / Unicode pre-clean
-    _UNICODE_QUOTES = re.compile(r'[\u2018\u2019\u201a\u201b\u2032\u2035]')  # curly apostrophes
-    _UNICODE_DASHES = re.compile(r'[\u2010-\u2015\u2212]')                   # various dashes → -
-    _CONTROL_CHARS  = re.compile(r'[\x00-\x1f\x7f]')
-    _UNICODE_AMP    = re.compile(r'\uff06')                                   # ＆ → &
-
-    # Branch/tracking prefix: "105891 - ", "WA317974334 - ", etc.
-    _BRANCH_PREFIX  = re.compile(r'^[A-Za-z0-9]{5,}\s*[-–]\s+(?=[A-Za-z])')
-
-    # Punctuation / separator normalisation
-    _SLASH_SEP      = re.compile(r'\s*/\s*')    # "A/B" → "A B"
-    _AMP_TO_AND     = re.compile(r'\s*&\s*')    # "&" → " AND "
-    _AND_SPACES     = re.compile(r'\b AND \b', re.I)  # collapse spacing after amp expansion
-    _PUNCT_CLEAN    = re.compile(r"[''`]")       # apostrophes (after NFKD)
-    _TRAILING_PUNCT = re.compile(r'[.,;:\-–/]+$')
-    _WS             = re.compile(r'\s{2,}')
-
-    # DBA / formerly-known-as clauses
-    _DBA_CLAUSE     = re.compile(r'\s+(?:D/?B/?A|F/?K/?A|A/?K/?A)\s+.+$', re.I)
-
-    # Leading/trailing articles
-    _LEADING_THE    = re.compile(r'^THE\s+', re.I)
-    _TRAILING_THE   = re.compile(r'[,.]?\s*\bTHE\s*$', re.I)
-
-    # Corporate / legal suffixes — matched at end of string, up to 4 passes
-    _CORP_SUFFIX    = re.compile(
-        r'[,.]?\s*\b(?:'
-        r'INC\.?|INCORPORATED|'
-        r'LLC\.?|L\.?L\.?C\.?|'
-        r'LLP\.?|L\.?L\.?P\.?|'
-        r'LP\.?|L\.?P\.?|'
-        r'CORP\.?|CORPORATION|'
-        r'CO\.?|COMPANY|'
-        r'LTD\.?|LIMITED(?:\s+(?:PARTNERSHIP|LIABILITY\s+COMPANY))?|'
-        r'HOLDINGS?|GROUP|ENTERPRISES?|SOLUTIONS?|INDUSTRIES?|INTERNATIONAL'
-        r')\s*$',
-        re.I,
-    )
-
-    # Facility-noise suffixes (only stripped in match_key, not canonical_name).
-    # The number is optional: strips "STORE #123", "STORE 45", and bare "STORE".
-    _FACILITY_NOISE = re.compile(
-        r'\s*[-\u2013,]?\s*\b(?:'
-        r'PLANT|BLDG|BUILDING|UNIT|LOC|LOCATION|'
-        r'STORE|'
-        r'WAREHOUSE|WH|'
-        r'DC|PDC|FC|IDC|'
-        r'YARD|ANNEX|CAMPUS|COMPLEX|SITE|'
-        r'DIVISION|DIV'
-        r')\s*(?:#?\s*\d+)?\s*$',
-        re.I,
-    )
-    # Hash-prefixed numbers always stripped (canonical + match_key): " #1189", "#2345"
-    _TRAILING_HASH_NUM = re.compile(r'\s*#\s*\d+\s*$')
-    # Bare 4+-digit trailing numbers (store numbers without #)
-    _TRAILING_NUM   = re.compile(r'\s+\d{4,}\s*$')
-    # Dangling separator left after stripping
-    _DANGLING_SEP   = re.compile(r'\s*[-\u2013,/]\s*$')
-
-    # Token-level abbreviation canonicalisation (applied in match_key)
-    _TOKEN_CANON: Dict[str, str] = {
-        'INTL':   'INTERNATIONAL',
-        'INTNL':  'INTERNATIONAL',
-        'MFG':    'MANUFACTURING',
-        'MFGR':   'MANUFACTURING',
-        'MFR':    'MANUFACTURING',
-        'IND':    'INDUSTRIAL',
-        'INDS':   'INDUSTRIES',
-        'INDUS':  'INDUSTRIES',
-        'SVCS':   'SERVICES',
-        'SVC':    'SERVICES',
-        'TECH':   'TECHNOLOGY',
-        'TECHS':  'TECHNOLOGIES',
-        'DIST':   'DISTRIBUTION',
-        'DISTR':  'DISTRIBUTION',
-        'DISTRIB':'DISTRIBUTION',
-        'DISTRO': 'DISTRIBUTION',
-        'PKG':    'PACKAGING',
-        'PKG':    'PACKAGING',
-        'PRODS':  'PRODUCTS',
-        'PROD':   'PRODUCTS',
-        'EQUIP':  'EQUIPMENT',
-        'CORP':   '',           # already stripped by _CORP_SUFFIX, but belt-and-suspenders
-        'ASSOC':  'ASSOCIATES',
-        'ASSOCS': 'ASSOCIATES',
-        'GRP':    'GROUP',
-        'MGMT':   'MANAGEMENT',
-        'MGNT':   'MANAGEMENT',
-        'NATL':   'NATIONAL',
-        'NATL':   'NATIONAL',
-        'AMER':   'AMERICAN',
-        'AMER':   'AMERICAN',
-        'PWR':    'POWER',
-        'SYS':    'SYSTEMS',
-        'SYS':    'SYSTEMS',
-        'ENGRG':  'ENGINEERING',
-        'ENGR':   'ENGINEERING',
-        'ENG':    'ENGINEERING',
-        'CHEM':   'CHEMICAL',
-        'CHEMS':  'CHEMICALS',
-        'ELEC':   'ELECTRIC',
-        'ELECS':  'ELECTRIC',
-        'AUTH':   'AUTHORITY',
-    }
-
-    # ------------------------------------------------------------------ #
-    #  Internal helpers
-    # ------------------------------------------------------------------ #
-    @classmethod
-    def _preclean(cls, raw: str) -> str:
-        """
-        Unicode folding + structural clean-up before any pattern matching.
-        Returns an uppercased, whitespace-normalised string.
-        """
-        import unicodedata
-        # NFKD decomposition folds ligatures, fullwidth chars, etc.
-        s = unicodedata.normalize('NFKD', raw)
-        # Drop combining diacritics (accents) so "RÉSUMÉ" → "RESUME"
-        s = ''.join(c for c in s if not unicodedata.combining(c))
-        s = cls._UNICODE_QUOTES.sub("'", s)
-        s = cls._UNICODE_DASHES.sub('-', s)
-        s = cls._UNICODE_AMP.sub('&', s)
-        s = cls._CONTROL_CHARS.sub(' ', s)
-        s = s.upper()
-        # Strip branch/tracking prefix ("105891 - ", "WA317974334 - ")
-        s = cls._BRANCH_PREFIX.sub('', s).strip()
-        # Normalise punctuation
-        s = cls._SLASH_SEP.sub(' ', s)         # "/" → space
-        s = cls._PUNCT_CLEAN.sub('', s)        # apostrophes
-        s = cls._AMP_TO_AND.sub(' AND ', s)    # & → AND
-        s = cls._WS.sub(' ', s).strip()
-        return s
-
-    @classmethod
-    def _strip_noise(cls, s: str, strip_facility: bool = False) -> str:
-        """
-        Remove DBA clauses, THE articles, legal suffixes, trailing hash-numbers,
-        and optionally facility-specific noise (PLANT 1, BUILDING 4, STORE 123, etc.).
-        Runs suffix-stripping passes until stable.
-        """
-        # DBA / FKA clause
-        s = cls._DBA_CLAUSE.sub('', s).strip()
-
-        # Always strip trailing " #\d+" (hash-prefixed store/unit numbers)
-        # and bare 4+ digit numbers, plus dangling separators — even in canonical.
-        always_patterns = (cls._TRAILING_HASH_NUM, cls._TRAILING_NUM, cls._DANGLING_SEP)
-        facility_patterns = (cls._FACILITY_NOISE,) if strip_facility else ()
-
-        changed = True
-        while changed:
-            changed = False
-            for pat in always_patterns + facility_patterns:
-                new = pat.sub('', s).strip()
-                if new != s:
-                    s = new
-                    changed = True
-
-        # Strip trailing THE before corp suffix (handles "CO THE")
-        s = cls._TRAILING_THE.sub('', s).strip()
-
-        # Strip corporate suffixes — up to 5 passes for stacked suffixes "CO, INC."
-        for _ in range(5):
-            new = cls._CORP_SUFFIX.sub('', s).strip()
-            if new == s:
-                break
-            s = new
-
-        # Strip THE again (may have been hidden behind a corp suffix)
-        s = cls._TRAILING_THE.sub('', s).strip()
-        s = cls._LEADING_THE.sub('', s).strip()
-
-        # Clean up any trailing punctuation left behind
-        s = cls._TRAILING_PUNCT.sub('', s).strip()
-        s = cls._WS.sub(' ', s).strip()
-        return s
-
-    @classmethod
-    def _canonicalize_tokens(cls, s: str) -> str:
-        """
-        Expand known abbreviations token by token.
-        Only replaces whole tokens to avoid partial matches
-        (e.g. "TECH" in "BIOTECH" must not expand).
-        Empty expansions (e.g. CORP → '') remove the token.
-        """
-        tokens = s.split()
-        result = []
-        for tok in tokens:
-            expanded = cls._TOKEN_CANON.get(tok)
-            if expanded is None:
-                result.append(tok)
-            elif expanded:          # non-empty → replace
-                result.append(expanded)
-            # empty string → drop the token entirely
-        return ' '.join(result)
-
-    # ------------------------------------------------------------------ #
-    #  Public-facing normalisation methods
-    # ------------------------------------------------------------------ #
     @classmethod
     def _normalize_company_name(cls, raw: str) -> str:
-        """
-        Conservative canonical form — suitable for display, lookup keys, and
-        the SQLite ``company_key`` column.
-
-        Strips: branch prefixes, DBA clauses, THE articles, legal suffixes,
-        Unicode noise, punctuation.  Does NOT strip facility descriptors or
-        expand abbreviations (use ``company_match_key`` for that).
-
-        Examples that all produce "GOODYEAR TIRE AND RUBBER":
-          Goodyear Tire & Rubber
-          GOODYEAR TIRE AND RUBBER COMPANY
-          Goodyear Tire & Rubber, The
-          Goodyear Tire & Rubber Co THE
-        """
-        s = cls._preclean(raw)
-        s = cls._strip_noise(s, strip_facility=False)
-        return s
+        return normalize_company_name(raw)
 
     @classmethod
     def company_match_key(cls, raw: str) -> str:
-        """
-        Aggressive clustering key — used for fuzzy grouping and search where
-        over-precision hurts recall more than a rare false-positive hurts.
-
-        On top of ``_normalize_company_name`` this also:
-          • strips facility descriptors  (PLANT 1, BUILDING 4, STORE 123 …)
-          • expands common abbreviations (MFG→MANUFACTURING, INTL→INTERNATIONAL …)
-          • collapses any spacing artifacts from the above
-
-        Two names that differ only in facility number, legal suffix, abbreviated
-        word, or Unicode representation will produce the same match key.
-        """
-        s = cls._preclean(raw)
-        s = cls._strip_noise(s, strip_facility=True)
-        s = cls._canonicalize_tokens(s)
-        s = cls._WS.sub(' ', s).strip()
-        return s
+        return company_match_key(raw)
 
     # ================================================================== #
     #  SQLite helpers
@@ -387,7 +163,10 @@ class OSHAClient:
         """Execute a SELECT and return results as a list of plain dicts."""
         if self._db_conn is None:
             return []
-        return [dict(r) for r in self._db_conn.execute(sql, params).fetchall()]
+        with self._db_lock:
+            cur = self._db_conn.execute(sql, params)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def _sqlite_upsert_inspection(self, insp: dict):
         """Insert or ignore a delta inspection into the SQLite DB."""
@@ -677,7 +456,7 @@ class OSHAClient:
     # ================================================================== #
     #  Public API
     # ================================================================== #
-    def search_manufacturer(self, manufacturer: Manufacturer) -> List[OSHARecord]:
+    def search_manufacturer(self, manufacturer: Manufacturer, years_back: int = 0) -> List[OSHARecord]:
         """
         Look up a manufacturer's OSHA records.
         Searches the bulk cache first (0 API calls).
@@ -690,7 +469,7 @@ class OSHAClient:
 
         # location may be a single string or None; _search_cache expects a list
         loc_list = [manufacturer.location] if manufacturer.location else None
-        records = self._search_cache(manufacturer.name, loc_list)
+        records = self._search_cache(manufacturer.name, loc_list, years_back=years_back)
         if records is not None:
             return records
 
@@ -910,6 +689,21 @@ class OSHAClient:
             return [r["name"] for r in rows]
         return self._company_names
 
+    def get_all_raw_estab_names(self) -> List[str]:
+        """Return ALL distinct raw OSHA establishment names (title-cased)."""
+        self.ensure_cache()
+        if self._use_sqlite:
+            rows = self._db_rows(
+                "SELECT DISTINCT estab_name FROM inspections "
+                "WHERE estab_name IS NOT NULL AND estab_name != '' "
+                "ORDER BY estab_name"
+            )
+            return [r["estab_name"].strip().title() for r in rows if r["estab_name"]]
+        return sorted(
+            {name.title() for name in self._inspections_by_estab if name},
+            key=str.casefold,
+        )
+
     def get_locations_for_company(self, company: str) -> List[str]:
         """Return full-address locations recorded for *company*."""
         self.ensure_cache()
@@ -934,7 +728,7 @@ class OSHAClient:
             return locs
         return self._locations_by_company.get(company.strip().upper(), [])
 
-    def _search_cache(self, name: str, locations: Optional[List[str]] = None) -> Optional[List[OSHARecord]]:
+    def _search_cache(self, name: str, locations: Optional[List[str]] = None, years_back: int = 0) -> Optional[List[OSHARecord]]:
         """
         Find matching inspections in the cache by company name.
         Returns None if no match found (caller should fall back to API).
@@ -989,10 +783,17 @@ class OSHAClient:
                 matches = filtered
 
         print(f"  Found {len(matches)} inspection(s) in cache.")
-        return self._build_records(matches)
+        return self._build_records(matches, years_back=years_back)
 
-    def _build_records(self, inspections: list) -> List[OSHARecord]:
-        """Convert raw inspection dicts + cached violations + accidents into OSHARecord objects."""
+    def _build_records(self, inspections: list, years_back: int = 0) -> List[OSHARecord]:
+        """Convert raw inspection dicts + cached violations + accidents into OSHARecord objects.
+
+        Parameters
+        ----------
+        years_back : int
+            If > 0, only include inspections opened within the last N years.
+        """
+        cutoff = (date.today() - timedelta(days=years_back * 365)) if years_back > 0 else None
         records: List[OSHARecord] = []
         for insp in inspections:
             activity_nr = str(insp.get("activity_nr", ""))
@@ -1002,6 +803,9 @@ class OSHAClient:
                                if date_str else date.today())
             except ValueError:
                 date_opened = date.today()
+
+            if cutoff and date_opened < cutoff:
+                continue
 
             raw_viols = self.get_violations_for_activity(activity_nr)
             violations, total_penalties = self._parse_violations(raw_viols)
@@ -1028,6 +832,9 @@ class OSHAClient:
                 accidents=accidents,
                 naics_code=insp.get("naics_code"),
                 nr_in_estab=insp.get("nr_in_estab"),
+                estab_name=insp.get("estab_name"),
+                site_city=insp.get("site_city"),
+                site_state=insp.get("site_state"),
             ))
         return records
 

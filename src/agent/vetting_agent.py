@@ -36,7 +36,7 @@ class VettingAgent:
         self.osha_client.ensure_cache()
         return self.osha_client
 
-    def vet_by_raw_estab_names(self, raw_names: list[str], display_name: str) -> "RiskAssessment":
+    def vet_by_raw_estab_names(self, raw_names: list[str], display_name: str, years_back: int = 0) -> "RiskAssessment":
         """
         Run a risk assessment directly against a specific list of raw OSHA
         establishment names (e.g. individual facilities selected by the user).
@@ -78,7 +78,7 @@ class VettingAgent:
 
         print(f"  vet_by_raw_estab_names: {len(raw_names)} selected name(s) → "
               f"{len(seen_activity_nrs)} unique inspections")
-        records = self.osha_client._build_records(all_inspections) if all_inspections else []
+        records = self.osha_client._build_records(all_inspections, years_back=years_back) if all_inspections else []
         manufacturer = Manufacturer(name=display_name)
         reputation_data = self.reputation_client.search_news(display_name)
         assessment = self.risk_assessor.assess(manufacturer, records, reputation_data)
@@ -86,7 +86,7 @@ class VettingAgent:
             self._enhance_explanation(assessment, reputation_data)
         return assessment
 
-    def vet_manufacturer(self, name: str, location: str = None, locations: list[str] = None) -> RiskAssessment:
+    def vet_manufacturer(self, name: str, location: str = None, locations: list[str] = None, years_back: int = 0) -> RiskAssessment:
         """
         Main workflow for vetting a manufacturer.
         1. Resolve identity
@@ -102,11 +102,11 @@ class VettingAgent:
         # 2. Retrieve data
         if locations:
             self.osha_client.ensure_cache()
-            records = self.osha_client._search_cache(name, locations)
+            records = self.osha_client._search_cache(name, locations, years_back=years_back)
             if records is None:
                 records = []
         else:
-            records = self.osha_client.search_manufacturer(manufacturer)
+            records = self.osha_client.search_manufacturer(manufacturer, years_back=years_back)
         
         # 2b. Retrieve reputation data
         reputation_data = self.reputation_client.search_news(manufacturer.name)

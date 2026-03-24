@@ -21,6 +21,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from rapidfuzz import fuzz, process, utils as rfutils
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Data structures
@@ -88,6 +90,75 @@ class SearchResultSet:
     top_group: Optional[GroupedCompanyResult]
     other_groups: List[GroupedCompanyResult]
     unmatched: List[str]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Pre-built name index (persisted to disk so it's built once, not every startup)
+# ──────────────────────────────────────────────────────────────────────────────
+
+import json
+import os
+
+_NAME_INDEX_PATH = os.path.join("ml_cache", "name_index.json")
+
+
+def build_name_index(
+    all_company_names: List[str],
+) -> tuple:
+    """
+    Pre-normalise all raw OSHA names and return a tuple
+    ``(norm_to_raws, choices)`` that can be passed to
+    ``group_establishments`` as its *all_company_names* argument.
+
+    ``norm_to_raws``  – dict mapping each normalised string to its raw variants.
+    ``choices``       – deduplicated list of normalised strings (for rapidfuzz).
+    """
+    norm_to_raws: Dict[str, List[str]] = {}
+    seen: set = set()
+    choices: List[str] = []
+    for name in all_company_names:
+        n = normalize_establishment_name(name)
+        if len(n.strip()) < 2:
+            continue
+        norm_to_raws.setdefault(n, []).append(name)
+        if n not in seen:
+            seen.add(n)
+            choices.append(n)
+    return norm_to_raws, choices
+
+
+def save_name_index(index: tuple) -> None:
+    """Persist the name index to disk as JSON."""
+    norm_to_raws, choices = index
+    os.makedirs(os.path.dirname(_NAME_INDEX_PATH), exist_ok=True)
+    with open(_NAME_INDEX_PATH, "w", encoding="utf-8") as f:
+        json.dump({"norm_to_raws": norm_to_raws, "choices": choices}, f)
+
+
+def load_name_index() -> Optional[tuple]:
+    """Load a previously saved name index from disk. Returns None if not found."""
+    if not os.path.exists(_NAME_INDEX_PATH):
+        return None
+    with open(_NAME_INDEX_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data["norm_to_raws"], data["choices"]
+
+
+def get_or_build_name_index(all_company_names: List[str]) -> tuple:
+    """
+    Return the cached name index from disk if it exists and matches the
+    current name count; otherwise build, save, and return a fresh one.
+    """
+    cached = load_name_index()
+    if cached is not None:
+        # Quick count check — compare total raw names stored in the index
+        # against the input count, without re-normalizing anything.
+        total_raws = sum(len(v) for v in cached[0].values())
+        if total_raws == len(all_company_names):
+            return cached
+    index = build_name_index(all_company_names)
+    save_name_index(index)
+    return index
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -177,63 +248,26 @@ def extract_facility_code(raw: str) -> Optional[str]:
     return None
 
 
-def _tokenize(name: str) -> List[str]:
-    """Split a normalised name into significant tokens (≥2 chars, not stopwords)."""
-    _STOPS = {'AND', 'OF', 'THE', 'A', 'AN', 'FOR', 'IN', 'AT', 'BY', 'TO'}
-    return [t for t in re.split(r'\W+', name.upper()) if len(t) >= 2 and t not in _STOPS]
-
-
-def _token_overlap(a: str, b: str) -> float:
-    """Jaccard-like token overlap between two normalised names (0.0–1.0)."""
-    ta, tb = set(_tokenize(a)), set(_tokenize(b))
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / max(len(ta), len(tb))
-
-
 def score_candidate_match(query_norm: str, candidate_norm: str) -> float:
     """
     Return a confidence score (0.0–1.0) measuring how likely `candidate`
     belongs to the same company as `query`.
 
-    Scoring:
-      1.0  – exact normalised match
-      0.85 – candidate starts with query (typical variant pattern)
-      0.75 – query starts with candidate (query is more specific)
-      0.60 – high token overlap (≥0.8)
-      0.45 – medium token overlap (≥0.5)
-      0.25 – low token overlap (≥0.3)
-      0.0  – no meaningful overlap
+    Uses rapidfuzz WRatio which automatically combines token_sort_ratio,
+    token_set_ratio, and partial_ratio — handling subset relationships
+    (e.g. "WALMART" ↔ "WALMART SUPERCENTER") without manual thresholds.
     """
-    q, c = query_norm.upper(), candidate_norm.upper()
-
-    if q == c:
-        return 1.0
-
-    # Strip facility-code suffix from candidate before comparing prefixes
-    # e.g. "AMAZON FWA4" → "AMAZON" for prefix comparison
-    c_stripped = re.split(r'\s+[-–]?\s*[A-Z]{1,5}[0-9]{1,4}\s*$', c)[0].strip()
-    c_stripped = re.sub(r'\s*\([A-Z0-9]{2,8}\)\s*$', '', c_stripped).strip()
-
-    if c.startswith(q) or c_stripped == q:
-        return 0.85
-    if q.startswith(c):
-        return 0.75
-
-    overlap = _token_overlap(q, c)
-    if overlap >= 0.8:
-        return 0.60
-    if overlap >= 0.5:
-        return 0.45
-    if overlap >= 0.3:
-        return 0.25
-    return 0.0
+    q = query_norm.strip()
+    c = candidate_norm.strip()
+    if not q or not c or len(c) < 2:
+        return 0.0
+    return fuzz.WRatio(q, c, processor=rfutils.default_process) / 100.0
 
 
 def _confidence_label(score: float) -> str:
-    if score >= 0.70:
+    if score >= 0.85:
         return "High"
-    if score >= 0.40:
+    if score >= 0.65:
         return "Medium"
     return "Low"
 
@@ -249,13 +283,21 @@ def _estab_info_for_name(raw_name: str, osha_client) -> Tuple[str, str, str, str
     Supports both the SQLite fast path and the in-memory path.
     """
     if getattr(osha_client, "_use_sqlite", False) and osha_client._db_conn is not None:
-        # company_key in SQLite is computed via company_match_key() during the build step
-        ck = osha_client.company_match_key(raw_name.upper()).upper()
+        # Query by raw estab_name first so each variant gets its own address;
+        # fall back to company_key if the raw name doesn't match (e.g. title-case mismatch).
+        raw_up = raw_name.strip().upper()
         rows = osha_client._db_rows(
             "SELECT site_city, site_state, site_address, naics_code "
-            "FROM inspections WHERE company_key = ? LIMIT 1",
-            (ck,),
+            "FROM inspections WHERE estab_name = ? COLLATE NOCASE LIMIT 1",
+            (raw_up,),
         )
+        if not rows:
+            ck = osha_client.company_match_key(raw_up).upper()
+            rows = osha_client._db_rows(
+                "SELECT site_city, site_state, site_address, naics_code "
+                "FROM inspections WHERE company_key = ? LIMIT 1",
+                (ck,),
+            )
         if rows:
             r = rows[0]
             return (
@@ -306,64 +348,48 @@ def group_establishments(
     if not query_up or len(query_up) < 2:
         return SearchResultSet(query=query, top_group=None, other_groups=[], unmatched=[])
 
-    # ── Step 1: Collect candidates (substring match) ─────────────────────
-    candidates: List[Tuple[str, float]] = []   # (raw_name, confidence)
-    for name in all_company_names:
-        name_norm = normalize_establishment_name(name)
-        # Keep names where either direction contains the other
-        if query_up not in name_norm.upper() and name_norm.upper() not in query_up:
-            # Fallback: token overlap
-            score = score_candidate_match(query_norm, name_norm)
-            if score < 0.3:
+    # ── Step 1: Collect candidates (rapidfuzz WRatio) ────────────────────
+    # Use the pre-built normalised index if provided, otherwise build on the fly.
+    if isinstance(all_company_names, tuple) and len(all_company_names) == 2:
+        norm_to_raws, choices = all_company_names
+    else:
+        norm_to_raws: Dict[str, List[str]] = {}
+        choices: List[str] = []
+        for name in all_company_names:
+            n = normalize_establishment_name(name)
+            if len(n.strip()) < 2:
                 continue
-        else:
-            score = score_candidate_match(query_norm, name_norm)
-        candidates.append((name, score))
+            norm_to_raws.setdefault(n, []).append(name)
+            if n not in choices:
+                choices.append(n)
+
+    if not choices:
+        return SearchResultSet(query=query, top_group=None, other_groups=[], unmatched=[])
+
+    # score_cutoff=55 keeps strong variants, rejects noise
+    hits = process.extract(
+        query_norm, choices,
+        scorer=fuzz.WRatio,
+        processor=rfutils.default_process,
+        score_cutoff=55,
+        limit=max_results * 3,
+    )
+
+    candidates: List[Tuple[str, float]] = []
+    qlen = len(query_norm)
+    for norm_name, rf_score, _idx in hits:
+        # Reject short candidates that only match via partial_ratio
+        if len(norm_name) < qlen * 0.5:
+            continue
+        score = rf_score / 100.0
+        for raw in norm_to_raws[norm_name]:
+            candidates.append((raw, score))
 
     if not candidates:
         return SearchResultSet(query=query, top_group=None, other_groups=[], unmatched=[])
 
-    # Sort by confidence desc, then alphabetically
     candidates.sort(key=lambda x: (-x[1], x[0]))
     candidates = candidates[:max_results]
-
-    # ── Step 1b: Pre-fetch NAICS codes for all candidates ────────────────
-    # Batch-query dominant NAICS code per company_key so Step 2b can enforce
-    # the 2-digit sector compatibility check without per-row DB round-trips.
-    naics_by_raw: Dict[str, str] = {}
-    if getattr(osha_client, "_use_sqlite", False) and osha_client._db_conn is not None:
-        key_to_raws: Dict[str, List[str]] = {}
-        for raw, _ in candidates:
-            ck = osha_client.company_match_key(raw.upper()).upper()
-            key_to_raws.setdefault(ck, []).append(raw)
-        if key_to_raws:
-            placeholders = ",".join("?" * len(key_to_raws))
-            naics_rows = osha_client._db_rows(
-                f"SELECT company_key, naics_code FROM inspections "
-                f"WHERE company_key IN ({placeholders}) AND naics_code != ''",
-                tuple(key_to_raws.keys()),
-            )
-            key_code_counts: Dict[str, Counter] = {}
-            for r in naics_rows:
-                ck = r["company_key"]
-                nc = (r.get("naics_code") or "").strip()
-                if nc:
-                    key_code_counts.setdefault(ck, Counter())[nc] += 1
-            for ck, raws in key_to_raws.items():
-                dominant = key_code_counts.get(ck, Counter()).most_common(1)
-                code = dominant[0][0] if dominant else ""
-                for raw in raws:
-                    naics_by_raw[raw] = code
-    else:
-        for raw, _ in candidates:
-            _, _, _, nc = _estab_info_for_name(raw, osha_client)
-            naics_by_raw[raw] = nc
-
-    def _dominant_naics2_for(members: List[Tuple[str, float]]) -> str:
-        """Most common 2-digit NAICS sector code among a cluster's members."""
-        codes = [naics_by_raw.get(r, "")[:2] for r, _ in members
-                 if naics_by_raw.get(r, "")[:2]]
-        return Counter(codes).most_common(1)[0][0] if codes else ""
 
     # ── Step 2: Cluster by parent prefix ─────────────────────────────────
     # The "parent prefix" is the normalised name stripped of facility codes.
@@ -396,18 +422,9 @@ def group_establishments(
     sorted_keys = sorted(clusters.keys(), key=len)  # shortest first
     merged_clusters: Dict[str, List[Tuple[str, float]]] = {}
     for key in sorted_keys:
-        # Check if an already-accepted shorter key is a word-boundary prefix
         parent_key = None
         for mk in merged_clusters:
             if key.startswith(mk + " ") or key == mk:
-                # NAICS 2-digit sector guard: only merge when both clusters share
-                # the same top-level industry (e.g. don't merge "WALMART AUTO CARE
-                # CENTER" (81 = repair) into "WALMART" (45 = retail)).
-                naics_a = _dominant_naics2_for(merged_clusters[mk])
-                naics_b = _dominant_naics2_for(clusters[key])
-                if naics_a and naics_b and naics_a != naics_b:
-                    # Different sectors — keep as a separate cluster
-                    break
                 parent_key = mk
                 break
         if parent_key is not None:
@@ -421,16 +438,15 @@ def group_establishments(
     unmatched: List[str] = []
 
     for prefix, members in clusters.items():
-        # Determine parent label: the shortest / cleanest member name
-        parent_name = min(members, key=lambda x: len(x[0]))[0]
-        parent_name = parent_name.title()
+        # Determine parent label: use the cluster prefix (already normalised)
+        parent_name = prefix.title()
 
-        high  = [(r, s) for r, s in members if s >= 0.70]
-        med   = [(r, s) for r, s in members if 0.40 <= s < 0.70]
-        low   = [(r, s) for r, s in members if s < 0.40]
+        high  = [(r, s) for r, s in members if s >= 0.85]
+        med   = [(r, s) for r, s in members if 0.65 <= s < 0.85]
+        low   = [(r, s) for r, s in members if s < 0.65]
 
         # A cluster with only 1 low-confidence member goes to unmatched
-        if len(members) == 1 and members[0][1] < 0.40:
+        if len(members) == 1 and members[0][1] < 0.65:
             unmatched.append(members[0][0])
             continue
 

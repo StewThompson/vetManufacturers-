@@ -1,6 +1,7 @@
 import re
 import streamlit as st
 import pandas as pd
+from st_aggrid import AgGrid, GridOptionsBuilder
 from src.ui.components.violations import render_violation_dashboard
 
 
@@ -57,12 +58,27 @@ def render_results(assessment, vetting_agent):
 
     _render_industry_comparison(assessment)
     _render_site_breakdown(assessment)
-    _render_explanation_sections(assessment)
+    # Show executive summary only once LLM text is available; a spinner replaces it while pending
+    if not st.session_state.get("llm_pending"):
+        _render_explanation_sections(assessment)
     render_violation_dashboard(assessment, llm_breakdown_text=None)
     _render_feature_importance(assessment)
     _render_penalty_timeline(assessment)
     _render_accident_details(assessment)
     _render_raw_records(assessment)
+
+    # --- Deferred LLM call -----------------------------------------------------------
+    # Runs AFTER all data sections have streamed to the client so results are visible
+    # immediately. The status widget shows the user what’s happening.
+    if st.session_state.get("llm_pending") and vetting_agent.client:
+        with st.status("✍ Generating AI summary…", expanded=False) as _llm_status:
+            vetting_agent.enhance_explanation(assessment)
+            # Patch the cached assessment object so the explanation persists on next render
+            st.session_state.assessment = assessment
+            st.session_state.llm_pending = False
+            _llm_status.update(label="✅ AI summary ready", state="complete")
+        st.rerun()
+        return
 
     st.divider()
     _render_chat(assessment, vetting_agent)
@@ -154,7 +170,19 @@ def _render_site_breakdown(assessment):
                 "Inspections": s["n_inspections"],
                 "NAICS": s.get("naics_code") or "—",
             })
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        _site_df = pd.DataFrame(rows)
+        _gb = GridOptionsBuilder.from_dataframe(_site_df)
+        _gb.configure_default_column(resizable=True, sortable=True, filter=True)
+        _gb.configure_column("Establishment", minWidth=180)
+        _gb.configure_column("Risk Score", type=["numericColumn"])
+        AgGrid(
+            _site_df,
+            gridOptions=_gb.build(),
+            height=min(400, 56 + len(rows) * 42),
+            fit_columns_on_grid_load=True,
+            theme="streamlit",
+            enable_enterprise_modules=False,
+        )
         if assessment.systemic_risk_flag:
             st.error(
                 "⚠️ **Systemic risk detected** — high-risk conditions are present "
@@ -248,6 +276,7 @@ def _render_accident_details(assessment):
                 inj_rows = [
                     {
                         "Degree": inj.get("degree", ""),
+                        "Event Type": inj.get("event_type", ""),
                         "Nature": inj.get("nature", ""),
                         "Body Part": inj.get("body_part", ""),
                         "Age": inj.get("age", ""),
@@ -266,6 +295,7 @@ def _render_raw_records(assessment):
 def _render_chat(assessment, vetting_agent):
     st.markdown("**💬 AI Assistant**")
     st.caption("Ask follow-up questions about this company's compliance record.")
+    st.caption("💡 Try asking about a specific OSHA code or citation — e.g. *19100030 B01*, *1910.1200*, or *citation 01001A*")
     for msg in st.session_state.messages:
         st.chat_message(msg["role"]).write(msg["content"])
     if prompt := st.chat_input("Ask about specific risks, violations, or recommendations…"):

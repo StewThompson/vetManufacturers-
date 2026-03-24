@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+from st_aggrid import AgGrid, GridOptionsBuilder
 from src.ui.styles import map_standard_to_theme, theme_description, THEME_DEFS
 
 
@@ -136,7 +137,12 @@ def _render_top_findings(df: pd.DataFrame):
 
 
 def render_violation_dashboard(assessment, llm_breakdown_text: str = None):
-    df = _build_violations_df(assessment)
+    # Build once per assessment and cache — avoids rebuilding on every Streamlit rerun
+    # (e.g. every "Select" button click) which is expensive for large record sets.
+    _cache_key = f"_violations_df_{id(assessment)}"
+    if _cache_key not in st.session_state:
+        st.session_state[_cache_key] = _build_violations_df(assessment)
+    df = st.session_state[_cache_key]
 
     with st.expander("📋 Violation Breakdown", expanded=False):
         if df.empty:
@@ -268,7 +274,18 @@ def render_violation_dashboard(assessment, llm_breakdown_text: str = None):
                     .rename(columns={"_loc_label": "Establishment"})
                     .sort_values("Penalties", ascending=False)
                 )
-                st.dataframe(loc_agg, width="stretch", hide_index=True)
+                _gb2 = GridOptionsBuilder.from_dataframe(loc_agg)
+                _gb2.configure_default_column(resizable=True, sortable=True)
+                _gb2.configure_column("Establishment", minWidth=200)
+                _gb2.configure_column("Penalties", type=["numericColumn"])
+                AgGrid(
+                    loc_agg,
+                    gridOptions=_gb2.build(),
+                    height=min(500, 56 + len(loc_agg) * 42),
+                    fit_columns_on_grid_load=True,
+                    theme="streamlit",
+                    enable_enterprise_modules=False,
+                )
                 chart_data = loc_agg.set_index("Establishment")[["Citations", "Serious", "Willful", "Repeat"]]
                 st.bar_chart(chart_data, height=250)
 
@@ -281,23 +298,35 @@ def render_violation_dashboard(assessment, llm_breakdown_text: str = None):
             detail["inspection_date"] = detail["inspection_date"].dt.strftime("%Y-%m-%d")
             for col in ("fatality_linked", "is_willful", "is_repeat"):
                 detail[col] = detail[col].map({True: "Yes", False: ""})
-            st.dataframe(
-                detail.rename(columns={
-                    "inspection_id": "Inspection ID",
-                    "estab_name": "Establishment",
-                    "location": "City, State",
-                    "inspection_date": "Date",
-                    "standard_code": "OSHA Code",
-                    "hazard_theme": "Theme",
-                    "severity": "Severity",
-                    "gravity": "Gravity",
-                    "penalty": "Penalty ($)",
-                    "fatality_linked": "Fatality Linked",
-                    "is_willful": "Willful",
-                    "is_repeat": "Repeat",
-                }),
-                width='stretch',
-                hide_index=True,
+            _detail_renamed = detail.rename(columns={
+                "inspection_id": "Inspection ID",
+                "estab_name": "Establishment",
+                "location": "City, State",
+                "inspection_date": "Date",
+                "standard_code": "OSHA Code",
+                "hazard_theme": "Theme",
+                "severity": "Severity",
+                "gravity": "Gravity",
+                "penalty": "Penalty ($)",
+                "fatality_linked": "Fatality Linked",
+                "is_willful": "Willful",
+                "is_repeat": "Repeat",
+            })
+            _gb = GridOptionsBuilder.from_dataframe(_detail_renamed)
+            _gb.configure_default_column(resizable=True, sortable=True, filter=True, minWidth=80)
+            _gb.configure_column("Inspection ID", minWidth=110)
+            _gb.configure_column("Establishment", minWidth=160)
+            _gb.configure_column("OSHA Code", minWidth=100)
+            _gb.configure_column("Penalty ($)", type=["numericColumn"], minWidth=90)
+            _gb.configure_column("Gravity", type=["numericColumn"], minWidth=80)
+            _gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=50)
+            AgGrid(
+                _detail_renamed,
+                gridOptions=_gb.build(),
+                height=500,
+                fit_columns_on_grid_load=False,
+                theme="streamlit",
+                enable_enterprise_modules=False,
             )
 
         with st.expander("🗓️ Inspection-by-Inspection Evidence", expanded=False):

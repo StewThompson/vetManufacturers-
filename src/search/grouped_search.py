@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from rapidfuzz import fuzz, process, utils as rfutils
+from src.data_retrieval.normalization.company_names import company_match_key as _cmk
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -93,71 +94,71 @@ class SearchResultSet:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Pre-built name index (persisted to disk so it's built once, not every startup)
+#  Company-key search index
+#  (persisted to disk so it is built once, not every startup)
+#
+#  The index is keyed by company_match_key() — the same normalization used
+#  to store company_key in the DB — so rapidfuzz matches map directly to DB
+#  rows with zero mismatch between search results and scored facilities.
 # ──────────────────────────────────────────────────────────────────────────────
 
 import json
 import os
 
-_NAME_INDEX_PATH = os.path.join("ml_cache", "name_index.json")
+_COMPANY_KEY_INDEX_PATH = os.path.join("ml_cache", "company_key_index.json")
 
 
-def build_name_index(
-    all_company_names: List[str],
-) -> tuple:
+def build_company_key_index(osha_client) -> tuple:
     """
-    Pre-normalise all raw OSHA names and return a tuple
-    ``(norm_to_raws, choices)`` that can be passed to
-    ``group_establishments`` as its *all_company_names* argument.
+    Build the company-key search index from the OSHA database.
 
-    ``norm_to_raws``  – dict mapping each normalised string to its raw variants.
-    ``choices``       – deduplicated list of normalised strings (for rapidfuzz).
+    Returns ``(ckey_to_estabs, company_keys)`` where:
+      ckey_to_estabs  – dict mapping each company_key (uppercase) to a list of
+                        estab dicts: {raw_name, city, state, address, naics_code}
+      company_keys    – sorted list of unique company_key strings
     """
-    norm_to_raws: Dict[str, List[str]] = {}
-    seen: set = set()
-    choices: List[str] = []
-    for name in all_company_names:
-        n = normalize_establishment_name(name)
-        if len(n.strip()) < 2:
-            continue
-        norm_to_raws.setdefault(n, []).append(name)
-        if n not in seen:
-            seen.add(n)
-            choices.append(n)
-    return norm_to_raws, choices
+    return osha_client.get_company_key_index()
 
 
-def save_name_index(index: tuple) -> None:
-    """Persist the name index to disk as JSON."""
-    norm_to_raws, choices = index
-    os.makedirs(os.path.dirname(_NAME_INDEX_PATH), exist_ok=True)
-    with open(_NAME_INDEX_PATH, "w", encoding="utf-8") as f:
-        json.dump({"norm_to_raws": norm_to_raws, "choices": choices}, f)
+def save_company_key_index(index: tuple) -> None:
+    """Persist the company-key index to disk as JSON."""
+    ckey_to_estabs, company_keys = index
+    os.makedirs(os.path.dirname(_COMPANY_KEY_INDEX_PATH), exist_ok=True)
+    with open(_COMPANY_KEY_INDEX_PATH, "w", encoding="utf-8") as f:
+        json.dump({"index": ckey_to_estabs, "keys": company_keys}, f)
 
 
-def load_name_index() -> Optional[tuple]:
-    """Load a previously saved name index from disk. Returns None if not found."""
-    if not os.path.exists(_NAME_INDEX_PATH):
+def load_company_key_index() -> Optional[tuple]:
+    """Load a saved company-key index from disk. Returns None if not found."""
+    if not os.path.exists(_COMPANY_KEY_INDEX_PATH):
         return None
-    with open(_NAME_INDEX_PATH, "r", encoding="utf-8") as f:
+    with open(_COMPANY_KEY_INDEX_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return data["norm_to_raws"], data["choices"]
+    return data["index"], data["keys"]
 
 
-def get_or_build_name_index(all_company_names: List[str]) -> tuple:
+def get_or_build_company_key_index(osha_client) -> tuple:
     """
-    Return the cached name index from disk if it exists and matches the
-    current name count; otherwise build, save, and return a fresh one.
+    Return the cached company-key index from disk when it is current;
+    otherwise build from the DB, save, and return.
+
+    Staleness is checked via a single COUNT(DISTINCT company_key) query.
     """
-    cached = load_name_index()
+    cached = load_company_key_index()
     if cached is not None:
-        # Quick count check — compare total raw names stored in the index
-        # against the input count, without re-normalizing anything.
-        total_raws = sum(len(v) for v in cached[0].values())
-        if total_raws == len(all_company_names):
+        _ckey_to_estabs, company_keys = cached
+        if getattr(osha_client, "_use_sqlite", False) and osha_client._db_conn is not None:
+            rows = osha_client._db_rows(
+                "SELECT COUNT(DISTINCT company_key) AS cnt FROM inspections "
+                "WHERE company_key IS NOT NULL AND company_key != ''"
+            )
+            db_count = rows[0]["cnt"] if rows else 0
+            if db_count == len(company_keys):
+                return cached
+        else:
             return cached
-    index = build_name_index(all_company_names)
-    save_name_index(index)
+    index = build_company_key_index(osha_client)
+    save_company_key_index(index)
     return index
 
 
@@ -325,172 +326,87 @@ def _estab_info_for_name(raw_name: str, osha_client) -> Tuple[str, str, str, str
 
 def group_establishments(
     query: str,
-    all_company_names: List[str],
-    osha_client,
-    max_results: int = 50,
+    company_key_index: tuple,
+    osha_client=None,
+    max_results: int = 250,  # kept for API compatibility; not used
 ) -> SearchResultSet:
     """
-    Given a user search query and the full list of OSHA company names,
-    return a SearchResultSet that groups raw names into parent-company buckets.
+    Search for a company using the pre-built company-key index.
 
-    Strategy:
-      1. Normalise the query.
-      2. For every company name that substring-matches the query, compute a
-         confidence score.
-      3. Cluster names by their normalised prefix (the text before any
-         facility-code suffix) to form parent groups.
-      4. Rank groups by total high-confidence members.
-      5. Return top_group + up to 4 other_groups + unmatched leftovers.
+    The index maps each company_match_key() value (uppercase, already stored in
+    the DB ``company_key`` column) to the full list of raw establishment names
+    that share that key.  rapidfuzz runs against the compact company_key list
+    (not against every raw name), and each hit maps directly to the correct DB
+    rows — no secondary expansion or confidence filtering needed.
+
+    This guarantees that the facilities shown in the UI are exactly the same
+    set that ``vet_by_raw_estab_names`` will score.
     """
-    query_norm = normalize_establishment_name(query)
-    query_up   = query_norm.upper()
-
-    if not query_up or len(query_up) < 2:
+    query_key = _cmk(query)
+    if not query_key or len(query_key) < 2:
         return SearchResultSet(query=query, top_group=None, other_groups=[], unmatched=[])
 
-    # ── Step 1: Collect candidates (rapidfuzz WRatio) ────────────────────
-    # Use the pre-built normalised index if provided, otherwise build on the fly.
-    if isinstance(all_company_names, tuple) and len(all_company_names) == 2:
-        norm_to_raws, choices = all_company_names
-    else:
-        norm_to_raws: Dict[str, List[str]] = {}
-        choices: List[str] = []
-        for name in all_company_names:
-            n = normalize_establishment_name(name)
-            if len(n.strip()) < 2:
-                continue
-            norm_to_raws.setdefault(n, []).append(name)
-            if n not in choices:
-                choices.append(n)
-
-    if not choices:
+    ckey_to_estabs, company_keys = company_key_index
+    if not company_keys:
         return SearchResultSet(query=query, top_group=None, other_groups=[], unmatched=[])
 
-    # score_cutoff=55 keeps strong variants, rejects noise
     hits = process.extract(
-        query_norm, choices,
+        query_key, company_keys,
         scorer=fuzz.WRatio,
         processor=rfutils.default_process,
         score_cutoff=55,
-        limit=max_results * 3,
+        limit=500,
     )
 
-    candidates: List[Tuple[str, float]] = []
-    qlen = len(query_norm)
-    for norm_name, rf_score, _idx in hits:
-        # Reject short candidates that only match via partial_ratio
-        if len(norm_name) < qlen * 0.5:
-            continue
-        score = rf_score / 100.0
-        for raw in norm_to_raws[norm_name]:
-            candidates.append((raw, score))
-
-    if not candidates:
-        return SearchResultSet(query=query, top_group=None, other_groups=[], unmatched=[])
-
-    candidates.sort(key=lambda x: (-x[1], x[0]))
-    candidates = candidates[:max_results]
-
-    # ── Step 2: Cluster by parent prefix ─────────────────────────────────
-    # The "parent prefix" is the normalised name stripped of facility codes.
-    def _parent_prefix(name: str) -> str:
-        norm = normalize_establishment_name(name).upper()
-        # Remove trailing facility code like "FWA4", "CMH1" etc.
-        norm = re.sub(r'\s+[-–]?\s*[A-Z]{1,5}[0-9]{1,4}\s*$', '', norm).strip()
-        norm = re.sub(r'\s*\([A-Z0-9]{2,8}\)\s*$', '', norm).strip()
-        # Remove generic site-descriptor suffixes
-        norm = re.sub(
-            r'\s+(?:SITE|CAMPUS|FACILITY|WAREHOUSE|DC|FC|IDC|PDC|UNIT|LOC)\s*\d*\s*$',
-            '', norm, flags=re.IGNORECASE,
-        ).strip()
-        # Remove trailing separators
-        norm = re.sub(r'\s*[-–/]\s*$', '', norm).strip()
-        return norm or normalize_establishment_name(name).upper()
-
-    clusters: Dict[str, List[Tuple[str, float]]] = {}
-    for raw, score in candidates:
-        prefix = _parent_prefix(raw)
-        clusters.setdefault(prefix, []).append((raw, score))
-
-    # ── Step 2b: Merge sub-prefix clusters into the primary query cluster ─
-    # e.g. query="WALMART": clusters keyed "WALMART SUPERCENTER",
-    # "WALMART DISTRIBUTION CENTER", etc. should all fold into "WALMART" so
-    # the user sees one group, not 20.  We only merge when a shorter cluster
-    # key is a proper word-boundary prefix of a longer one, preventing false
-    # merges between unrelated companies that merely share a first word
-    # (e.g. "PARKER HANNIFIN" vs "PARKER BROTHERS").
-    sorted_keys = sorted(clusters.keys(), key=len)  # shortest first
-    merged_clusters: Dict[str, List[Tuple[str, float]]] = {}
-    for key in sorted_keys:
-        parent_key = None
-        for mk in merged_clusters:
-            if key.startswith(mk + " ") or key == mk:
-                parent_key = mk
-                break
-        if parent_key is not None:
-            merged_clusters[parent_key].extend(clusters[key])
-        else:
-            merged_clusters[key] = list(clusters[key])
-    clusters = merged_clusters
-
-    # ── Step 3: Build GroupedCompanyResult for each cluster ───────────────
     groups: List[GroupedCompanyResult] = []
     unmatched: List[str] = []
 
-    for prefix, members in clusters.items():
-        # Determine parent label: use the cluster prefix (already normalised)
-        parent_name = prefix.title()
-
-        high  = [(r, s) for r, s in members if s >= 0.85]
-        med   = [(r, s) for r, s in members if 0.65 <= s < 0.85]
-        low   = [(r, s) for r, s in members if s < 0.65]
-
-        # A cluster with only 1 low-confidence member goes to unmatched
-        if len(members) == 1 and members[0][1] < 0.65:
-            unmatched.append(members[0][0])
+    for ckey, rf_score, _idx in hits:
+        score = rf_score / 100.0
+        estabs = ckey_to_estabs.get(ckey, [])
+        if not estabs:
             continue
 
-        # Overall group confidence = mean of top-5 member scores
-        top_scores = sorted([s for _, s in members], reverse=True)[:5]
-        overall_conf = sum(top_scores) / len(top_scores)
-
-        def _build_facility(raw: str, score: float) -> FacilityCandidate:
-            city, state, address, naics_code = _estab_info_for_name(raw, osha_client)
-            code = extract_facility_code(raw)
-            # Build display name: strip facility code from the end for readability
-            disp = normalize_establishment_name(raw).title()
-            return FacilityCandidate(
-                raw_name=raw,
-                display_name=disp,
-                facility_code=code,
-                city=city,
-                state=state,
-                address=address,
-                naics_code=naics_code,
+        facilities = [
+            FacilityCandidate(
+                raw_name=e["raw_name"],
+                display_name=normalize_establishment_name(e["raw_name"]).title(),
+                facility_code=extract_facility_code(e["raw_name"]),
+                city=e.get("city", ""),
+                state=e.get("state", ""),
+                address=e.get("address", ""),
+                naics_code=e.get("naics_code", ""),
                 confidence=score,
                 confidence_label=_confidence_label(score),
             )
+            for e in estabs
+        ]
+
+        # Single low-confidence hit with no clear parent → treat as unmatched
+        if len(facilities) == 1 and score < 0.65:
+            unmatched.append(facilities[0].raw_name)
+            continue
+
+        high = [f for f in facilities if score >= 0.85]
+        med  = [f for f in facilities if 0.65 <= score < 0.85]
+        low  = [f for f in facilities if score < 0.65]
 
         groups.append(GroupedCompanyResult(
-            parent_name=parent_name,
+            parent_name=ckey.title(),
             query=query,
-            total_facilities=len(members),
-            confidence=overall_conf,
-            confidence_label=_confidence_label(overall_conf),
-            high_confidence=[_build_facility(r, s) for r, s in high],
-            medium_confidence=[_build_facility(r, s) for r, s in med],
-            low_confidence=[_build_facility(r, s) for r, s in low],
+            total_facilities=len(facilities),
+            confidence=score,
+            confidence_label=_confidence_label(score),
+            high_confidence=high,
+            medium_confidence=med,
+            low_confidence=low,
         ))
 
-    # Sort groups: prefer higher confidence, more members
     groups.sort(key=lambda g: (-g.confidence, -g.total_facilities))
-
-    top_group    = groups[0] if groups else None
-    other_groups = groups[1:5]  # surface up to 4 alternatives
 
     return SearchResultSet(
         query=query,
-        top_group=top_group,
-        other_groups=other_groups,
+        top_group=groups[0] if groups else None,
+        other_groups=groups[1:5],
         unmatched=unmatched[:10],
     )

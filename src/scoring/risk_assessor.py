@@ -11,22 +11,19 @@ class RiskAssessor:
     def __init__(self, osha_client=None):
         self.ml_scorer = MLRiskScorer(osha_client=osha_client)
 
-    def assess(self, manufacturer: Manufacturer, records: List[OSHARecord], reputation_data: List[dict] = None) -> RiskAssessment:
+    def assess(self, manufacturer: Manufacturer, records: List[OSHARecord]) -> RiskAssessment:
         """
         Assess risk using the ML-weighted scoring model, then build a
         human-readable explanation.
         """
-        reputation_data = reputation_data or []
-        print(f"Assessing risk for: {manufacturer.name} based on {len(records)} records and {len(reputation_data)} news items.")
+        print(f"Assessing risk for: {manufacturer.name} based on {len(records)} records.")
 
         # --- ML scoring ---
-        ml_result = self.ml_scorer.score(records, reputation_data)
+        ml_result = self.ml_scorer.score(records)
         risk_score = ml_result["risk_score"]
         percentile_rank = ml_result["percentile_rank"]
         feature_weights = ml_result["feature_weights"]
         features = ml_result["features"]
-        reputation_score = ml_result["reputation_score"]
-        news_sentiment = ml_result["news_sentiment"]
         industry_label = ml_result.get("industry_label", "Unknown Industry")
         industry_group = ml_result.get("industry_group")
         industry_percentile = ml_result.get("industry_percentile", 50.0)
@@ -57,8 +54,8 @@ class RiskAssessor:
 
         # --- Explanation ---
         explanation_lines = self._build_explanation(
-            records, reputation_data, risk_score, percentile_rank,
-            feature_weights, features, news_sentiment, reputation_score,
+            records, risk_score, percentile_rank,
+            feature_weights, features,
             industry_label=industry_label,
             industry_group=industry_group,
             industry_percentile=industry_percentile,
@@ -66,20 +63,16 @@ class RiskAssessor:
             missing_naics=missing_naics,
         )
 
-        if not records and not reputation_data:
-            explanation_lines.insert(0, "No OSHA records or news found. Absence of records does not guarantee safety.")
+        if not records:
+            explanation_lines.insert(0, "No OSHA records found. Absence of records does not guarantee safety.")
 
         explanation = "\n".join(explanation_lines)
 
-        confidence = 0.9 if (records or reputation_data) else 0.4
+        confidence = 0.9 if records else 0.4
 
         return RiskAssessment(
             manufacturer=manufacturer,
             records=records,
-            reputation_score=reputation_score,
-            news_sentiment=news_sentiment,
-            reputation_summary=f"Analyzed {len(reputation_data)} articles." if reputation_data else "No news found.",
-            reputation_data=reputation_data,
             risk_score=risk_score,
             recommendation=recommendation,
             explanation=explanation,
@@ -104,8 +97,8 @@ class RiskAssessor:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _build_explanation(
-        records, reputation_data, risk_score, percentile_rank,
-        feature_weights, features, news_sentiment, reputation_score,
+        records, risk_score, percentile_rank,
+        feature_weights, features,
         industry_label="Unknown Industry",
         industry_group=None,
         industry_percentile=50.0,
@@ -220,9 +213,5 @@ class RiskAssessor:
 
         if total_penalties > 0:
             lines.append(f"\nTotal Penalties: ${total_penalties:,.2f}")
-
-        # Reputation
-        if reputation_data:
-            lines.append(f"\nReputation: {news_sentiment} sentiment (Score: {reputation_score:.1f})")
 
         return lines

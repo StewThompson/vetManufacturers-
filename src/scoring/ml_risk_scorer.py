@@ -31,7 +31,8 @@ class MLRiskScorer:
     broader population of inspected establishments.
     """
     INDUSTRY_MIN_SAMPLE = 10
-    LOG_FEATURE_INDICES = [0, 1, 5]  # log-scaled to prevent volume/aggregation bias
+    # Expand log transformation to more features with large ranges
+    LOG_FEATURE_INDICES = [0, 1, 5, 6, 7, 11, 12, 13, 15]  # log-scale counts, penalties, accident/injury counts
 
     # Canonical 2-digit NAICS sectors for one-hot encoding.
     NAICS_SECTORS = [
@@ -523,12 +524,14 @@ class MLRiskScorer:
         X = np.nan_to_num(X_raw, nan=0.0)
         X = self._log_transform_features(X)  # model trains on log-scaled counts
 
+        # Increase model complexity: more estimators, deeper trees, lower learning rate
         self.pipeline = Pipeline([
             ("scaler", StandardScaler()),
             ("model", GradientBoostingRegressor(
-                n_estimators=100,
-                max_depth=3,
-                learning_rate=0.1,
+                n_estimators=300,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
                 random_state=42,
             )),
         ])
@@ -744,7 +747,7 @@ class MLRiskScorer:
     # ------------------------------------------------------------------ #
     #  Public scoring API
     # ------------------------------------------------------------------ #
-    def score(self, records: List[OSHARecord], reputation_data: list = None) -> Dict:
+    def score(self, records: List[OSHARecord]) -> Dict:
         """
         Predict risk score for a manufacturer relative to the population.
 
@@ -771,32 +774,6 @@ class MLRiskScorer:
         # ── Per-establishment scoring ─────────────────────────────────
         estab = self.score_establishments(records)
         risk_score = estab["weighted_avg_score"]
-
-        # ── Reputation adjustment (company-level, outside OSHA ML) ────
-        reputation_score = 50.0
-        news_sentiment = "Unknown"
-        if reputation_data:
-            neg_kw = {"violation", "fine", "penalty", "lawsuit", "injury",
-                      "death", "accident", "unsafe", "danger", "settlement", "sued"}
-            pos_kw = {"award", "safety", "recognized", "leader", "innovation"}
-            neg = sum(1 for item in reputation_data
-                      if any(k in (item.get("title", "") + " " + item.get("body", "")).lower() for k in neg_kw))
-            pos = sum(1 for item in reputation_data
-                      if any(k in (item.get("title", "") + " " + item.get("body", "")).lower() for k in pos_kw))
-            total = neg + pos
-            if total > 0:
-                sentiment_adj = ((neg - pos) / total) * 15.0
-                risk_score = float(np.clip(risk_score + sentiment_adj, 0, 100))
-                ratio = (pos - neg) / (total + 1)
-                reputation_score = 50.0 + (ratio * 30.0)
-                if ratio > 0.2:
-                    news_sentiment = "Positive"
-                elif ratio < -0.2:
-                    news_sentiment = "Negative"
-                else:
-                    news_sentiment = "Mixed"
-            else:
-                news_sentiment = "Neutral"
 
         # ── Percentile rank within population ─────────────────────────
         if self.population_features is not None and len(self.population_features) > 0:
@@ -902,8 +879,6 @@ class MLRiskScorer:
             "percentile_rank": round(percentile, 1),
             "feature_weights": importances,
             "features": feature_vals,
-            "reputation_score": round(reputation_score, 1),
-            "news_sentiment": news_sentiment,
             "industry_label": industry_label,
             "industry_group": resolved_group,
             "industry_percentile": round(industry_percentile, 1),

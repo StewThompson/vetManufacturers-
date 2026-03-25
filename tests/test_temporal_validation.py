@@ -833,7 +833,18 @@ class TestEdgeCases:
     """Validate model behaviour on specific establishment profiles."""
 
     def test_fatality_establishments_score_high(self, split_data: TemporalSplitData):
-        """Establishments with fatalities should score ≥ 40 on average."""
+        """Establishments with fatalities should score above the single-inspection floor.
+
+        Threshold is 25 (not the previous 40) because real-world validation
+        showed the old threshold was calibrated to a hard floor in the
+        pseudo-labeler that forced any historical-fatality establishment to
+        score ≥ 65 regardless of recent clean record.  That floor created
+        non-monotone risk tiers and has been removed.  Fatalities are now
+        scored organically: companies with fatalities AND ongoing violations
+        still score high; companies with a single past incident but clean
+        recent history score in the Low–Medium range, which is empirically
+        more accurate.
+        """
         fatal_idx = [
             i for i, p in enumerate(split_data.test_pop)
             if p["_has_fatality"]
@@ -842,8 +853,8 @@ class TestEdgeCases:
             pytest.skip("Too few fatality establishments in test set")
         fatal_preds = split_data.test_preds[fatal_idx]
         mean_score = fatal_preds.mean()
-        assert mean_score >= 40.0, (
-            f"Fatality establishments avg score = {mean_score:.1f}, expected ≥ 40"
+        assert mean_score >= 25.0, (
+            f"Fatality establishments avg score = {mean_score:.1f}, expected ≥ 25"
         )
 
     def test_clean_establishments_score_low(self, split_data: TemporalSplitData):

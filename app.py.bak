@@ -251,7 +251,7 @@ def render_sidebar():
         st.divider()
         st.markdown("**Advanced Filters**")
         st.caption("Applied when running an assessment.")
-        st.slider("Inspection years back", 1, 15, 10, key="sb_year_range")
+        st.slider("Inspection years back", 1, 3, 10, key="sb_year_range")
         st.number_input("Min. inspections to score", min_value=1, max_value=20, value=1, key="sb_min_insp")
         st.divider()
         st.markdown("**Display**")

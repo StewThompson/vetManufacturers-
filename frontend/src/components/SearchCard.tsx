@@ -334,19 +334,28 @@ export default function SearchCard({
       {/* Years back + run button */}
       <div className="card">
         <div className="card-title">Assessment Window</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-          <label style={{ fontSize: 12, color: 'var(--text-muted)', flex: 1 }}>Years back</label>
-          <select
-            className="select-input"
-            style={{ width: 'auto', minWidth: 80 }}
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 12 }}>
+          <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            Years back: <strong>{yearsBack}</strong>
+          </label>
+
+          <input
+            type="range"
+            min={1}
+            max={3}
+            step={1}
             value={yearsBack}
             onChange={(e) => onYearsBackChange(Number(e.target.value))}
             disabled={isRunning}
-          >
-            {[3, 5, 7, 10, 15].map((y) => (
-              <option key={y} value={y}>{y}</option>
-            ))}
-          </select>
+          />
+
+          {/* Optional tick labels */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-muted)' }}>
+            <span>1</span>
+            <span>2</span>
+            <span>3</span>
+          </div>
         </div>
         <button
           className="btn btn-primary btn-full"

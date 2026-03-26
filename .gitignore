@@ -1,2 +1,4 @@
 OshaData/
 ml_cache/
+__pycache__/
+*.pyc

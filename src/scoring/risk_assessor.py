@@ -74,14 +74,7 @@ class RiskAssessor:
     ) -> list:
         lines = []
 
-        # Predictive headline — the primary output requested by the user
-        lines.append(
-            f"This supplier has a **{risk_score:.0f}%** predicted chance of a "
-            f"serious OSHA enforcement event "
-            f"(Percentile: {percentile_rank:.0f}% — riskier than {percentile_rank:.0f}% of peers)."
-        )
-
-        # Contextual severity label
+        # Headline
         if risk_score < 15:
             lines.append("Low risk profile based on available history.")
         elif risk_score < 45:
@@ -89,7 +82,7 @@ class RiskAssessor:
         else:
             lines.append("High risk! Significant enforcement activity, penalties, or negative reputation.")
 
-        lines.append(f"\n**Predicted Enforcement Probability: {risk_score:.0f}%** | ML Risk Score: {risk_score}/100 (Percentile: {percentile_rank}%)")
+        lines.append(f"\n**ML Risk Score: {risk_score}/100** (Percentile: {percentile_rank}% — higher means riskier than more peers)")
 
         # Top feature drivers
         sorted_weights = sorted(feature_weights.items(), key=lambda kv: kv[1], reverse=True)

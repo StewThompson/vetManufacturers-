@@ -82,7 +82,12 @@ def compute_relative_features(
         }
 
     def _z(val: float, avg: float, std: float) -> float:
-        return (float(val) - avg) / max(abs(std), 1e-6)
+        raw = (float(val) - avg) / max(abs(std), 1e-6)
+        # Clip to ±3 σ: extreme outliers in low-baseline industries can produce
+        # z-scores of 10-20, which the GBR then uses to inflate predictions for
+        # companies that are merely "above average for a quiet industry" — not
+        # genuinely high-risk — causing band inversions at the tail.
+        return float(max(-3.0, min(3.0, raw)))
 
     return {
         "relative_violation_rate": _z(

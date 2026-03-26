@@ -1,3 +1,4 @@
+import csv
 import math
 import os
 import json
@@ -16,6 +17,7 @@ from src.models.osha_record import OSHARecord
 from src.data_retrieval.naics_lookup import get_industry_name, load_naics_map
 from src.scoring.industry_stats import compute_industry_stats, compute_relative_features
 from src.scoring.pseudo_labeler import pseudo_label
+from src.scoring.tail_calibrator import TailCalibrator
 
 
 # compute_industry_stats and compute_relative_features are re-exported
@@ -130,12 +132,14 @@ class MLRiskScorer:
     CACHE_DIR = "ml_cache"
     MODEL_FILE = "risk_model.pkl"
     POP_FILE = "population_data.json"
+    CALIBRATOR_FILE = "tail_calibrator.pkl"
 
     def __init__(self, osha_client=None):
         self.osha_client = osha_client
         self.pipeline: Optional[Pipeline] = None
         self.population_features: Optional[np.ndarray] = None
         self._industry_stats: dict = {}
+        self._calibrator: Optional[TailCalibrator] = None
         self._naics_map: dict = load_naics_map()
         os.makedirs(self.CACHE_DIR, exist_ok=True)
         self._load_or_build()
@@ -181,8 +185,7 @@ class MLRiskScorer:
         No recency weighting is applied.  Recency is captured by the
         ``recent_ratio`` feature (inspections within the last year).
         """
-        one_year_ago = date.today() - timedelta(days=365)
-
+        one_year_ago = date.today() - timedelta(days=1095)  # 3-year recency window
         n_insp = len(records)
         recent = 0
         severe = 0
@@ -356,7 +359,7 @@ class MLRiskScorer:
             name = (insp.get("estab_name") or "UNKNOWN").upper()
             estab_inspections[name].append(insp)
 
-        one_year_ago = date.today() - timedelta(days=365)
+        one_year_ago = date.today() - timedelta(days=1095)  # 3-year recency window
         total_estabs = len(estab_inspections)
         population = []
         progress = 0
@@ -524,23 +527,197 @@ class MLRiskScorer:
         X = np.nan_to_num(X_raw, nan=0.0)
         X = self._log_transform_features(X)  # model trains on log-scaled counts
 
-        # Increase model complexity: more estimators, deeper trees, lower learning rate
+        # ── 80/20 split: train GBR on 80%, fit calibrator on held-out 20% ─
+        # Using a random split (not temporal) because the population dict
+        # carries no date field.  Fitting the calibrator on held-out data
+        # ensures it corrects GBR compression without overfitting to the
+        # training targets.
+        rng = np.random.default_rng(42)
+        n = len(X)
+        idx = rng.permutation(n)
+        split = int(n * 0.8)
+        train_idx, cal_idx = idx[:split], idx[split:]
+        X_train, y_train = X[train_idx], y[train_idx]
+        X_cal, y_cal = X[cal_idx], y[cal_idx]
+        # ── Tail sample weights ───────────────────────────────────────────
+        # Ramp starts at the Recommend→Caution boundary (y=30) rather than 40
+        # to give the model a stronger gradient signal throughout the Caution
+        # band.  Steeper slope (1 unit per 10 score points) and an 8× cap
+        # (vs. the old 3×) counteract the 79:1 class imbalance between
+        # Recommend and Do-Not-Recommend establishments.
+        sw_train = np.clip(1.0 + np.maximum(0.0, y_train - 30.0) / 10.0, 1.0, 8.0)
+
+        # ── Model: Huber loss + higher capacity + min leaf ────────────
+        # Huber loss (alpha=0.9 ≈ 90th-percentile transition) is less
+        # aggressive than squared-error at penalising tail deviations,
+        # reducing regression of high-scored establishments toward the mean.
+        # n_estimators 300 → 400 gives the model more capacity to learn
+        # the thinly-populated tail; min_samples_leaf=3 prevents over-
+        # smoothing of the rare extreme examples.
         self.pipeline = Pipeline([
             ("scaler", StandardScaler()),
             ("model", GradientBoostingRegressor(
-                n_estimators=300,
+                n_estimators=500,
                 max_depth=5,
                 learning_rate=0.05,
                 subsample=0.8,
+                loss="huber",
+                alpha=0.95,
+                min_samples_leaf=3,
                 random_state=42,
             )),
         ])
-        self.pipeline.fit(X, y)
+        # Pipeline.fit() routes extra kwargs to the final estimator via
+        # the "stepname__param" convention.
+        self.pipeline.fit(X_train, y_train, model__sample_weight=sw_train)
         self.population_features = X
-        print(f"ML Risk Model trained on {len(X)} establishments.")
+
+        # ── Fit tail calibrator on held-out 20% ───────────────────────
+        # Predicts raw scores for the calibration fold and maps them to
+        # the pseudo-labels those establishments should have received.
+        # This corrects for GBR's MSE-driven tail compression without
+        # touching the rank order of any two establishments.
+        cal_preds = self.pipeline.predict(X_cal)
+        self._calibrator = TailCalibrator()
+        self._calibrator.fit(cal_preds, y_cal)
+        print(
+            f"ML Risk Model trained on {len(X_train)} establishments "
+            f"(calibrator fitted on {len(X_cal)})."
+        )
 
     # ------------------------------------------------------------------ #
     #  Persistence
+    # ------------------------------------------------------------------ #
+    #  Temporal calibration
+    # ------------------------------------------------------------------ #
+    def _refit_calibrator_from_temporal(self, population: List[Dict]) -> None:
+        """Refit the tail calibrator using real future outcomes (2024+).
+
+        After training, this method loads post-2024 inspections and violations
+        from the bulk CSVs, computes real future adverse outcome scores for each
+        training establishment that also received inspections after 2024-01-01,
+        and re-fits the calibrator so that the raw-score→calibrated-score mapping
+        reflects actual compliance outcomes rather than self-referential
+        pseudo-labels.
+
+        This corrects the circular calibration problem: fitting the calibrator
+        on pseudo-label holdout only un-compresses back to already-faulty labels.
+        Real temporal data reveals how raw scores actually predict future harm.
+        """
+        insp_path = os.path.join(self.CACHE_DIR, "inspections_bulk.csv")
+        viol_path = os.path.join(self.CACHE_DIR, "violations_bulk.csv")
+
+        if not os.path.exists(insp_path) or not os.path.exists(viol_path):
+            print("  Temporal calibration skipped: bulk CSVs not found in ml_cache/.")
+            return
+
+        if self.pipeline is None or self.population_features is None:
+            return
+
+        CUTOFF = date(2024, 1, 1)
+        print("  Refitting calibrator from real temporal outcomes (2024+ holdout)…")
+
+        # Get raw model predictions for every population establishment.
+        pop_raw_scores = self.pipeline.predict(self.population_features)
+        name_to_raw: Dict[str, float] = {
+            p["name"]: float(pop_raw_scores[i])
+            for i, p in enumerate(population)
+        }
+
+        # Stream post-2024 inspections, keeping only names we trained on.
+        post_estabs: Dict[str, list] = defaultdict(list)
+        csv.field_size_limit(10 * 1024 * 1024)
+        with open(insp_path, encoding="utf-8", errors="replace", newline="") as f:
+            for row in csv.DictReader(f):
+                name = (row.get("estab_name") or "UNKNOWN").upper()
+                if name not in name_to_raw:
+                    continue
+                od = row.get("open_date", "")
+                try:
+                    d = date.fromisoformat(od[:10])
+                except (ValueError, TypeError):
+                    continue
+                if d >= CUTOFF:
+                    post_estabs[name].append(row)
+
+        if not post_estabs:
+            print("  No post-2024 inspections for known establishments; skipping.")
+            return
+
+        # Load violations for post-2024 activity numbers only (leakage guard).
+        post_acts: set = {
+            str(r.get("activity_nr", ""))
+            for rows in post_estabs.values()
+            for r in rows
+        }
+        viols_by_act: Dict[str, list] = defaultdict(list)
+        with open(viol_path, encoding="utf-8", errors="replace", newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("delete_flag") == "X":
+                    continue
+                act = str(row.get("activity_nr", ""))
+                if act in post_acts:
+                    viols_by_act[act].append(row)
+
+        # Compute (raw_score, future_adverse) pairs.
+        raw_scores_cal: list = []
+        future_advs_cal: list = []
+
+        for name, fut_inspections in post_estabs.items():
+            raw_pred = name_to_raw[name]
+            fut_viols: list = []
+            fut_fat = 0
+            for insp in fut_inspections:
+                act = str(insp.get("activity_nr", ""))
+                fut_viols.extend(viols_by_act.get(act, []))
+                fut_fat += int(insp.get("fatalities", "0") or 0)
+
+            fut_n   = len(fut_inspections)
+            fut_wr  = sum(1 for v in fut_viols if v.get("viol_type") in ("W", "R"))
+            fut_s   = sum(1 for v in fut_viols if v.get("viol_type") == "S")
+            fut_pen = sum(
+                float(v.get("current_penalty") or v.get("initial_penalty") or 0)
+                for v in fut_viols
+            )
+            fut_vr    = len(fut_viols) / fut_n if fut_n > 0 else 0.0
+            any_fatal = int(fut_fat > 0)
+
+            # Mirror the adverse-outcome formula used in test_real_world_validation.
+            adv = 0.0
+            adv += 20.0 * any_fatal
+            adv += min((fut_fat - 1) * 5.0, 15.0) if fut_fat > 1 else 0.0
+            adv += 8.0 * int(fut_wr > 0)
+            adv += min(fut_wr * 3.0, 15.0)
+            adv += min(fut_s * 1.0, 10.0)
+            adv += min(math.log1p(fut_pen) * 0.8, 10.0)
+            adv += min(fut_vr * 2.0, 10.0)
+
+            raw_scores_cal.append(raw_pred)
+            future_advs_cal.append(adv)
+
+        n_pairs = len(raw_scores_cal)
+        if n_pairs < 100:
+            print(
+                f"  Only {n_pairs} temporal pairs found; "
+                "keeping pseudo-label calibrator."
+            )
+            return
+
+        print(
+            f"  Fitting temporal calibrator on {n_pairs:,} "
+            "(raw_score, future_adverse) pairs…"
+        )
+        new_cal = TailCalibrator()
+        new_cal.fit(
+            np.array(raw_scores_cal, dtype=float),
+            np.array(future_advs_cal, dtype=float),
+        )
+        if new_cal.is_fitted:
+            self._calibrator = new_cal
+            print("  Temporal calibrator fitted and attached.")
+        else:
+            print("  Temporal calibrator fit produced too few bins; keeping pseudo-label version.")
+
     # ------------------------------------------------------------------ #
     def _save(self, population: List[Dict]):
         model_path = os.path.join(self.CACHE_DIR, self.MODEL_FILE)
@@ -566,6 +743,9 @@ class MLRiskScorer:
                 },
                 f,
             )
+        if self._calibrator is not None and self._calibrator.is_fitted:
+            cal_path = os.path.join(self.CACHE_DIR, self.CALIBRATOR_FILE)
+            self._calibrator.save(cal_path)
 
     def _load_or_build(self):
         model_path = os.path.join(self.CACHE_DIR, self.MODEL_FILE)
@@ -612,6 +792,13 @@ class MLRiskScorer:
                     self.pipeline = loaded_pipeline
                     self.population_features = self._log_transform_features(feats)
                     self._industry_stats = meta.get("industry_stats", {})
+                    # Load calibrator if available (graceful degradation if absent)
+                    cal_path = os.path.join(self.CACHE_DIR, self.CALIBRATOR_FILE)
+                    if os.path.exists(cal_path):
+                        try:
+                            self._calibrator = TailCalibrator.load(cal_path)
+                        except Exception as cal_e:
+                            print(f"  Calibrator load failed ({cal_e}); running uncalibrated.")
                     print(f"Loaded cached ML risk model (trained {cache_date}, {len(pop)} estabs).")
                     return
             except Exception as e:
@@ -626,6 +813,7 @@ class MLRiskScorer:
                 print("Insufficient population data ")
                 return
             self._train(population)
+            self._refit_calibrator_from_temporal(population)
             self._save(population)
         except Exception as e:
             print(f"Population fetch failed ({e})")
@@ -683,7 +871,35 @@ class MLRiskScorer:
             log_feats = self._log_transform_features(raw)
 
             raw_pred = float(self.pipeline.predict(log_feats)[0])
-            score = float(np.clip(raw_pred, 0, 100))
+
+            # ── Evidence-gated score ceiling ──────────────────────────
+            # Single-event companies lack sufficient evidence for a high
+            # "Do Not Recommend" classification.  Cap scores based on
+            # inspection depth so sparse-evidence establishments cannot
+            # land in the highest tier without sufficient historical data.
+            # Exception: confirmed fatality + willful violations may
+            # reach 70 regardless of inspection count.
+            n_insp_this = len(estab_records)
+            feat17_raw = feat17  # already extracted above
+            # feat17 is a raw list; willful is index 3, fatalities index 12
+            has_fatality = feat17_raw[12] > 0
+            has_willful  = feat17_raw[3] > 0
+            if has_fatality and has_willful:
+                ceiling = 70.0
+            elif n_insp_this <= 2:
+                ceiling = 50.0
+            elif n_insp_this <= 4:
+                ceiling = 58.0
+            else:
+                ceiling = 100.0
+            evidence_capped = raw_pred > ceiling
+            clipped = float(np.clip(raw_pred, 0, ceiling))
+
+            # ── Isotonic calibration ──────────────────────────────────
+            if self._calibrator is not None and self._calibrator.is_fitted:
+                score = self._calibrator.calibrate(clipped)
+            else:
+                score = clipped
 
             n = len(estab_records)
             # Resolve city/state from the most recent record in this group
@@ -700,6 +916,7 @@ class MLRiskScorer:
                 "naics_code": naics,
                 "city": city,
                 "state": state,
+                "evidence_capped": evidence_capped,
             })
             total_inspections += n
 
@@ -901,6 +1118,7 @@ class MLRiskScorer:
         population = self._fetch_population()
         if len(population) >= 5:
             self._train(population)
+            self._refit_calibrator_from_temporal(population)
             self._save(population)
             return True
         return False

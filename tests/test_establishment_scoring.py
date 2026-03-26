@@ -145,11 +145,13 @@ def test_recommendation_systemic_high_risk():
     # Make predict return 70 (high risk) for all
     scorer.pipeline.predict.return_value = np.array([70.0])
 
-    records = [
-        _make_record(inspection_id="I1", estab_name="SITE 1"),
-        _make_record(inspection_id="I2", estab_name="SITE 2"),
-        _make_record(inspection_id="I3", estab_name="SITE 3"),
-    ]
+    # Each site needs ≥ 5 inspection records so the evidence-gated ceiling
+    # (50 for n_insp ≤ 2, 58 for n_insp ≤ 4) does not apply.  The ceiling
+    # is 100 at 5+ inspections, allowing the mock score of 70 to pass through.
+    records = []
+    for site in ("SITE 1", "SITE 2", "SITE 3"):
+        for i in range(5):
+            records.append(_make_record(inspection_id=f"I{site}{i}", estab_name=site))
     result = scorer.score(records)
     # All 3 sites ≥ 60 → risk_concentration == 1.0 → systemic
     # With score 70 > 60 and systemic → "Do Not Recommend"
@@ -331,17 +333,22 @@ def test_weighted_average_calculation():
 
     scorer.pipeline.predict.side_effect = mock_predict
 
+    # HEAVY SITE needs ≥ 5 inspection records so the evidence-gated ceiling
+    # (58 for n_insp ≤ 4) does not cap the mock score of 80.  At 5+
+    # inspections the ceiling is 100, allowing 80 to pass through unchanged.
     records = [
         _make_record(inspection_id="H1", estab_name="HEAVY SITE"),
         _make_record(inspection_id="H2", estab_name="HEAVY SITE"),
         _make_record(inspection_id="H3", estab_name="HEAVY SITE"),
+        _make_record(inspection_id="H4", estab_name="HEAVY SITE"),
+        _make_record(inspection_id="H5", estab_name="HEAVY SITE"),
         _make_record(inspection_id="L1", estab_name="LIGHT SITE"),
     ]
     estab = scorer.score_establishments(records)
 
-    # HEAVY: 3 inspections × 80 = 240  |  LIGHT: 1 inspection × 20 = 20
-    # Weighted avg = 260 / 4 = 65.0
-    expected = (80.0 * 3 + 20.0 * 1) / 4
+    # HEAVY: 5 inspections × 80 = 400  |  LIGHT: 1 inspection × 20 = 20
+    # Weighted avg = 420 / 6 = 70.0
+    expected = (80.0 * 5 + 20.0 * 1) / 6
     assert abs(estab["weighted_avg_score"] - expected) < 0.1, \
         f"Expected {expected}, got {estab['weighted_avg_score']}"
     print("PASS: weighted average correct")

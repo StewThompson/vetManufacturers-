@@ -1,10 +1,13 @@
 import sys
 sys.path.insert(0, '.')
 from src.data_retrieval.osha_client import OSHAClient
-from src.search.grouped_search import group_establishments
+from src.search.grouped_search import group_establishments, get_or_build_company_key_index
 
 client = OSHAClient()
 client.ensure_cache()
+
+company_key_index = get_or_build_company_key_index(client)
+_ckey_to_estabs, company_keys = company_key_index
 
 names = client.get_all_company_names()
 print(f"Total company names: {len(names)}")
@@ -14,7 +17,7 @@ for n in sorted(walmart_names):
     print(f"  {n}")
 
 print("\nRunning group_establishments('Walmart')...")
-result = group_establishments("Walmart", names, client)
+result = group_establishments("Walmart", company_key_index, client)
 if result.top_group:
     g = result.top_group
     all_fac = g.all_facilities

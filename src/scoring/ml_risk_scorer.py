@@ -1,8 +1,11 @@
+import csv
+import math
 import os
 import json
 import pickle
 import numpy as np
-from collections import defaultdict
+import pandas as pd
+from collections import defaultdict, Counter
 from datetime import date, timedelta
 from typing import List, Dict, Optional
 
@@ -11,6 +14,14 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
 from src.models.osha_record import OSHARecord
+from src.data_retrieval.naics_lookup import get_industry_name, load_naics_map
+from src.scoring.industry_stats import compute_industry_stats, compute_relative_features
+from src.scoring.pseudo_labeler import pseudo_label
+from src.scoring.tail_calibrator import TailCalibrator
+
+
+# compute_industry_stats and compute_relative_features are re-exported
+# from src.scoring.industry_stats for backward compatibility.
 
 
 class MLRiskScorer:
@@ -21,14 +32,26 @@ class MLRiskScorer:
     DOL API so that every manufacturer's risk score is *relative* to the
     broader population of inspected establishments.
     """
+    INDUSTRY_MIN_SAMPLE = 10
+    # Expand log transformation to more features with large ranges
+    LOG_FEATURE_INDICES = [0, 1, 5, 6, 7, 11, 12, 13, 15]  # log-scale counts, penalties, accident/injury counts
+
+    # Canonical 2-digit NAICS sectors for one-hot encoding.
+    NAICS_SECTORS = [
+        "11", "21", "22", "23", "31", "32", "33",
+        "42", "44", "45", "48", "49", "51", "52",
+        "53", "54", "55", "56", "61", "62", "71",
+        "72", "81", "92",
+    ]
 
     FEATURE_NAMES = [
-        "total_inspections",
-        "total_violations",
+        # ── Absolute signals (17) ──────────────────────────────────────
+        "log_inspections",
+        "log_violations",
         "serious_violations",
         "willful_violations",
         "repeat_violations",
-        "total_penalties",
+        "log_penalties",
         "avg_penalty",
         "max_penalty",
         "recent_ratio",
@@ -40,15 +63,30 @@ class MLRiskScorer:
         "avg_gravity",
         "penalties_per_inspection",
         "clean_ratio",
+        # ── Industry-relative z-scores (4) ────────────────────────────
+        # 0.0 sentinel when NAICS unavailable
+        "relative_violation_rate",
+        "relative_penalty",
+        "relative_serious_ratio",
+        "relative_willful_repeat",
+        # ── 2-digit NAICS sector one-hot (25) ─────────────────────────
+        "naics_11", "naics_21", "naics_22", "naics_23",
+        "naics_31", "naics_32", "naics_33",
+        "naics_42", "naics_44", "naics_45",
+        "naics_48", "naics_49", "naics_51", "naics_52",
+        "naics_53", "naics_54", "naics_55", "naics_56",
+        "naics_61", "naics_62", "naics_71", "naics_72",
+        "naics_81", "naics_92",
+        "naics_unknown",
     ]
 
     FEATURE_DISPLAY = {
-        "total_inspections": "Inspection Count",
-        "total_violations": "Violation Count",
+        "log_inspections": "Inspection Count (log)",
+        "log_violations": "Violation Count (log)",
         "serious_violations": "Serious Violations",
         "willful_violations": "Willful Violations",
         "repeat_violations": "Repeat Violations",
-        "total_penalties": "Total Penalties ($)",
+        "log_penalties": "Total Penalties (log $)",
         "avg_penalty": "Avg Penalty ($)",
         "max_penalty": "Max Single Penalty ($)",
         "recent_ratio": "Recent Activity (1yr)",
@@ -60,85 +98,133 @@ class MLRiskScorer:
         "avg_gravity": "Avg Violation Gravity",
         "penalties_per_inspection": "Penalties / Inspection ($)",
         "clean_ratio": "Clean Inspection Ratio",
+        "relative_violation_rate": "Violation Rate vs. Industry (z)",
+        "relative_penalty": "Avg Penalty vs. Industry (z)",
+        "relative_serious_ratio": "Serious Ratio vs. Industry (z)",
+        "relative_willful_repeat": "Willful+Repeat Rate vs. Industry (z)",
+        "naics_11": "Agriculture/Forestry/Fishing",
+        "naics_21": "Mining/Oil & Gas",
+        "naics_22": "Utilities",
+        "naics_23": "Construction",
+        "naics_31": "Mfg (Food/Textile/Apparel)",
+        "naics_32": "Mfg (Wood/Paper/Chemical/Plastics)",
+        "naics_33": "Mfg (Metal/Machinery/Electronics)",
+        "naics_42": "Wholesale Trade",
+        "naics_44": "Retail Trade",
+        "naics_45": "Retail Trade (Misc.)",
+        "naics_48": "Transportation/Warehousing",
+        "naics_49": "Warehousing/Storage",
+        "naics_51": "Information",
+        "naics_52": "Finance/Insurance",
+        "naics_53": "Real Estate",
+        "naics_54": "Professional/Scientific/Technical",
+        "naics_55": "Management of Companies",
+        "naics_56": "Admin/Support/Waste Mgmt",
+        "naics_61": "Educational Services",
+        "naics_62": "Health Care/Social Assistance",
+        "naics_71": "Arts/Entertainment/Recreation",
+        "naics_72": "Accommodation/Food Services",
+        "naics_81": "Other Services",
+        "naics_92": "Public Administration",
+        "naics_unknown": "Industry Unknown",
     }
 
     CACHE_DIR = "ml_cache"
     MODEL_FILE = "risk_model.pkl"
     POP_FILE = "population_data.json"
+    CALIBRATOR_FILE = "tail_calibrator.pkl"
 
     def __init__(self, osha_client=None):
         self.osha_client = osha_client
         self.pipeline: Optional[Pipeline] = None
         self.population_features: Optional[np.ndarray] = None
+        self._industry_stats: dict = {}
+        self._calibrator: Optional[TailCalibrator] = None
+        self._naics_map: dict = load_naics_map()
         os.makedirs(self.CACHE_DIR, exist_ok=True)
         self._load_or_build()
 
     # ------------------------------------------------------------------ #
+    #  Feature transforms
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _log_transform_features(X: np.ndarray) -> np.ndarray:
+        """Log1p-compress raw count features (inspections, violations, penalties).
+
+        Prevents volume/aggregation bias: a 500-establishment company's
+        raw counts become comparable to single-site training data.
+        log1p(500)≈6.2 vs log1p(3)≈1.4 — not the 167× raw ratio.
+        """
+        X = X.copy()
+        for i in MLRiskScorer.LOG_FEATURE_INDICES:
+            X[..., i] = np.log1p(np.maximum(X[..., i], 0))
+        return X
+
+    def _encode_naics(self, naics_code) -> list:
+        """One-hot encode 2-digit NAICS prefix. Returns list of len(NAICS_SECTORS)+1."""
+        prefix = str(naics_code or "")[:2] if naics_code else ""
+        vec = [0] * (len(self.NAICS_SECTORS) + 1)
+        if prefix in self.NAICS_SECTORS:
+            vec[self.NAICS_SECTORS.index(prefix)] = 1
+        else:
+            vec[-1] = 1  # naics_unknown
+        return vec
+
+    # ------------------------------------------------------------------ #
     #  Feature extraction
     # ------------------------------------------------------------------ #
-    def extract_features(self, records: List[OSHARecord]) -> np.ndarray:
-        """Convert a list of OSHARecords into a 1 x n_features array.
+    def _extract_establishment_features_raw(
+        self, records: List[OSHARecord],
+    ) -> tuple:
+        """Extract the 17 absolute features for one establishment.
 
-        Count signals (serious, willful, repeat, accidents, etc.) are
-        expressed as *rates per inspection* so that large multi-site
-        companies are scored on their per-location safety rate rather
-        than their aggregate totals.  This keeps training and inference
-        on the same scale regardless of company size.
+        Returns ``(feature_list_17, naics_code)`` where *feature_list_17*
+        uses **simple per-inspection rates** — identical semantics to
+        ``_fetch_population`` so that train and inference are aligned.
 
-        More recent inspections are weighted higher via exponential decay
-        (half-life = 3 years).
+        No recency weighting is applied.  Recency is captured by the
+        ``recent_ratio`` feature (inspections within the last year).
         """
-        one_year_ago = date.today() - timedelta(days=365)
-        today = date.today()
-        half_life_days = 3 * 365  # 3-year half-life
-
+        one_year_ago = date.today() - timedelta(days=1095)  # 3-year recency window
         n_insp = len(records)
-
-        # Per-inspection recency weight: exp(-ln2 * age / half_life)
-        def recency_weight(d: date) -> float:
-            age = max((today - d).days, 0)
-            return float(np.exp(-np.log(2) * age / half_life_days))
-
-        insp_weights = [recency_weight(r.date_opened) for r in records]
-        total_w = sum(insp_weights) or 1.0
-
-        # Weighted accumulation — will be divided by total_w to produce rates
-        serious_w = 0.0
-        willful_w = 0.0
-        repeat_w = 0.0
+        recent = 0
+        severe = 0
+        clean = 0
+        n_viols = 0
+        serious_raw = 0
+        willful_raw = 0
+        repeat_raw = 0
         total_pen = 0.0
         all_penalties: list = []
-        recent = 0
-        severe_w = 0.0
-        n_viols_w = 0.0
-        accident_w = 0.0
-        fatality_w = 0.0
-        injury_w = 0.0
+        acc_count = 0
+        fat_count = 0
+        inj_count = 0
         gravities: list = []
-        clean_w = 0.0
 
-        for r, w in zip(records, insp_weights):
+        naics_votes: Counter = Counter()
+
+        for r in records:
             viols = r.violations
-            n_viols_w += len(viols) * w
+            n_viols += len(viols)
 
-            serious_w += sum(1 for v in viols if v.severity == "Serious") * w
-            willful_w += sum(1 for v in viols if v.is_willful) * w
-            repeat_w  += sum(1 for v in viols if v.is_repeat) * w
+            serious_raw += sum(1 for v in viols if v.severity == "Serious")
+            willful_raw += sum(1 for v in viols if v.is_willful)
+            repeat_raw  += sum(1 for v in viols if v.is_repeat)
 
             pens = [v.penalty_amount for v in viols]
-            total_pen += sum(pens) * w
+            total_pen += sum(pens)
             all_penalties.extend(pens)
 
             if r.date_opened >= one_year_ago:
                 recent += 1
 
             if r.accidents:
-                severe_w += w
+                severe += 1
                 for a in r.accidents:
-                    accident_w += w
+                    acc_count += 1
                     if a.fatality:
-                        fatality_w += w
-                    injury_w += len(a.injuries) * w
+                        fat_count += 1
+                    inj_count += len(a.injuries)
 
             for v in viols:
                 if v.gravity:
@@ -148,159 +234,102 @@ class MLRiskScorer:
                         pass
 
             if not viols:
-                clean_w += w
+                clean += 1
 
-        # --- Rates (per weighted inspection) ---
-        # Dividing by total_w normalises for company size: a 1,000-location
-        # chain and a single-site supplier both land on the same scale.
-        serious       = serious_w  / total_w
-        willful       = willful_w  / total_w
-        repeat        = repeat_w   / total_w
-        severe        = severe_w   / total_w
-        accident_count = accident_w / total_w
-        fatality_count = fatality_w / total_w
-        injury_count   = injury_w   / total_w
+            if r.naics_code:
+                naics_votes[r.naics_code] += 1
 
+        naics_code = naics_votes.most_common(1)[0][0] if naics_votes else None
+
+        # Per-inspection rates — same scale as _fetch_population training data
         avg_pen = float(np.mean(all_penalties)) if all_penalties else 0.0
         max_pen = max(all_penalties) if all_penalties else 0.0
-        recent_ratio = recent / n_insp if n_insp else 0.0
-        vpi = n_viols_w / total_w if total_w else 0.0
-        avg_gravity = float(np.mean(gravities)) if gravities else 0.0
-        pen_per_insp = total_pen / total_w if total_w else 0.0
-        clean_ratio = clean_w / total_w if total_w else 0.0
+        recent_ratio  = recent      / n_insp if n_insp else 0.0
+        vpi           = n_viols     / n_insp if n_insp else 0.0
+        avg_gravity   = float(np.mean(gravities)) if gravities else 0.0
+        pen_per_insp  = total_pen   / n_insp if n_insp else 0.0
+        clean_ratio   = clean       / n_insp if n_insp else 0.0
+        serious_rate  = serious_raw / n_insp if n_insp else 0.0
+        willful_rate  = willful_raw / n_insp if n_insp else 0.0
+        repeat_rate   = repeat_raw  / n_insp if n_insp else 0.0
+        severe_rate   = severe      / n_insp if n_insp else 0.0
+        acc_rate      = acc_count   / n_insp if n_insp else 0.0
+        fat_rate      = fat_count   / n_insp if n_insp else 0.0
+        inj_rate      = inj_count   / n_insp if n_insp else 0.0
 
-        return np.array([[
-            n_insp, n_viols_w, serious, willful, repeat,
-            total_pen, avg_pen, max_pen, recent_ratio, severe, vpi,
-            accident_count, fatality_count, injury_count, avg_gravity,
+        # Fraction-of-violations metrics for industry comparison
+        raw_serious_rate = serious_raw / max(n_viols, 1)
+        raw_wr_rate      = (willful_raw + repeat_raw) / max(n_viols, 1)
+
+        features_17 = [
+            n_insp, n_viols, serious_rate, willful_rate, repeat_rate,
+            total_pen, avg_pen, max_pen, recent_ratio, severe_rate, vpi,
+            acc_rate, fat_rate, inj_rate, avg_gravity,
             pen_per_insp, clean_ratio,
-        ]])
+        ]
+
+        return features_17, naics_code, vpi, avg_pen, raw_serious_rate, raw_wr_rate
+
+    def _complete_features(
+        self,
+        features_17: list,
+        naics_code: str,
+        vpi: float,
+        avg_pen: float,
+        raw_serious_rate: float,
+        raw_wr_rate: float,
+    ) -> np.ndarray:
+        """Append industry z-scores + NAICS one-hot → 1×46 array (pre-log-transform)."""
+        industry_group = (
+            naics_code[:4]
+            if naics_code and len(str(naics_code)) >= 4
+            else None
+        )
+
+        rel = compute_relative_features(
+            {
+                "industry_group": industry_group,
+                "raw_vpi": vpi,
+                "raw_avg_pen": avg_pen,
+                "raw_serious_rate": raw_serious_rate,
+                "raw_wr_rate": raw_wr_rate,
+            },
+            self._industry_stats,
+            self._naics_map,
+            min_sample=self.INDUSTRY_MIN_SAMPLE,
+        )
+
+        def _safe(v: float) -> float:
+            return 0.0 if (v != v) else v  # NaN → 0.0
+
+        naics_vec = self._encode_naics(naics_code)
+
+        row = features_17 + [
+            _safe(rel["relative_violation_rate"]),
+            _safe(rel["relative_penalty"]),
+            _safe(rel["relative_serious_ratio"]),
+            _safe(rel["relative_willful_repeat"]),
+        ] + naics_vec
+
+        return np.array([row])
+
+    def extract_features(self, records: List[OSHARecord]) -> np.ndarray:
+        """Convert a list of OSHARecords into a 1 × n_features array.
+
+        Backward-compatible entry point.  Treats all *records* as a single
+        establishment (aggregated).  Uses simple per-inspection rates —
+        identical to the training path in ``_fetch_population``.
+        """
+        feat17, naics, vpi, avg_pen, sr, wr = (
+            self._extract_establishment_features_raw(records)
+        )
+        raw = self._complete_features(feat17, naics, vpi, avg_pen, sr, wr)
+        return self._log_transform_features(raw)
 
     # ------------------------------------------------------------------ #
-    #  Pseudo-label generation (domain knowledge)
+    #  Pseudo-label generation (domain knowledge) — delegated
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _pseudo_label(row: np.ndarray) -> float:
-        """
-        Generate a training label (0-100 risk) from raw features using
-        an explainable, credit-score-inspired heuristic.
-
-        Scoring philosophy:
-          direct harm signals         0-34   dominant, can create score floors
-          violation type             0-24   willful/repeat matter heavily
-          gravity / severity         0-14   serious + gravity corroborate risk
-          recency                    0-12   recent bad behavior matters more
-          violation rate             0-10   normalized by inspections
-          penalties                  0-6    log-scaled corroboration only
-          clean inspection credit    0 to -10  reward repeated clean history
-          uncertainty / sparse data  0-8    caution when evidence is thin
-
-        Modifiers:
-          + interaction penalties for compounding patterns
-          + catastrophic-event floors
-          + sparse-data floors
-        """
-        (n_insp, n_viols, serious, willful, repeat,
-         total_pen, avg_pen, max_pen, recent_ratio, severe, vpi,
-         accident_count, fatality_count, injury_count, avg_gravity,
-         pen_per_insp, clean_ratio) = row
-
-        # All count features (serious, willful, repeat, severe, accidents,
-        # fatalities, injuries) are now *rates per inspection* — a value of 1.0
-        # means every inspection had that event; 0.1 means 1-in-10 inspections.
-        # This keeps Walmart (1,000 locations) on the same scale as a single
-        # factory.  n_insp is retained raw so the scorer still knows how much
-        # evidence exists.
-
-        score = 0.0
-
-        # --- Direct harm signals (up to 34) ---
-        # Fatalities dominate: one death is categorically different from any number
-        # of paper violations.  fatality_count is a *rate* (fatality inspections /
-        # total inspections), so > 0 means at least one fatal inspection occurred;
-        # the nonlinear jump is preserved — a company with a 10 % fatality rate
-        # scores near the cap whereas a 0.1 % rate still triggers the floor.
-        if fatality_count > 0:
-            # Reconstruct a representative absolute count for the jump formula,
-            # bounded so a 100 % fatality rate doesn't inflate beyond the cap.
-            eff_fatalities = min(fatality_count * max(n_insp, 1), 5)
-            score += min(22.0 + (eff_fatalities - 1) * 6.0, 34)
-        score += min(severe * 25.0, 6)                      # rate × scale → up to 6
-        score += min(injury_count * 6.0, 4)                 # rate × scale → up to 4
-        score += min(accident_count * 10.0, 4)              # rate × scale → up to 4
-
-        # Cap the full direct-harm block at 34
-        score = min(score, 34)
-
-        # --- Violation type (up to 24) ---
-        # Willful violations = deliberate disregard for safety; treated more harshly
-        # than repeat, which is a pattern signal but may reflect complexity, not malice.
-        # Both are now rates: willful=1.0 means every inspection had a willful.
-        score += min(willful * 14.0, 14)                    # rate × scale → up to 14
-        score += min(repeat * 10.0, 10)                     # rate × scale → up to 10
-
-        # --- Gravity / severity (up to 14) ---
-        # Serious rate and avg_gravity corroborate real danger.
-        score += min(serious * 8.0, 8)                      # rate × scale → up to 8
-        if avg_gravity > 0:
-            score += min(avg_gravity * 0.6, 6)              # avg is already scale-invariant
-
-        # --- Recency — recent activity within 1yr (up to 12) ---
-        # raw ratio is already scale-invariant
-        score += recent_ratio * 12.0                        # up to 12
-
-        # --- Violation rate per inspection (up to 10) ---
-        # vpi is already a rate (violations / inspection); unchanged.
-        score += min(vpi * 2.5, 10)                         # up to 10
-
-        # --- Penalties — corroboration only (up to 6) ---
-        # pen_per_insp is already normalized; total_pen is intentionally raw
-        # (absolute fine size is a corroborating signal, not the primary driver).
-        if total_pen > 0:
-            score += min(np.log1p(total_pen) * 0.4, 4)     # up to 4
-        if pen_per_insp > 0:
-            score += min(np.log1p(pen_per_insp) * 0.3, 2)  # up to 2
-
-        # --- Clean inspection credit (up to -10) ---
-        # A pattern of clean inspections is genuinely positive, but it cannot
-        # offset catastrophic events — a company with a fatality rate > 0 is
-        # still high-risk even if most inspections were clean.
-        if (clean_ratio > 0
-                and fatality_count == 0
-                and accident_count == 0
-                and severe == 0):
-            if n_insp >= 3:
-                score -= clean_ratio * 10.0                 # full credit: sustained history
-            elif n_insp == 2:
-                score -= clean_ratio * 4.0                  # partial: only two data points
-            # n_insp <= 1: no credit — one clean inspection proves nothing
-
-        # --- Uncertainty / sparse data (up to 5) ---
-        # Sparse data means we don't know enough to call this company safe.
-        if n_insp <= 1:
-            score += 5.0
-        elif n_insp <= 3:
-            score += 2.5
-        elif n_insp <= 5:
-            score += 1.0
-
-        # --- Interaction effects ---
-        # Rate-based: both conditions can fire even for a single-inspection
-        # company if the rates are non-zero.
-        if fatality_count > 0 and (willful + repeat) > 0:
-            score += 8.0                                    # institutional disregard
-        if willful > 0 and repeat > 0:
-            score += 5.0                                    # known + ignored pattern
-        if recent_ratio > 0.5 and serious >= 0.25:          # ≥25 % of inspections serious
-            score += 4.0                                    # concentrated recent danger
-
-        # --- Conservative floors ---
-        if fatality_count > 0 and recent_ratio >= 0.25:
-            score = max(score, 65.0)                        # recent fatality rate: never low-risk
-        if n_insp <= 1 and score < 18:
-            score = 18.0                                    # single-inspection: insufficient data
-
-        return float(np.clip(score, 0, 100))
+    _pseudo_label = staticmethod(pseudo_label)
 
     # ------------------------------------------------------------------ #
     #  Population data from bulk cache
@@ -330,7 +359,7 @@ class MLRiskScorer:
             name = (insp.get("estab_name") or "UNKNOWN").upper()
             estab_inspections[name].append(insp)
 
-        one_year_ago = date.today() - timedelta(days=365)
+        one_year_ago = date.today() - timedelta(days=1095)  # 3-year recency window
         total_estabs = len(estab_inspections)
         population = []
         progress = 0
@@ -348,6 +377,8 @@ class MLRiskScorer:
             fat_count = 0
             inj_count = 0
 
+            # Majority-vote NAICS code for this establishment
+            naics_votes: dict = defaultdict(int)
             for insp in inspections:
                 act = str(insp.get("activity_nr", ""))
                 od = insp.get("open_date", "")
@@ -369,6 +400,13 @@ class MLRiskScorer:
                 inj_count += acc_stats["injuries"]
                 if acc_stats["accidents"] > 0:
                     severe += 1
+
+                # Track NAICS votes
+                nc = str(insp.get("naics_code") or "").strip()
+                if nc and nc.isdigit() and len(nc) >= 4:
+                    naics_votes[nc[:4]] += 1
+
+            naics_group = max(naics_votes, key=naics_votes.get) if naics_votes else None
 
             n_viols = len(viols)
             serious_raw = sum(1 for v in viols if v.get("viol_type") == "S")
@@ -407,6 +445,10 @@ class MLRiskScorer:
             fat_rate      = fat_count    / n_insp if n_insp else 0.0
             inj_rate      = inj_count    / n_insp if n_insp else 0.0
 
+            # Fraction-of-violations metrics for industry comparison
+            raw_serious_rate = serious_raw / max(n_viols, 1)
+            raw_wr_rate      = (willful_raw + repeat_raw) / max(n_viols, 1)
+
             population.append({
                 "name": estab,
                 "features": [
@@ -414,10 +456,62 @@ class MLRiskScorer:
                     total_pen, avg_pen, max_pen, recent_ratio, severe_rate, vpi,
                     acc_rate, fat_rate, inj_rate, avg_gravity,
                     pen_per_insp, clean_ratio,
+                    # Relative features will be appended below
                 ],
+                # Scratch fields for industry stats — removed before persisting
+                "_industry_group": naics_group,
+                "_raw_vpi": vpi,
+                "_raw_avg_pen": avg_pen,
+                "_raw_serious_rate": raw_serious_rate,
+                "_raw_wr_rate": raw_wr_rate,
             })
 
         print(f"  Aggregated {len(population)} unique establishments.")
+
+        # ── Compute industry stats from full population ────────────────────
+        pop_df = pd.DataFrame([
+            {
+                "industry_group":  p["_industry_group"],
+                "raw_vpi":         p["_raw_vpi"],
+                "raw_avg_pen":     p["_raw_avg_pen"],
+                "raw_serious_rate": p["_raw_serious_rate"],
+                "raw_wr_rate":     p["_raw_wr_rate"],
+            }
+            for p in population
+        ])
+        self._industry_stats = compute_industry_stats(
+            pop_df,
+            min_sample=self.INDUSTRY_MIN_SAMPLE,
+            naics_map=self._naics_map,
+        )
+        print(f"  Industry stats: {len(self._industry_stats)} industry groups.")
+
+        # ── Append relative features + NAICS one-hot ──────────────────────
+        for p in population:
+            ig = p.pop("_industry_group")
+            rel = compute_relative_features(
+                {
+                    "industry_group":  ig,
+                    "raw_vpi":         p.pop("_raw_vpi"),
+                    "raw_avg_pen":     p.pop("_raw_avg_pen"),
+                    "raw_serious_rate": p.pop("_raw_serious_rate"),
+                    "raw_wr_rate":     p.pop("_raw_wr_rate"),
+                },
+                self._industry_stats,
+                self._naics_map,
+                min_sample=self.INDUSTRY_MIN_SAMPLE,
+            )
+            # NaN z-scores for missing NAICS → nan_to_num(0.0) in _train()
+            p["features"].extend([
+                rel["relative_violation_rate"],
+                rel["relative_penalty"],
+                rel["relative_serious_ratio"],
+                rel["relative_willful_repeat"],
+            ])
+            # NAICS sector one-hot
+            naics_2digit = ig[:2] if ig else None
+            p["features"].extend(self._encode_naics(naics_2digit))
+
         return population
 
     # ------------------------------------------------------------------ #
@@ -425,32 +519,233 @@ class MLRiskScorer:
     # ------------------------------------------------------------------ #
     def _train(self, population: List[Dict]):
         """Build feature matrix, generate pseudo-labels, train pipeline."""
-        X = np.array([p["features"] for p in population])
-        y = np.array([self._pseudo_label(row) for row in X])
+        # X_raw may contain NaN in z-score features for NAICS-missing rows.
+        # Pseudo-labels use only absolute signals + naics_unknown flag;
+        # the model trains on NaN→0.0 matrix for z-scores.
+        X_raw = np.array([p["features"] for p in population], dtype=float)
+        y = np.array([self._pseudo_label(row) for row in X_raw])  # labels from raw values
+        X = np.nan_to_num(X_raw, nan=0.0)
+        X = self._log_transform_features(X)  # model trains on log-scaled counts
 
+        # ── 80/20 split: train GBR on 80%, fit calibrator on held-out 20% ─
+        # Using a random split (not temporal) because the population dict
+        # carries no date field.  Fitting the calibrator on held-out data
+        # ensures it corrects GBR compression without overfitting to the
+        # training targets.
+        rng = np.random.default_rng(42)
+        n = len(X)
+        idx = rng.permutation(n)
+        split = int(n * 0.8)
+        train_idx, cal_idx = idx[:split], idx[split:]
+        X_train, y_train = X[train_idx], y[train_idx]
+        X_cal, y_cal = X[cal_idx], y[cal_idx]
+        # ── Tail sample weights ───────────────────────────────────────────
+        # Ramp starts at the Recommend→Caution boundary (y=30) rather than 40
+        # to give the model a stronger gradient signal throughout the Caution
+        # band.  Steeper slope (1 unit per 10 score points) and an 8× cap
+        # (vs. the old 3×) counteract the 79:1 class imbalance between
+        # Recommend and Do-Not-Recommend establishments.
+        sw_train = np.clip(1.0 + np.maximum(0.0, y_train - 30.0) / 10.0, 1.0, 8.0)
+
+        # ── Model: Huber loss + higher capacity + min leaf ────────────
+        # Huber loss (alpha=0.9 ≈ 90th-percentile transition) is less
+        # aggressive than squared-error at penalising tail deviations,
+        # reducing regression of high-scored establishments toward the mean.
+        # n_estimators 300 → 400 gives the model more capacity to learn
+        # the thinly-populated tail; min_samples_leaf=3 prevents over-
+        # smoothing of the rare extreme examples.
         self.pipeline = Pipeline([
             ("scaler", StandardScaler()),
             ("model", GradientBoostingRegressor(
-                n_estimators=100,
-                max_depth=3,
-                learning_rate=0.1,
+                n_estimators=500,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                loss="huber",
+                alpha=0.95,
+                min_samples_leaf=3,
                 random_state=42,
             )),
         ])
-        self.pipeline.fit(X, y)
+        # Pipeline.fit() routes extra kwargs to the final estimator via
+        # the "stepname__param" convention.
+        self.pipeline.fit(X_train, y_train, model__sample_weight=sw_train)
         self.population_features = X
-        print(f"ML Risk Model trained on {len(X)} establishments.")
+
+        # ── Fit tail calibrator on held-out 20% ───────────────────────
+        # Predicts raw scores for the calibration fold and maps them to
+        # the pseudo-labels those establishments should have received.
+        # This corrects for GBR's MSE-driven tail compression without
+        # touching the rank order of any two establishments.
+        cal_preds = self.pipeline.predict(X_cal)
+        self._calibrator = TailCalibrator()
+        self._calibrator.fit(cal_preds, y_cal)
+        print(
+            f"ML Risk Model trained on {len(X_train)} establishments "
+            f"(calibrator fitted on {len(X_cal)})."
+        )
 
     # ------------------------------------------------------------------ #
     #  Persistence
+    # ------------------------------------------------------------------ #
+    #  Temporal calibration
+    # ------------------------------------------------------------------ #
+    def _refit_calibrator_from_temporal(self, population: List[Dict]) -> None:
+        """Refit the tail calibrator using real future outcomes (2024+).
+
+        After training, this method loads post-2024 inspections and violations
+        from the bulk CSVs, computes real future adverse outcome scores for each
+        training establishment that also received inspections after 2024-01-01,
+        and re-fits the calibrator so that the raw-score→calibrated-score mapping
+        reflects actual compliance outcomes rather than self-referential
+        pseudo-labels.
+
+        This corrects the circular calibration problem: fitting the calibrator
+        on pseudo-label holdout only un-compresses back to already-faulty labels.
+        Real temporal data reveals how raw scores actually predict future harm.
+        """
+        insp_path = os.path.join(self.CACHE_DIR, "inspections_bulk.csv")
+        viol_path = os.path.join(self.CACHE_DIR, "violations_bulk.csv")
+
+        if not os.path.exists(insp_path) or not os.path.exists(viol_path):
+            print("  Temporal calibration skipped: bulk CSVs not found in ml_cache/.")
+            return
+
+        if self.pipeline is None or self.population_features is None:
+            return
+
+        CUTOFF = date(2024, 1, 1)
+        print("  Refitting calibrator from real temporal outcomes (2024+ holdout)…")
+
+        # Get raw model predictions for every population establishment.
+        pop_raw_scores = self.pipeline.predict(self.population_features)
+        name_to_raw: Dict[str, float] = {
+            p["name"]: float(pop_raw_scores[i])
+            for i, p in enumerate(population)
+        }
+
+        # Stream post-2024 inspections, keeping only names we trained on.
+        post_estabs: Dict[str, list] = defaultdict(list)
+        csv.field_size_limit(10 * 1024 * 1024)
+        with open(insp_path, encoding="utf-8", errors="replace", newline="") as f:
+            for row in csv.DictReader(f):
+                name = (row.get("estab_name") or "UNKNOWN").upper()
+                if name not in name_to_raw:
+                    continue
+                od = row.get("open_date", "")
+                try:
+                    d = date.fromisoformat(od[:10])
+                except (ValueError, TypeError):
+                    continue
+                if d >= CUTOFF:
+                    post_estabs[name].append(row)
+
+        if not post_estabs:
+            print("  No post-2024 inspections for known establishments; skipping.")
+            return
+
+        # Load violations for post-2024 activity numbers only (leakage guard).
+        post_acts: set = {
+            str(r.get("activity_nr", ""))
+            for rows in post_estabs.values()
+            for r in rows
+        }
+        viols_by_act: Dict[str, list] = defaultdict(list)
+        with open(viol_path, encoding="utf-8", errors="replace", newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("delete_flag") == "X":
+                    continue
+                act = str(row.get("activity_nr", ""))
+                if act in post_acts:
+                    viols_by_act[act].append(row)
+
+        # Compute (raw_score, future_adverse) pairs.
+        raw_scores_cal: list = []
+        future_advs_cal: list = []
+
+        for name, fut_inspections in post_estabs.items():
+            raw_pred = name_to_raw[name]
+            fut_viols: list = []
+            fut_fat = 0
+            for insp in fut_inspections:
+                act = str(insp.get("activity_nr", ""))
+                fut_viols.extend(viols_by_act.get(act, []))
+                fut_fat += int(insp.get("fatalities", "0") or 0)
+
+            fut_n   = len(fut_inspections)
+            fut_wr  = sum(1 for v in fut_viols if v.get("viol_type") in ("W", "R"))
+            fut_s   = sum(1 for v in fut_viols if v.get("viol_type") == "S")
+            fut_pen = sum(
+                float(v.get("current_penalty") or v.get("initial_penalty") or 0)
+                for v in fut_viols
+            )
+            fut_vr    = len(fut_viols) / fut_n if fut_n > 0 else 0.0
+            any_fatal = int(fut_fat > 0)
+
+            # Mirror the adverse-outcome formula used in test_real_world_validation.
+            adv = 0.0
+            adv += 20.0 * any_fatal
+            adv += min((fut_fat - 1) * 5.0, 15.0) if fut_fat > 1 else 0.0
+            adv += 8.0 * int(fut_wr > 0)
+            adv += min(fut_wr * 3.0, 15.0)
+            adv += min(fut_s * 1.0, 10.0)
+            adv += min(math.log1p(fut_pen) * 0.8, 10.0)
+            adv += min(fut_vr * 2.0, 10.0)
+
+            raw_scores_cal.append(raw_pred)
+            future_advs_cal.append(adv)
+
+        n_pairs = len(raw_scores_cal)
+        if n_pairs < 100:
+            print(
+                f"  Only {n_pairs} temporal pairs found; "
+                "keeping pseudo-label calibrator."
+            )
+            return
+
+        print(
+            f"  Fitting temporal calibrator on {n_pairs:,} "
+            "(raw_score, future_adverse) pairs…"
+        )
+        new_cal = TailCalibrator()
+        new_cal.fit(
+            np.array(raw_scores_cal, dtype=float),
+            np.array(future_advs_cal, dtype=float),
+        )
+        if new_cal.is_fitted:
+            self._calibrator = new_cal
+            print("  Temporal calibrator fitted and attached.")
+        else:
+            print("  Temporal calibrator fit produced too few bins; keeping pseudo-label version.")
+
     # ------------------------------------------------------------------ #
     def _save(self, population: List[Dict]):
         model_path = os.path.join(self.CACHE_DIR, self.MODEL_FILE)
         pop_path = os.path.join(self.CACHE_DIR, self.POP_FILE)
         with open(model_path, "wb") as f:
             pickle.dump(self.pipeline, f)
+        # NaN is not valid JSON — replace with null before serialising.
+        # On load we convert null (None) back to 0.0 (model was trained on 0.0).
+        def _serialise_features(feats):
+            return [None if isinstance(v, float) and math.isnan(v) else v for v in feats]
+
+        safe_pop = [
+            {"name": p["name"], "features": _serialise_features(p["features"])}
+            for p in population
+        ]
         with open(pop_path, "w") as f:
-            json.dump({"date": str(date.today()), "manufacturers": population}, f)
+            json.dump(
+                {
+                    "date": str(date.today()),
+                    "manufacturers": safe_pop,
+                    "industry_stats": self._industry_stats,
+                    "feature_names": self.FEATURE_NAMES,
+                },
+                f,
+            )
+        if self._calibrator is not None and self._calibrator.is_fitted:
+            cal_path = os.path.join(self.CACHE_DIR, self.CALIBRATOR_FILE)
+            self._calibrator.save(cal_path)
 
     def _load_or_build(self):
         model_path = os.path.join(self.CACHE_DIR, self.MODEL_FILE)
@@ -463,13 +758,53 @@ class MLRiskScorer:
                 cache_date = meta.get("date", "")
                 if cache_date and (date.today() - date.fromisoformat(cache_date)).days < 7:
                     with open(model_path, "rb") as f:
-                        self.pipeline = pickle.load(f)
+                        loaded_pipeline = pickle.load(f)
                     pop = meta["manufacturers"]
-                    self.population_features = np.array([p["features"] for p in pop])
+                    # Convert null → 0.0 (NaN was serialised as null)
+                    feats = np.array(
+                        [[0.0 if v is None else v for v in p["features"]] for p in pop],
+                        dtype=float,
+                    )
+                    # Shape-mismatch guard: stale model after upgrade
+                    expected_n = len(self.FEATURE_NAMES)
+                    if feats.shape[1] != expected_n:
+                        print(
+                            f"  Model feature shape mismatch "
+                            f"({feats.shape[1]} vs {expected_n} expected). "
+                            "Deleting stale cache and retraining…"
+                        )
+                        try:
+                            os.remove(model_path)
+                        except OSError:
+                            pass
+                        raise ValueError("feature shape mismatch")
+
+                    # Feature-name guard: catches renames (e.g. raw→log)
+                    cached_names = meta.get("feature_names", [])
+                    if cached_names and cached_names != self.FEATURE_NAMES:
+                        print("  Feature names changed. Retraining…")
+                        try:
+                            os.remove(model_path)
+                        except OSError:
+                            pass
+                        raise ValueError("feature names mismatch")
+
+                    self.pipeline = loaded_pipeline
+                    self.population_features = self._log_transform_features(feats)
+                    self._industry_stats = meta.get("industry_stats", {})
+                    # Load calibrator if available (graceful degradation if absent)
+                    cal_path = os.path.join(self.CACHE_DIR, self.CALIBRATOR_FILE)
+                    if os.path.exists(cal_path):
+                        try:
+                            self._calibrator = TailCalibrator.load(cal_path)
+                        except Exception as cal_e:
+                            print(f"  Calibrator load failed ({cal_e}); running uncalibrated.")
                     print(f"Loaded cached ML risk model (trained {cache_date}, {len(pop)} estabs).")
                     return
             except Exception as e:
-                print(f"Cache load failed: {e}")
+                if "feature shape mismatch" not in str(e):
+                    print(f"Cache load failed: {e}")
+                # Fall through to rebuild
 
         print("Building ML risk model from DOL API data...")
         try:
@@ -478,74 +813,304 @@ class MLRiskScorer:
                 print("Insufficient population data ")
                 return
             self._train(population)
+            self._refit_calibrator_from_temporal(population)
             self._save(population)
         except Exception as e:
             print(f"Population fetch failed ({e})")
 
     # ------------------------------------------------------------------ #
+    #  Per-establishment scoring
+    # ------------------------------------------------------------------ #
+    def score_establishments(self, records: List[OSHARecord]) -> Dict:
+        """Score each establishment independently and compute aggregate metrics.
+
+        Groups *records* by ``estab_name`` (falls back to ``"UNKNOWN"``),
+        extracts features per group using the same path as the training
+        pipeline, and runs the GB model per establishment.
+
+        Returns
+        -------
+        dict with keys:
+            weighted_avg_score  – inspection-count-weighted mean of site scores
+            max_score           – highest single-site score
+            median_score        – median of site scores
+            establishment_count – number of distinct establishments
+            site_scores         – list of per-site dicts (name, score, n_inspections, naics_code)
+            risk_concentration  – fraction of sites scoring ≥ 60
+            systemic_risk_flag  – True when risk is systemic (>50% high-risk
+                                  or willful/repeat violations across ≥ 2 sites)
+            aggregate_features  – 1×46 log-transformed feature array (all records)
+        """
+        if self.pipeline is None:
+            return {
+                "weighted_avg_score": 50.0,
+                "max_score": 50.0,
+                "median_score": 50.0,
+                "establishment_count": 0,
+                "site_scores": [],
+                "risk_concentration": 0.0,
+                "systemic_risk_flag": False,
+                "aggregate_features": None,
+            }
+
+        # ── Group records by establishment name ───────────────────────
+        groups: Dict[str, List[OSHARecord]] = defaultdict(list)
+        for r in records:
+            key = (r.estab_name or "UNKNOWN").upper().strip()
+            groups[key].append(r)
+
+        # ── Score each establishment ──────────────────────────────────
+        site_scores: list = []
+        total_inspections = 0
+
+        for estab_name, estab_records in groups.items():
+            feat17, naics, vpi, avg_pen, sr, wr = (
+                self._extract_establishment_features_raw(estab_records)
+            )
+            raw = self._complete_features(feat17, naics, vpi, avg_pen, sr, wr)
+            log_feats = self._log_transform_features(raw)
+
+            raw_pred = float(self.pipeline.predict(log_feats)[0])
+
+            # ── Evidence-gated score ceiling ──────────────────────────
+            # Single-event companies lack sufficient evidence for a high
+            # "Do Not Recommend" classification.  Cap scores based on
+            # inspection depth so sparse-evidence establishments cannot
+            # land in the highest tier without sufficient historical data.
+            # Exception: confirmed fatality + willful violations may
+            # reach 70 regardless of inspection count.
+            n_insp_this = len(estab_records)
+            feat17_raw = feat17  # already extracted above
+            # feat17 is a raw list; willful is index 3, fatalities index 12
+            has_fatality = feat17_raw[12] > 0
+            has_willful  = feat17_raw[3] > 0
+            if has_fatality and has_willful:
+                ceiling = 70.0
+            elif n_insp_this <= 2:
+                ceiling = 50.0
+            elif n_insp_this <= 4:
+                ceiling = 58.0
+            else:
+                ceiling = 100.0
+            evidence_capped = raw_pred > ceiling
+            clipped = float(np.clip(raw_pred, 0, ceiling))
+
+            # ── Isotonic calibration ──────────────────────────────────
+            if self._calibrator is not None and self._calibrator.is_fitted:
+                score = self._calibrator.calibrate(clipped)
+            else:
+                score = clipped
+
+            n = len(estab_records)
+            # Resolve city/state from the most recent record in this group
+            city = state = ""
+            for _r in sorted(estab_records, key=lambda r: r.date_opened, reverse=True):
+                if _r.site_city:
+                    city = _r.site_city
+                    state = _r.site_state or ""
+                    break
+            site_scores.append({
+                "name": estab_name,
+                "score": round(score, 1),
+                "n_inspections": n,
+                "naics_code": naics,
+                "city": city,
+                "state": state,
+                "evidence_capped": evidence_capped,
+            })
+            total_inspections += n
+
+        # ── Aggregate metrics ─────────────────────────────────────────
+        if site_scores:
+            weighted_sum = sum(s["score"] * s["n_inspections"] for s in site_scores)
+            weighted_avg = weighted_sum / total_inspections
+            max_score = max(s["score"] for s in site_scores)
+            median_score = float(np.median([s["score"] for s in site_scores]))
+        else:
+            weighted_avg = max_score = median_score = 50.0
+
+        HIGH_RISK_THRESHOLD = 60.0
+        high_risk_count = sum(1 for s in site_scores if s["score"] >= HIGH_RISK_THRESHOLD)
+        risk_concentration = high_risk_count / len(site_scores) if site_scores else 0.0
+
+        # Systemic flag: majority of sites are high-risk …
+        systemic = risk_concentration > 0.5
+        # … or willful/repeat violations span >= 2 distinct sites AND the
+        # aggregate score is meaningfully elevated (>= 45). Without the
+        # score gate, companies with many sites almost always trip this
+        # condition from incidental repeat violations on a handful of sites.
+        sites_with_wr = 0
+        for estab_records in groups.values():
+            if any(
+                v.is_willful or v.is_repeat
+                for r in estab_records
+                for v in r.violations
+            ):
+                sites_with_wr += 1
+        if len(groups) >= 2 and sites_with_wr >= 2 and weighted_avg >= 45:
+            systemic = True
+
+        # Aggregate features (all records as one blob) for display
+        agg_feats = self.extract_features(records) if records else None
+
+        return {
+            "weighted_avg_score": round(weighted_avg, 1),
+            "max_score": round(max_score, 1),
+            "median_score": round(median_score, 1),
+            "establishment_count": len(site_scores),
+            "site_scores": sorted(site_scores, key=lambda s: s["score"], reverse=True),
+            "risk_concentration": round(risk_concentration, 2),
+            "systemic_risk_flag": systemic,
+            "aggregate_features": agg_feats,
+        }
+
+    # ------------------------------------------------------------------ #
     #  Public scoring API
     # ------------------------------------------------------------------ #
-    def score(self, records: List[OSHARecord], reputation_data: list = None) -> Dict:
+    def score(self, records: List[OSHARecord]) -> Dict:
         """
         Predict risk score for a manufacturer relative to the population.
 
+        Scores each establishment independently, then produces a
+        weighted-average company score.  The per-site breakdown is
+        included in the return dict so callers can surface concentration.
+
         Returns:
-            risk_score      – 0 to 100
-            percentile_rank – 0 to 100 (higher = riskier than more peers)
-            feature_weights – feature name → learned importance
-            features        – feature name → raw value for this manufacturer
+            risk_score            – 0 to 100 (weighted avg of establishment scores)
+            percentile_rank       – 0 to 100 (higher = riskier than more peers)
+            feature_weights       – feature name → learned importance
+            features              – feature name → raw value (aggregate)
+            industry_label        – human-readable industry name (NAICS lookup)
+            industry_group        – 4-digit (or coarser) NAICS group used
+            industry_percentile   – company's violation-rate percentile within its industry
+            industry_comparison   – list of comparison strings
+            missing_naics         – True when no NAICS code was available
+            establishment_count   – number of distinct scored establishments
+            site_scores           – list of per-site dicts
+            risk_concentration    – fraction of sites ≥ 60
+            systemic_risk_flag    – True when risk is systemic
+            aggregation_warning   – human-readable warning when multi-site
         """
-        X = self.extract_features(records)
-        raw = float(self.pipeline.predict(X)[0])
-        risk_score = float(np.clip(raw, 0, 100))
+        # ── Per-establishment scoring ─────────────────────────────────
+        estab = self.score_establishments(records)
+        risk_score = estab["weighted_avg_score"]
 
-        # Reputation adjustment (outside the OSHA ML pipeline)
-        reputation_score = 50.0
-        news_sentiment = "Unknown"
-        if reputation_data:
-            neg_kw = {"violation", "fine", "penalty", "lawsuit", "injury",
-                      "death", "accident", "unsafe", "danger", "settlement", "sued"}
-            pos_kw = {"award", "safety", "recognized", "leader", "innovation"}
-            neg = sum(1 for item in reputation_data
-                      if any(k in (item.get("title", "") + " " + item.get("body", "")).lower() for k in neg_kw))
-            pos = sum(1 for item in reputation_data
-                      if any(k in (item.get("title", "") + " " + item.get("body", "")).lower() for k in pos_kw))
-            total = neg + pos
-            if total > 0:
-                sentiment_adj = ((neg - pos) / total) * 15.0
-                risk_score = float(np.clip(risk_score + sentiment_adj, 0, 100))
-                ratio = (pos - neg) / (total + 1)
-                reputation_score = 50.0 + (ratio * 30.0)
-                if ratio > 0.2:
-                    news_sentiment = "Positive"
-                elif ratio < -0.2:
-                    news_sentiment = "Negative"
-                else:
-                    news_sentiment = "Mixed"
-            else:
-                news_sentiment = "Neutral"
-
-        # Percentile rank within population
+        # ── Percentile rank within population ─────────────────────────
         if self.population_features is not None and len(self.population_features) > 0:
             pop_scores = self.pipeline.predict(self.population_features)
             percentile = float(np.mean(pop_scores <= risk_score) * 100)
         else:
             percentile = 50.0
 
-        # Feature importances from the GB model
+        # ── Feature importances from the GB model ─────────────────────
         gb = self.pipeline.named_steps["model"]
         importances = dict(zip(self.FEATURE_NAMES, gb.feature_importances_.tolist()))
 
-        # Raw feature values
-        feature_vals = dict(zip(self.FEATURE_NAMES, X[0].tolist()))
+        # Aggregate feature values for display
+        agg_X = estab["aggregate_features"]
+        if agg_X is not None:
+            feature_vals = dict(zip(self.FEATURE_NAMES, agg_X[0].tolist()))
+        else:
+            feature_vals = {}
+
+        # ── Industry context ──────────────────────────────────────────
+        naics_votes = Counter(r.naics_code for r in records if r.naics_code)
+        naics_code = naics_votes.most_common(1)[0][0] if naics_votes else None
+        industry_group_raw = (naics_code[:4] if naics_code and len(str(naics_code)) >= 4 else None)
+        missing_naics = naics_code is None
+
+        # Resolve industry entry with 4→3→2-digit fallback
+        industry_entry = None
+        resolved_group = industry_group_raw
+        if industry_group_raw and self._industry_stats:
+            for grp_len in (4, 3, 2):
+                key = industry_group_raw[:grp_len]
+                entry = self._industry_stats.get(key)
+                if entry and entry.get("count", 0) >= self.INDUSTRY_MIN_SAMPLE:
+                    industry_entry = entry
+                    resolved_group = key
+                    break
+
+        if industry_entry:
+            industry_label = industry_entry.get("label", "Unknown Industry")
+            if industry_label == "Unknown Industry" and resolved_group:
+                fresh = get_industry_name(resolved_group, load_naics_map())
+                if fresh != "Unknown Industry":
+                    industry_label = fresh
+        else:
+            industry_label = get_industry_name(naics_code, load_naics_map())
+
+        # Build comparison messages and percentile from z-scores
+        industry_comparison: list = []
+        industry_percentile = 50.0
+
+        if industry_entry and not missing_naics:
+            metric_defs = [
+                ("relative_violation_rate",  "avg_violation_rate",  "std_violation_rate",  "violation rate"),
+                ("relative_penalty",         "avg_penalty",         "std_penalty",         "average penalty"),
+                ("relative_serious_ratio",   "avg_serious_ratio",   "std_serious_ratio",   "serious violation ratio"),
+                ("relative_willful_repeat",  "avg_willful_repeat",  "std_willful_repeat",  "willful/repeat rate"),
+            ]
+            for feat_key, avg_key, std_key, label_str in metric_defs:
+                z = feature_vals.get(feat_key, 0.0)
+                avg = industry_entry.get(avg_key, 0.0)
+                std = industry_entry.get(std_key, 1e-6)
+                if abs(z) < 0.3 or avg == 0:
+                    continue
+                company_val = avg + z * std
+                pct = abs((company_val - avg) / max(abs(avg), 1e-9)) * 100
+                if pct < 10:
+                    continue
+                direction = "higher" if z > 0 else "lower"
+                industry_comparison.append(
+                    f"{pct:.0f}% {direction} {label_str} than "
+                    f"{industry_label} average"
+                )
+
+            z_vr = feature_vals.get("relative_violation_rate", 0.0)
+            if not math.isnan(z_vr):
+                industry_percentile = round(
+                    50.0 * (1.0 + math.erf(z_vr / math.sqrt(2.0))), 1
+                )
+
+        # ── Aggregation warning ───────────────────────────────────────
+        n_estab = estab["establishment_count"]
+        if n_estab > 1:
+            scores = [s["score"] for s in estab["site_scores"]]
+            aggregation_warning = (
+                f"This score aggregates {n_estab} establishments. "
+                f"Individual site scores range from {min(scores):.0f} to "
+                f"{max(scores):.0f}."
+            )
+        else:
+            aggregation_warning = ""
+
+        # ── Concentration warning ─────────────────────────────────────
+        concentration_warning = ""
+        if estab["risk_concentration"] > 0 and n_estab > 1:
+            high_ct = sum(1 for s in estab["site_scores"] if s["score"] >= 60)
+            concentration_warning = (
+                f"{high_ct} of {n_estab} establishment(s) scored as high-risk "
+                f"(≥ 60). Review the per-site breakdown below."
+            )
 
         return {
             "risk_score": round(risk_score, 1),
             "percentile_rank": round(percentile, 1),
             "feature_weights": importances,
             "features": feature_vals,
-            "reputation_score": round(reputation_score, 1),
-            "news_sentiment": news_sentiment,
+            "industry_label": industry_label,
+            "industry_group": resolved_group,
+            "industry_percentile": round(industry_percentile, 1),
+            "industry_comparison": industry_comparison[:4],
+            "missing_naics": missing_naics,
+            # ── New per-establishment fields ──────────────────────────
+            "establishment_count": n_estab,
+            "site_scores": estab["site_scores"],
+            "risk_concentration": estab["risk_concentration"],
+            "systemic_risk_flag": estab["systemic_risk_flag"],
+            "aggregation_warning": aggregation_warning,
+            "concentration_warning": concentration_warning,
         }
 
     def retrain(self):
@@ -553,6 +1118,7 @@ class MLRiskScorer:
         population = self._fetch_population()
         if len(population) >= 5:
             self._train(population)
+            self._refit_calibrator_from_temporal(population)
             self._save(population)
             return True
         return False

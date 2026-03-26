@@ -51,7 +51,15 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
 # Import helpers from the validation test module.
-from test_real_world_validation import RealWorldData, _decile_summary  # noqa: E402
+from test_real_world_validation import (  # noqa: E402
+    RealWorldData,
+    _decile_summary,
+    _compute_threshold_metrics,
+    _compute_topk_capture,
+    EVAL_THRESHOLDS,
+    TOPK_FRACTIONS,
+)
+# Note: _rolling_smooth is defined in this file (validation_plots.py).
 
 # -- Output directory -------------------------------------------------
 PLOTS_DIR = os.path.join(_PROJECT_ROOT, "plots")
@@ -455,6 +463,17 @@ def _plot_distribution_overlay(
         label=f"Top-25% future adverse outcome  (n={n_high:,})",
     )
 
+    # ── Recommendation-band threshold markers ──────────────────────────────
+    # 30 = Recommend→Caution boundary, 60 = Caution→Do-Not-Recommend boundary
+    for x_thresh, label_txt, ls in (
+        (30, "Caution (30)", "--"),
+        (60, "Do Not Recommend (60)", "-."),
+    ):
+        ax.axvline(
+            x=x_thresh, color="#555555", linewidth=1.6,
+            linestyle=ls, label=label_txt,
+        )
+
     ax.set_xlabel("Baseline Risk Score", fontsize=FONT_LABEL)
     ax.set_ylabel("Density", fontsize=FONT_LABEL)
     ax.set_title(
@@ -556,6 +575,301 @@ def _plot_decile_boxplot(
 
 
 # ====================================================================== #
+#  New plots (07 – 09)
+# ====================================================================== #
+
+def _plot_threshold_pr_f1(
+    rw_data: RealWorldData,
+    plots_dir: str,
+) -> str:
+    """Plot 07 -- precision / recall / F1 vs. score threshold for two targets.
+
+    Left panel: future adverse score >= 75th percentile of the paired population.
+    Right panel: any future serious / willful / repeat violation.
+
+    Business interpretation: the crossing point of precision and recall curves
+    marks the threshold with the highest F1 — the optimal trade-off between
+    flagging too many manufacturers (low precision) and missing future incidents
+    (low recall) for a given target definition.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    targets = [
+        (
+            rw_data.swr_75th_flags,
+            "Target A: future adverse >= 75th pct",
+            "score threshold",
+        ),
+        (
+            rw_data.paired_swr_flags,
+            "Target B: any future S/W/R event",
+            "score threshold",
+        ),
+    ]
+
+    for ax, (y_true, panel_title, _x_label) in zip(axes, targets):
+        if len(y_true) == 0:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=FONT_LABEL)
+            ax.set_title(panel_title, fontsize=FONT_LABEL, fontweight="bold")
+            continue
+
+        df = _compute_threshold_metrics(
+            rw_data.paired_scores, y_true, EVAL_THRESHOLDS,
+        )
+        xs         = df["threshold"].values
+        precision  = df["precision"].values
+        recall     = df["recall"].values
+        f1         = df["F1"].values
+        prevalence = float(df["prevalence"].iloc[0])
+
+        ax.plot(xs, precision, marker="o", linewidth=2.0,
+                color=COLOR_MAIN,  label="Precision")
+        ax.plot(xs, recall,    marker="s", linewidth=2.0,
+                color=COLOR_ALT,   label="Recall")
+        ax.plot(xs, f1,        marker="^", linewidth=2.0,
+                color="#1a9641", linestyle="-.", label="F1")
+        ax.axhline(y=prevalence, color=COLOR_REF, linewidth=1.2, linestyle=":",
+                   label=f"Prevalence ({prevalence:.3f})")
+
+        # Mark the threshold with the highest F1
+        best_idx = int(np.argmax(f1))
+        ax.annotate(
+            f"Best F1\n@ {xs[best_idx]}",
+            xy=(xs[best_idx], f1[best_idx]),
+            xytext=(8, -20), textcoords="offset points",
+            fontsize=FONT_ANNOT + 1,
+            arrowprops=dict(arrowstyle="->", color="#222", lw=1.1),
+        )
+
+        ax.set_xlim(min(xs) - 5, max(xs) + 5)
+        ax.set_ylim(0, 1.05)
+        ax.set_xlabel("Score Threshold", fontsize=FONT_LABEL)
+        ax.set_ylabel("Metric Value", fontsize=FONT_LABEL)
+        ax.set_title(panel_title, fontsize=FONT_LABEL, fontweight="bold")
+        ax.set_xticks(xs)
+        ax.tick_params(labelsize=FONT_TICK)
+        ax.legend(fontsize=FONT_LEGEND - 1)
+        ax.grid(True, linewidth=0.5)
+
+    fig.suptitle(
+        "Threshold Precision / Recall / F1 by Binary Target",
+        fontsize=FONT_TITLE, fontweight="bold",
+    )
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "07_threshold_pr_f1.png")
+    fig.savefig(path, dpi=FIG_DPI)
+    plt.close(fig)
+    return path
+
+
+def _plot_recommendation_band_outcomes(
+    rw_data: RealWorldData,
+    plots_dir: str,
+) -> str:
+    """Plot 08 -- grouped bar chart comparing future outcomes per recommendation band.
+
+    Recommendation bands are defined by the same score cut-points used in
+    RiskAssessor:
+      Recommend          score <  30
+      Proceed with Caution  30 <= score <= 60
+      Do Not Recommend   score >  60
+
+    Business interpretation: the bars directly validate that the recommendation
+    categories align with realised future compliance outcomes.  If the "Do Not
+    Recommend" band does not show materially worse future outcomes than
+    "Recommend", the recommendation thresholds need recalibration.
+    """
+    scores   = rw_data.paired_scores
+    outcomes = rw_data.paired_outcomes
+
+    bands = [
+        ("Recommend\n(< 30)",         scores < 30),
+        ("Caution\n(30–60)",    (scores >= 30) & (scores <= 60)),
+        ("Do Not Rec.\n(> 60)",        scores > 60),
+    ]
+
+    metrics = ["mean_adverse", "swr_rate", "fatality_rate"]
+    metric_labels = [
+        "Mean Adverse Score",
+        "S/W/R Event Rate",
+        "Fatality Rate",
+    ]
+    metric_colors = [COLOR_MAIN, COLOR_ALT, "#984ea3"]
+
+    n_metrics = len(metrics)
+    n_bands   = len(bands)
+    x         = np.arange(n_bands)
+    bar_w     = 0.22
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    band_ns   = []
+    band_vals = {m: [] for m in metrics}
+
+    for _band_label, mask in bands:
+        idx = np.where(mask)[0].tolist()
+        band_ns.append(len(idx))
+        adv  = [outcomes[i]["future_adverse_outcome_score"] for i in idx]
+        swr  = [outcomes[i]["future_any_serious_or_willful_repeat"] for i in idx]
+        fat  = [outcomes[i]["future_fatality_or_catastrophe"] for i in idx]
+        band_vals["mean_adverse"].append(float(np.mean(adv)) if adv else 0.0)
+        band_vals["swr_rate"].append(float(np.mean(swr)) if swr else 0.0)
+        band_vals["fatality_rate"].append(float(np.mean(fat)) if fat else 0.0)
+
+    # Normalise each metric to [0, 1] so all three fit on the same axis
+    # while preserving relative differences within each metric.
+    for metric_idx, (metric, label, color) in enumerate(
+        zip(metrics, metric_labels, metric_colors)
+    ):
+        vals     = band_vals[metric]
+        max_v    = max(vals) if max(vals) > 0 else 1.0
+        norm_v   = [v / max_v for v in vals]
+        offset   = (metric_idx - (n_metrics - 1) / 2) * bar_w
+        bars_h   = ax.bar(
+            x + offset, norm_v, bar_w,
+            label=label, color=color, alpha=0.82, edgecolor="white",
+        )
+        # Annotate with the raw (un-normalised) value
+        for bar, raw_v in zip(bars_h, vals):
+            if raw_v == 0:
+                continue
+            fmt = f"{raw_v:.2f}" if metric == "mean_adverse" else f"{raw_v:.1%}"
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.01,
+                fmt,
+                ha="center", va="bottom",
+                fontsize=FONT_ANNOT, color="#111111",
+            )
+
+    # Annotate n per band along the x-axis
+    for i, n_band in enumerate(band_ns):
+        ax.text(
+            x[i], -0.08,
+            f"n={n_band:,}",
+            ha="center", va="top",
+            fontsize=FONT_ANNOT, color="#333333",
+            transform=ax.get_xaxis_transform(),
+        )
+
+    band_labels = [b[0] for b in bands]
+    ax.set_xticks(x)
+    ax.set_xticklabels(band_labels, fontsize=FONT_TICK)
+    ax.set_ylabel("Normalised Metric Value  (raw value annotated)",
+                  fontsize=FONT_LABEL)
+    ax.set_title(
+        "Future Outcomes by Recommendation Band",
+        fontsize=FONT_TITLE, fontweight="bold",
+    )
+    ax.set_ylim(0, 1.30)
+    ax.tick_params(labelsize=FONT_TICK)
+    ax.legend(fontsize=FONT_LEGEND)
+    ax.grid(True, axis="y", linewidth=0.5)
+
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "08_rec_band_outcomes.png")
+    fig.savefig(path, dpi=FIG_DPI)
+    plt.close(fig)
+    return path
+
+
+def _plot_confidence_subgroup(
+    rw_data: RealWorldData,
+    plots_dir: str,
+) -> str:
+    """Plot 09 -- score vs. adverse outcome scatter per confidence tier.
+
+    Three panels (one per confidence level: High / Medium / Low).  Each panel
+    shows the raw scatter overlaid with a rolling-mean trend line.  The panel
+    title includes n and Spearman rho so analysts can immediately see how much
+    predictive signal remains at each evidence level.
+
+    Business interpretation: a strong upward trend in the High-confidence
+    panel (and a flat or noisy trend in the Low-confidence panel) confirms
+    that evidence depth matters.  Buyers should treat Low-confidence scores
+    as preliminary signals requiring additional due diligence.
+    """
+    from scipy.stats import spearmanr
+
+    if not rw_data.confidence_tags:
+        # Nothing to plot — return early with a blank placeholder
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.text(0.5, 0.5, "Confidence tags not available",
+                ha="center", va="center", transform=ax.transAxes)
+        path = os.path.join(plots_dir, "09_confidence_subgroup.png")
+        fig.savefig(path, dpi=FIG_DPI)
+        plt.close(fig)
+        return path
+
+    tags    = rw_data.confidence_tags
+    scores  = rw_data.paired_scores
+    adverse = rw_data.paired_adverse_scores
+
+    # Group data per confidence tier
+    groups = {"High": ([], []), "Medium": ([], []), "Low": ([], [])}
+    for tag, sc, adv in zip(tags, scores, adverse):
+        if tag in groups:
+            groups[tag][0].append(float(sc))
+            groups[tag][1].append(float(adv))
+
+    tier_order  = ["High", "Medium", "Low"]
+    tier_colors = ["#2166ac", "#f4a582", "#d6604d"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5), sharey=True)
+
+    for ax, tier, color in zip(axes, tier_order, tier_colors):
+        sc_arr  = np.array(groups[tier][0])
+        adv_arr = np.array(groups[tier][1])
+        n       = len(sc_arr)
+
+        if n == 0:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=FONT_LABEL)
+            ax.set_title(f"{tier} confidence  (n=0)",
+                         fontsize=FONT_LABEL, fontweight="bold")
+            continue
+
+        rho_str = "N/A"
+        if n >= 3:
+            rho_val = float(spearmanr(sc_arr, adv_arr)[0])
+            rho_str = f"{rho_val:.3f}"
+
+        # Scatter
+        ax.scatter(sc_arr, adv_arr,
+                   alpha=0.35, s=8, color=color, rasterized=True)
+
+        # Rolling-mean smooth (only when n >= 10)
+        if n >= 10:
+            xs_sm, ys_sm = _rolling_smooth(
+                sc_arr, adv_arr,
+                window_frac=0.15, min_window=max(5, n // 10),
+            )
+            ax.plot(xs_sm, ys_sm, color="#222222", linewidth=2.2,
+                    label="Rolling mean")
+
+        ax.set_xlabel("Baseline Risk Score", fontsize=FONT_LABEL - 1)
+        ax.set_title(
+            f"{tier} confidence\n(n={n:,}  rho={rho_str})",
+            fontsize=FONT_LABEL, fontweight="bold",
+        )
+        ax.tick_params(labelsize=FONT_TICK)
+        ax.grid(True, linewidth=0.4)
+
+    axes[0].set_ylabel("Future Adverse Outcome Score", fontsize=FONT_LABEL)
+
+    fig.suptitle(
+        "Score Predictive Value by Evidence-Depth (Confidence Tier)",
+        fontsize=FONT_TITLE, fontweight="bold",
+    )
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "09_confidence_subgroup.png")
+    fig.savefig(path, dpi=FIG_DPI)
+    plt.close(fig)
+    return path
+
+
+# ====================================================================== #
 #  Console report
 # ====================================================================== #
 
@@ -609,7 +923,11 @@ def generate_all_validation_plots(
     rw_data: RealWorldData,
     plots_dir: str = PLOTS_DIR,
 ) -> list:
-    """Generate all 6 validation plots and save them to plots_dir.
+    """Generate all 9 validation plots and save them to plots_dir.
+
+    Plots 01-06 validate rank correlation, decile lift, and score distribution.
+    Plots 07-09 validate threshold performance, recommendation bands, and
+    confidence-tier predictive breakdown.
 
     Also prints the cumulative gains table to stdout.
 
@@ -626,18 +944,24 @@ def generate_all_validation_plots(
     saved = []
 
     steps = [
-        ("01  Scatter: score vs adverse (smooth)",    _plot_scatter_score_vs_adverse),
-        ("02  Binned mean + 95% CI (quantile bins)",   _plot_binned_mean_outcome),
-        ("03  Decile lift  (lift + n)",                _plot_decile_lift),
-        ("04  Top-K event capture curve",              _plot_capture_curve),
-        ("05  Score distribution overlay",             _plot_distribution_overlay),
-        ("06  Decile boxplot",                         _plot_decile_boxplot),
+        ("01  Scatter: score vs adverse (smooth)",         _plot_scatter_score_vs_adverse),
+        ("02  Binned mean + 95% CI (quantile bins)",        _plot_binned_mean_outcome),
+        ("03  Decile lift  (lift + n)",                     _plot_decile_lift),
+        ("04  Top-K event capture curve",                   _plot_capture_curve),
+        ("05  Score distribution + threshold markers",      _plot_distribution_overlay),
+        ("06  Decile boxplot",                              _plot_decile_boxplot),
+        ("07  Threshold precision/recall/F1  (2 targets)",  _plot_threshold_pr_f1),
+        ("08  Recommendation-band outcome bars",            _plot_recommendation_band_outcomes),
+        ("09  Confidence-tier scatter comparison",          _plot_confidence_subgroup),
     ]
 
     for label, plot_fn in steps:
-        path = plot_fn(rw_data, plots_dir)
-        saved.append(path)
-        print(f"  [{label}]  saved -> {os.path.basename(path)}")
+        try:
+            path = plot_fn(rw_data, plots_dir)
+            saved.append(path)
+            print(f"  [{label}]  saved -> {os.path.basename(path)}")
+        except Exception as exc:  # pragma: no cover
+            print(f"  [{label}]  ERROR: {exc}")
 
     # Console gains table
     _print_cumulative_gains_table(rw_data)

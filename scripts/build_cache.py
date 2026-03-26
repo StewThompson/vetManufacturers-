@@ -6,8 +6,8 @@ Usage:
     py build_cache.py              # full build from local OshaData/
 
 Datasets produced in ml_cache/:
-    inspections_bulk.csv       – 3-year window, key inspection fields
-    violations_bulk.csv        – 3-year window, all violations (incl. zero-penalty)
+    inspections_bulk.csv       – 10-year rolling window, key inspection fields
+    violations_bulk.csv        – 10-year rolling window, all violations (incl. zero-penalty)
     accidents_bulk.csv         – all accident events
     accident_injuries_bulk.csv – all injury records (links to inspections)
     accident_abstracts_bulk.csv – pre-joined full-text abstracts (one row per accident)
@@ -26,7 +26,14 @@ from datetime import date, timedelta
 OSHA_DIR = "OshaData"
 CACHE_DIR = "ml_cache"
 META_FILE = os.path.join(CACHE_DIR, "bulk_meta.json")
-CUTOFF_YEARS = 3
+# Rolling window for inspections and violations.
+# 3 years was too short — it missed violations from 2014-2020 that are still
+# predictive of current compliance behaviour.
+# Full OSHA history (1972-present) is too long — reformed companies whose
+# violations predate 2010 score high but have good recent outcomes, causing
+# prediction quality to degrade.
+# 10 years captures a meaningful recent history that balances both concerns.
+CUTOFF_YEARS = 10
 
 
 def _natural_sort_key(path):
@@ -45,10 +52,10 @@ def iter_chunks(folder_name):
     if not files:
         print(f"  WARNING: no CSV files in {folder}")
         return
-    print(f"  Reading {len(files)} chunk(s) from {folder_name}…")
+    print(f"  Reading {len(files)} chunk(s) from {folder_name}...")
     for i, fp in enumerate(files, 1):
         if i % 20 == 0 or i == len(files):
-            print(f"    chunk {i}/{len(files)}…")
+            print(f"    chunk {i}/{len(files)}...")
         with open(fp, "r", newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 yield {k.lower(): v for k, v in row.items()}
@@ -79,7 +86,7 @@ def build_dataset(folder_name, output_name, date_field=None,
             count += 1
 
             if count % 200_000 == 0:
-                print(f"    {count:,} rows…")
+                print(f"    {count:,} rows...")
 
     return count
 
@@ -124,7 +131,7 @@ def build_abstracts():
     Read all abstract lines, group by summary_nr, concatenate in line
     order, and write one row per accident. Returns count of unique abstracts.
     """
-    print("\nBuilding accident abstracts (pre-joining lines)…")
+    print("\nBuilding accident abstracts (pre-joining lines)...")
     abstracts: dict[str, list] = defaultdict(list)
 
     for row in iter_chunks("OSHA_accident_abstract"):
@@ -148,7 +155,7 @@ def build_abstracts():
             if full_text:
                 writer.writerow({"summary_nr": snr, "abstract_text": full_text})
 
-    print(f"  → {len(abstracts):,} unique abstracts")
+    print(f"  -> {len(abstracts):,} unique abstracts")
     return len(abstracts)
 
 
@@ -299,10 +306,10 @@ def main():
     print("OSHA Cache Builder (local data)")
     print(f"  Source: {OSHA_DIR}/")
     print(f"  Target: {CACHE_DIR}/")
-    print(f"  Date cutoff: {cutoff}")
+    print(f"  Date cutoff (rolling {CUTOFF_YEARS}-year window): {cutoff}")
 
-    # --- Inspections (3-year window) ---
-    print(f"\nBuilding inspections (open_date >= {cutoff})…")
+    # --- Inspections (10-year rolling window) ---
+    print(f"\nBuilding inspections (open_date >= {cutoff})...")
     insp_fields = [
         "activity_nr", "estab_name", "site_address", "site_city",
         "site_state", "site_zip", "owner_type", "naics_code",
@@ -313,10 +320,10 @@ def main():
         "OSHA_inspection", "inspections_bulk.csv",
         date_field="open_date", cutoff_date=cutoff, fields=insp_fields,
     )
-    print(f"  → {insp_count:,} inspections")
+    print(f"  -> {insp_count:,} inspections")
 
-    # --- Violations (3-year window, all penalties) ---
-    print(f"\nBuilding violations (issuance_date >= {cutoff})…")
+    # --- Violations (10-year rolling window, all penalties) ---
+    print(f"\nBuilding violations (issuance_date >= {cutoff})...")
     viol_fields = [
         "activity_nr", "citation_id", "delete_flag", "standard",
         "viol_type", "issuance_date", "abate_date", "abate_complete",
@@ -328,10 +335,10 @@ def main():
         "OSHA_violation", "violations_bulk.csv",
         date_field="issuance_date", cutoff_date=cutoff, fields=viol_fields,
     )
-    print(f"  → {viol_count:,} violations")
+    print(f"  -> {viol_count:,} violations")
 
     # --- Accidents (all time) ---
-    print("\nBuilding accidents (all)…")
+    print("\nBuilding accidents (all)...")
     acc_fields = [
         "summary_nr", "report_id", "event_date", "event_time",
         "event_desc", "event_keyword", "fatality", "abstract_text",
@@ -339,10 +346,10 @@ def main():
     acc_count = build_dataset(
         "OSHA_accident", "accidents_bulk.csv", fields=acc_fields,
     )
-    print(f"  → {acc_count:,} accidents")
+    print(f"  -> {acc_count:,} accidents")
 
     # --- Accident injuries (all time) ---
-    print("\nBuilding accident injuries (all)…")
+    print("\nBuilding accident injuries (all)...")
     inj_fields = [
         "summary_nr", "rel_insp_nr", "age", "sex",
         "nature_of_inj", "part_of_body", "src_of_injury",
@@ -352,7 +359,7 @@ def main():
     inj_count = build_dataset(
         "OSHA_accident_injury", "accident_injuries_bulk.csv", fields=inj_fields,
     )
-    print(f"  → {inj_count:,} accident injuries")
+    print(f"  -> {inj_count:,} accident injuries")
 
     # --- Accident abstracts (pre-joined) ---
     abs_count = build_abstracts()
@@ -378,7 +385,7 @@ def main():
     build_sqlite_db()
 
     # Build company-key index for search
-    print("  Building company-key index for search…")
+    print("  Building company-key index for search...")
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from src.search.grouped_search import build_company_key_index, save_company_key_index

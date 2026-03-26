@@ -27,6 +27,9 @@ class RiskAssessor:
         features = ml_result["features"]
         reputation_score = ml_result["reputation_score"]
         news_sentiment = ml_result["news_sentiment"]
+        predicted_serious_prob = ml_result["predicted_serious_prob"]
+        predicted_expected_violations = ml_result["predicted_expected_violations"]
+        predictive_statement = ml_result["predictive_statement"]
 
         # --- Recommendation ---
         if risk_score < 30:
@@ -40,6 +43,7 @@ class RiskAssessor:
         explanation_lines = self._build_explanation(
             records, reputation_data, risk_score, percentile_rank,
             feature_weights, features, news_sentiment, reputation_score,
+            predictive_statement,
         )
 
         if not records and not reputation_data:
@@ -62,6 +66,9 @@ class RiskAssessor:
             confidence_score=confidence,
             feature_weights=feature_weights,
             percentile_rank=percentile_rank,
+            predicted_serious_prob=predicted_serious_prob,
+            predicted_expected_violations=predicted_expected_violations,
+            predictive_statement=predictive_statement,
         )
 
     # ------------------------------------------------------------------ #
@@ -71,8 +78,13 @@ class RiskAssessor:
     def _build_explanation(
         records, reputation_data, risk_score, percentile_rank,
         feature_weights, features, news_sentiment, reputation_score,
+        predictive_statement="",
     ) -> list:
         lines = []
+
+        # Predictive statement (lead with the model's forward-looking prediction)
+        if predictive_statement:
+            lines.append(f"**Predictive Assessment:** {predictive_statement}")
 
         # Headline
         if risk_score < 15:

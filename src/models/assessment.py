@@ -16,3 +16,7 @@ class RiskAssessment(BaseModel):
     confidence_score: float # 0.0 to 1.0, reflecting data availability/ambiguity
     feature_weights: Dict[str, float] = {}  # ML feature importances
     percentile_rank: float = 50.0  # 0-100, risk percentile among population
+    # Predictive model outputs
+    predicted_serious_prob: float = 0.0       # 0-100, % chance of serious enforcement event
+    predicted_expected_violations: float = 0.0  # expected violations per inspection
+    predictive_statement: str = ""             # plain-English predictive summary

@@ -38,6 +38,11 @@ class RiskAssessor:
         aggregation_warning = ml_result.get("aggregation_warning", "")
         concentration_warning = ml_result.get("concentration_warning", "")
 
+        # Predictive fields
+        enforcement_probability = ml_result.get("enforcement_probability", 0.0)
+        expected_violations = ml_result.get("expected_violations", 0.0)
+        predictive_summary = ml_result.get("predictive_summary", "")
+
         # --- Recommendation ---
         # For multi-establishment companies, "Do Not Recommend" requires
         # systemic risk — not just one bad site inflating the aggregate.
@@ -61,6 +66,7 @@ class RiskAssessor:
             industry_percentile=industry_percentile,
             industry_comparison=industry_comparison,
             missing_naics=missing_naics,
+            predictive_summary=predictive_summary,
         )
 
         if not records:
@@ -104,6 +110,7 @@ class RiskAssessor:
         industry_percentile=50.0,
         industry_comparison=None,
         missing_naics=False,
+        predictive_summary="",
     ) -> list:
         from collections import Counter
         industry_comparison = industry_comparison or []
@@ -243,6 +250,10 @@ class RiskAssessor:
         if top_standards:
             std_list = ", ".join(f"{std} (cited {n} times)" for std, n in top_standards)
             sentences.append(f"The most frequently cited OSHA standards were {std_list}.")
+
+        # ── Predictive forward-looking summary ────────────────────────
+        if predictive_summary:
+            sentences.append(predictive_summary)
 
         return sentences
 

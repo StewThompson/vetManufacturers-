@@ -374,6 +374,129 @@ def test_osha_record_estab_name_optional():
     print("PASS: OSHARecord.estab_name defaults to None")
 
 
+# ── 8. Predictive output fields ───────────────────────────────────────
+
+def test_score_returns_predictive_fields():
+    """score() must include enforcement_probability, expected_violations, predictive_summary."""
+    scorer = _get_scorer()
+    records = [_make_record(estab_name="ACME CORP")]
+    result = scorer.score(records)
+
+    assert "enforcement_probability" in result, "Missing enforcement_probability"
+    assert "expected_violations" in result, "Missing expected_violations"
+    assert "predictive_summary" in result, "Missing predictive_summary"
+    print("PASS: score() returns predictive fields")
+
+
+def test_enforcement_probability_range():
+    """enforcement_probability must be in [0, 1]."""
+    scorer = _get_scorer()
+    records = [_make_record(estab_name="WIDGET CO")]
+    result = scorer.score(records)
+    prob = result["enforcement_probability"]
+    assert 0.0 <= prob <= 1.0, f"enforcement_probability out of range: {prob}"
+    print(f"PASS: enforcement_probability in [0,1] ({prob:.3f})")
+
+
+def test_expected_violations_nonnegative():
+    """expected_violations must be ≥ 0."""
+    scorer = _get_scorer()
+    records = [_make_record(estab_name="SAFE INC")]
+    result = scorer.score(records)
+    vr = result["expected_violations"]
+    assert vr >= 0.0, f"expected_violations negative: {vr}"
+    print(f"PASS: expected_violations ≥ 0 ({vr})")
+
+
+def test_predictive_summary_contains_score():
+    """predictive_summary must reference the risk score."""
+    scorer = _get_scorer()
+    records = [_make_record(estab_name="FACTORY X")]
+    result = scorer.score(records)
+    summary = result["predictive_summary"]
+    risk_str = str(round(result["risk_score"]))
+    assert risk_str in summary, (
+        f"predictive_summary does not mention risk score {risk_str}: {summary!r}"
+    )
+    print(f"PASS: predictive_summary contains score ({summary[:80]}…)")
+
+
+def test_predictive_summary_format():
+    """predictive_summary must follow the expected narrative format."""
+    scorer = _get_scorer()
+    records = [_make_record(estab_name="TEST CORP")]
+    result = scorer.score(records)
+    summary = result["predictive_summary"]
+    assert "predicted chance" in summary, "Missing 'predicted chance' in summary"
+    assert "OSHA enforcement event" in summary, "Missing 'OSHA enforcement event' in summary"
+    assert "expected" in summary, "Missing 'expected' in summary"
+    assert "violations" in summary, "Missing 'violations' in summary"
+    assert "risk score" in summary, "Missing 'risk score' in summary"
+    print(f"PASS: predictive_summary has expected format")
+
+
+def test_enforcement_prob_fallback_monotone():
+    """Higher risk scores should map to higher enforcement probabilities (fallback)."""
+    from src.scoring.ml_risk_scorer import MLRiskScorer
+    scores = [0, 20, 40, 60, 80, 100]
+    probs = [MLRiskScorer._enforcement_prob_from_score(s) for s in scores]
+    for i in range(len(probs) - 1):
+        assert probs[i] < probs[i + 1], (
+            f"Non-monotone: score {scores[i]}→{probs[i]:.3f} "
+            f"but score {scores[i+1]}→{probs[i+1]:.3f}"
+        )
+    print(f"PASS: _enforcement_prob_from_score monotonically increasing")
+
+
+def test_expected_violations_fallback_monotone():
+    """Higher risk scores should map to higher expected violation counts (fallback)."""
+    from src.scoring.ml_risk_scorer import MLRiskScorer
+    scores = [0, 25, 50, 75, 100]
+    vrs = [MLRiskScorer._expected_violations_from_score(s) for s in scores]
+    for i in range(len(vrs) - 1):
+        assert vrs[i] <= vrs[i + 1], (
+            f"Non-monotone: score {scores[i]}→{vrs[i]:.2f} "
+            f"but score {scores[i+1]}→{vrs[i+1]:.2f}"
+        )
+    print(f"PASS: _expected_violations_from_score monotonically non-decreasing")
+
+
+def test_example_calibration():
+    """Verify the example from the spec: risk_score≈67 → ~41% prob, ~1.8 violations."""
+    from src.scoring.ml_risk_scorer import MLRiskScorer
+    prob = MLRiskScorer._enforcement_prob_from_score(67)
+    vr   = MLRiskScorer._expected_violations_from_score(67)
+    # Allow ±5 percentage points and ±0.5 violations from spec values
+    assert abs(prob - 0.41) <= 0.05, f"Expected ~41% at score 67, got {prob:.3f}"
+    assert abs(vr - 1.8) <= 0.5,     f"Expected ~1.8 violations at score 67, got {vr:.2f}"
+    print(f"PASS: example calibration (score=67 → {prob*100:.0f}% prob, {vr:.1f} viol)")
+
+
+def test_generate_predictive_summary_output():
+    """_generate_predictive_summary produces the required narrative format."""
+    from src.scoring.ml_risk_scorer import MLRiskScorer
+    summary = MLRiskScorer._generate_predictive_summary(67.0, 0.41, 1.8)
+    assert "41%" in summary
+    assert "1.8" in summary
+    assert "67/100" in summary
+    assert "OSHA enforcement event" in summary
+    print(f"PASS: _generate_predictive_summary: {summary}")
+
+
+def test_build_temporal_labels_returns_none_without_csv():
+    """_build_temporal_labels_for_population returns None when CSVs are absent."""
+    from unittest.mock import patch
+    from src.scoring.ml_risk_scorer import MLRiskScorer
+
+    with patch.object(MLRiskScorer, "_load_or_build"):
+        scorer = MLRiskScorer()
+    # Pass a minimal population; there are no bulk CSVs in the test environment
+    population = [{"name": "ACME", "features": [1.0] * len(MLRiskScorer.FEATURE_NAMES)}]
+    result = scorer._build_temporal_labels_for_population(population)
+    assert result is None, f"Expected None (no CSVs), got: {result}"
+    print("PASS: _build_temporal_labels_for_population returns None without CSVs")
+
+
 # ── Runner ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -394,6 +517,17 @@ if __name__ == "__main__":
         test_weighted_average_calculation,
         test_osha_record_has_estab_name,
         test_osha_record_estab_name_optional,
+        # Predictive fields
+        test_score_returns_predictive_fields,
+        test_enforcement_probability_range,
+        test_expected_violations_nonnegative,
+        test_predictive_summary_contains_score,
+        test_predictive_summary_format,
+        test_enforcement_prob_fallback_monotone,
+        test_expected_violations_fallback_monotone,
+        test_example_calibration,
+        test_generate_predictive_summary_output,
+        test_build_temporal_labels_returns_none_without_csv,
     ]
 
     passed = 0

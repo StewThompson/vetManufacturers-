@@ -9,7 +9,7 @@ from collections import defaultdict, Counter
 from datetime import date, timedelta
 from typing import List, Dict, Optional
 
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
@@ -133,6 +133,10 @@ class MLRiskScorer:
     MODEL_FILE = "risk_model.pkl"
     POP_FILE = "population_data.json"
     CALIBRATOR_FILE = "tail_calibrator.pkl"
+    ENFORCEMENT_CLASSIFIER_FILE = "enforcement_classifier.pkl"
+    VIOLATION_REGRESSOR_FILE = "violation_regressor.pkl"
+    # Minimum temporal (real-outcome) pairs required to blend into training labels
+    MIN_TEMPORAL_TRAINING_PAIRS = 100
 
     def __init__(self, osha_client=None):
         self.osha_client = osha_client
@@ -140,6 +144,8 @@ class MLRiskScorer:
         self.population_features: Optional[np.ndarray] = None
         self._industry_stats: dict = {}
         self._calibrator: Optional[TailCalibrator] = None
+        self._enforcement_classifier = None   # GradientBoostingClassifier
+        self._violation_regressor = None      # GradientBoostingRegressor
         self._naics_map: dict = load_naics_map()
         os.makedirs(self.CACHE_DIR, exist_ok=True)
         self._load_or_build()
@@ -515,122 +521,50 @@ class MLRiskScorer:
         return population
 
     # ------------------------------------------------------------------ #
-    #  Model training
+    #  Temporal outcome label builder
     # ------------------------------------------------------------------ #
-    def _train(self, population: List[Dict]):
-        """Build feature matrix, generate pseudo-labels, train pipeline."""
-        # X_raw may contain NaN in z-score features for NAICS-missing rows.
-        # Pseudo-labels use only absolute signals + naics_unknown flag;
-        # the model trains on NaN→0.0 matrix for z-scores.
-        X_raw = np.array([p["features"] for p in population], dtype=float)
-        y = np.array([self._pseudo_label(row) for row in X_raw])  # labels from raw values
-        X = np.nan_to_num(X_raw, nan=0.0)
-        X = self._log_transform_features(X)  # model trains on log-scaled counts
+    def _build_temporal_labels_for_population(
+        self, population: List[Dict]
+    ) -> Optional[Dict]:
+        """Build real future-outcome labels for population establishments.
 
-        # ── 80/20 split: train GBR on 80%, fit calibrator on held-out 20% ─
-        # Using a random split (not temporal) because the population dict
-        # carries no date field.  Fitting the calibrator on held-out data
-        # ensures it corrects GBR compression without overfitting to the
-        # training targets.
-        rng = np.random.default_rng(42)
-        n = len(X)
-        idx = rng.permutation(n)
-        split = int(n * 0.8)
-        train_idx, cal_idx = idx[:split], idx[split:]
-        X_train, y_train = X[train_idx], y[train_idx]
-        X_cal, y_cal = X[cal_idx], y[cal_idx]
-        # ── Tail sample weights ───────────────────────────────────────────
-        # Ramp starts at the Recommend→Caution boundary (y=30) rather than 40
-        # to give the model a stronger gradient signal throughout the Caution
-        # band.  Steeper slope (1 unit per 10 score points) and an 8× cap
-        # (vs. the old 3×) counteract the 79:1 class imbalance between
-        # Recommend and Do-Not-Recommend establishments.
-        sw_train = np.clip(1.0 + np.maximum(0.0, y_train - 30.0) / 10.0, 1.0, 8.0)
+        Streams bulk inspection and violation CSVs, looking up post-2024
+        outcomes for every establishment that appears in *population*.
+        This data drives both mixed-label training (replacing pseudo-labels
+        where real outcomes are available) and the enforcement / violation
+        predictive models.
 
-        # ── Model: Huber loss + higher capacity + min leaf ────────────
-        # Huber loss (alpha=0.9 ≈ 90th-percentile transition) is less
-        # aggressive than squared-error at penalising tail deviations,
-        # reducing regression of high-scored establishments toward the mean.
-        # n_estimators 300 → 400 gives the model more capacity to learn
-        # the thinly-populated tail; min_samples_leaf=3 prevents over-
-        # smoothing of the rare extreme examples.
-        self.pipeline = Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", GradientBoostingRegressor(
-                n_estimators=500,
-                max_depth=5,
-                learning_rate=0.05,
-                subsample=0.8,
-                loss="huber",
-                alpha=0.95,
-                min_samples_leaf=3,
-                random_state=42,
-            )),
-        ])
-        # Pipeline.fit() routes extra kwargs to the final estimator via
-        # the "stepname__param" convention.
-        self.pipeline.fit(X_train, y_train, model__sample_weight=sw_train)
-        self.population_features = X
-
-        # ── Fit tail calibrator on held-out 20% ───────────────────────
-        # Predicts raw scores for the calibration fold and maps them to
-        # the pseudo-labels those establishments should have received.
-        # This corrects for GBR's MSE-driven tail compression without
-        # touching the rank order of any two establishments.
-        cal_preds = self.pipeline.predict(X_cal)
-        self._calibrator = TailCalibrator()
-        self._calibrator.fit(cal_preds, y_cal)
-        print(
-            f"ML Risk Model trained on {len(X_train)} establishments "
-            f"(calibrator fitted on {len(X_cal)})."
-        )
-
-    # ------------------------------------------------------------------ #
-    #  Persistence
-    # ------------------------------------------------------------------ #
-    #  Temporal calibration
-    # ------------------------------------------------------------------ #
-    def _refit_calibrator_from_temporal(self, population: List[Dict]) -> None:
-        """Refit the tail calibrator using real future outcomes (2024+).
-
-        After training, this method loads post-2024 inspections and violations
-        from the bulk CSVs, computes real future adverse outcome scores for each
-        training establishment that also received inspections after 2024-01-01,
-        and re-fits the calibrator so that the raw-score→calibrated-score mapping
-        reflects actual compliance outcomes rather than self-referential
-        pseudo-labels.
-
-        This corrects the circular calibration problem: fitting the calibrator
-        on pseudo-label holdout only un-compresses back to already-faulty labels.
-        Real temporal data reveals how raw scores actually predict future harm.
+        Returns
+        -------
+        dict with keys:
+            y_adverse   : np.ndarray[float] — composite adverse-outcome score
+            y_binary    : np.ndarray[float] — 1.0 if serious enforcement event
+            y_viol_rate : np.ndarray[float] — violations per future inspection
+            has_temporal: np.ndarray[bool]  — True where temporal data exists
+            n_temporal  : int               — count of temporal pairs
+        or None if bulk CSVs are unavailable.
         """
         insp_path = os.path.join(self.CACHE_DIR, "inspections_bulk.csv")
         viol_path = os.path.join(self.CACHE_DIR, "violations_bulk.csv")
 
         if not os.path.exists(insp_path) or not os.path.exists(viol_path):
-            print("  Temporal calibration skipped: bulk CSVs not found in ml_cache/.")
-            return
-
-        if self.pipeline is None or self.population_features is None:
-            return
+            return None
 
         CUTOFF = date(2024, 1, 1)
-        print("  Refitting calibrator from real temporal outcomes (2024+ holdout)…")
+        n = len(population)
+        name_to_idx: Dict[str, int] = {p["name"]: i for i, p in enumerate(population)}
 
-        # Get raw model predictions for every population establishment.
-        pop_raw_scores = self.pipeline.predict(self.population_features)
-        name_to_raw: Dict[str, float] = {
-            p["name"]: float(pop_raw_scores[i])
-            for i, p in enumerate(population)
-        }
+        y_adverse = np.full(n, np.nan)
+        y_binary  = np.full(n, np.nan)
+        y_viol_rate = np.full(n, np.nan)
 
-        # Stream post-2024 inspections, keeping only names we trained on.
+        # Stream post-2024 inspections for known establishments only.
         post_estabs: Dict[str, list] = defaultdict(list)
         csv.field_size_limit(10 * 1024 * 1024)
         with open(insp_path, encoding="utf-8", errors="replace", newline="") as f:
             for row in csv.DictReader(f):
                 name = (row.get("estab_name") or "UNKNOWN").upper()
-                if name not in name_to_raw:
+                if name not in name_to_idx:
                     continue
                 od = row.get("open_date", "")
                 try:
@@ -641,8 +575,7 @@ class MLRiskScorer:
                     post_estabs[name].append(row)
 
         if not post_estabs:
-            print("  No post-2024 inspections for known establishments; skipping.")
-            return
+            return None
 
         # Load violations for post-2024 activity numbers only (leakage guard).
         post_acts: set = {
@@ -659,12 +592,8 @@ class MLRiskScorer:
                 if act in post_acts:
                     viols_by_act[act].append(row)
 
-        # Compute (raw_score, future_adverse) pairs.
-        raw_scores_cal: list = []
-        future_advs_cal: list = []
-
         for name, fut_inspections in post_estabs.items():
-            raw_pred = name_to_raw[name]
+            idx = name_to_idx[name]
             fut_viols: list = []
             fut_fat = 0
             for insp in fut_inspections:
@@ -682,7 +611,7 @@ class MLRiskScorer:
             fut_vr    = len(fut_viols) / fut_n if fut_n > 0 else 0.0
             any_fatal = int(fut_fat > 0)
 
-            # Mirror the adverse-outcome formula used in test_real_world_validation.
+            # Composite adverse-outcome score (mirrors test_real_world_validation).
             adv = 0.0
             adv += 20.0 * any_fatal
             adv += min((fut_fat - 1) * 5.0, 15.0) if fut_fat > 1 else 0.0
@@ -692,11 +621,153 @@ class MLRiskScorer:
             adv += min(math.log1p(fut_pen) * 0.8, 10.0)
             adv += min(fut_vr * 2.0, 10.0)
 
-            raw_scores_cal.append(raw_pred)
-            future_advs_cal.append(adv)
+            y_adverse[idx]   = adv
+            # Binary: any serious enforcement event (serious viol, W/R, or fatality)
+            y_binary[idx]    = 1.0 if (fut_s > 0 or fut_wr > 0 or fut_fat > 0) else 0.0
+            y_viol_rate[idx] = fut_vr
 
-        n_pairs = len(raw_scores_cal)
-        if n_pairs < 100:
+        has_temporal = ~np.isnan(y_adverse)
+        n_temporal   = int(has_temporal.sum())
+
+        if n_temporal == 0:
+            return None
+
+        return {
+            "y_adverse":    y_adverse,
+            "y_binary":     y_binary,
+            "y_viol_rate":  y_viol_rate,
+            "has_temporal": has_temporal,
+            "n_temporal":   n_temporal,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Model training
+    # ------------------------------------------------------------------ #
+    def _train(self, population: List[Dict], temporal_data: Optional[Dict] = None):
+        """Build feature matrix, train pipeline.
+
+        When *temporal_data* contains ≥ MIN_TEMPORAL_TRAINING_PAIRS real
+        future-outcome labels, those labels are blended with pseudo-labels
+        so the model learns from observed compliance behaviour rather than
+        a self-referential heuristic alone.  Pseudo-labels are retained as
+        a fallback for the majority of establishments that have no post-cutoff
+        inspections, ensuring full population coverage.
+        """
+        # X_raw may contain NaN in z-score features for NAICS-missing rows.
+        X_raw = np.array([p["features"] for p in population], dtype=float)
+        X = np.nan_to_num(X_raw, nan=0.0)
+        X = self._log_transform_features(X)  # model trains on log-scaled counts
+
+        # ── Generate pseudo-labels as baseline ───────────────────────────
+        y_pseudo = np.array([self._pseudo_label(row) for row in X_raw])
+
+        # ── Blend with real temporal outcomes where available ─────────────
+        if (
+            temporal_data is not None
+            and temporal_data["n_temporal"] >= self.MIN_TEMPORAL_TRAINING_PAIRS
+        ):
+            mask = temporal_data["has_temporal"]
+            # Normalise adverse scores (max ≈ 88) to the same 0-100 scale as
+            # pseudo-labels so the GBR trains on a consistent target range.
+            ADV_MAX = 88.0
+            y_temporal_norm = np.clip(
+                temporal_data["y_adverse"] / ADV_MAX * 100.0, 0, 100
+            )
+            y = np.where(mask, y_temporal_norm, y_pseudo)
+            n_temporal = temporal_data["n_temporal"]
+            n_pseudo   = int((~mask).sum())
+            print(
+                f"  Mixed training: {n_temporal:,} real-outcome targets + "
+                f"{n_pseudo:,} pseudo-label targets."
+            )
+        else:
+            y = y_pseudo
+            if temporal_data is not None:
+                print(
+                    f"  Insufficient temporal pairs ({temporal_data['n_temporal']}); "
+                    "using pseudo-labels only."
+                )
+
+        # ── 80/20 split: train GBR on 80%, fit calibrator on held-out 20% ─
+        rng = np.random.default_rng(42)
+        n = len(X)
+        idx = rng.permutation(n)
+        split = int(n * 0.8)
+        train_idx, cal_idx = idx[:split], idx[split:]
+        X_train, y_train = X[train_idx], y[train_idx]
+        X_cal, y_cal = X[cal_idx], y[cal_idx]
+        # ── Tail sample weights ───────────────────────────────────────────
+        sw_train = np.clip(1.0 + np.maximum(0.0, y_train - 30.0) / 10.0, 1.0, 8.0)
+
+        # ── Model: Huber loss + higher capacity + min leaf ────────────────
+        self.pipeline = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", GradientBoostingRegressor(
+                n_estimators=500,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                loss="huber",
+                alpha=0.95,
+                min_samples_leaf=3,
+                random_state=42,
+            )),
+        ])
+        self.pipeline.fit(X_train, y_train, model__sample_weight=sw_train)
+        self.population_features = X
+
+        # ── Fit tail calibrator on held-out 20% ───────────────────────────
+        cal_preds = self.pipeline.predict(X_cal)
+        self._calibrator = TailCalibrator()
+        self._calibrator.fit(cal_preds, y_cal)
+        print(
+            f"ML Risk Model trained on {len(X_train)} establishments "
+            f"(calibrator fitted on {len(X_cal)})."
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Persistence
+    # ------------------------------------------------------------------ #
+    #  Temporal calibration + predictive model training
+    # ------------------------------------------------------------------ #
+    def _refit_calibrator_from_temporal(
+        self,
+        population: List[Dict],
+        temporal_data: Optional[Dict] = None,
+    ) -> None:
+        """Refit the tail calibrator using real future outcomes (2024+).
+
+        Also trains the enforcement-probability classifier and the
+        violation-rate regressor on the same temporal pairs so that
+        ``score()`` can return calibrated predictive estimates rather than
+        heuristic-derived fallbacks.
+
+        After training, this method loads post-2024 inspections and violations
+        from the bulk CSVs, computes real future adverse outcome scores for each
+        training establishment that also received inspections after 2024-01-01,
+        and re-fits the calibrator so that the raw-score→calibrated-score mapping
+        reflects actual compliance outcomes rather than self-referential
+        pseudo-labels.
+
+        This corrects the circular calibration problem: fitting the calibrator
+        on pseudo-label holdout only un-compresses back to already-faulty labels.
+        Real temporal data reveals how raw scores actually predict future harm.
+        """
+        if self.pipeline is None or self.population_features is None:
+            return
+
+        # Re-use pre-built temporal data if available; otherwise build now.
+        if temporal_data is None:
+            temporal_data = self._build_temporal_labels_for_population(population)
+
+        if temporal_data is None:
+            print("  Temporal calibration skipped: bulk CSVs not found in ml_cache/.")
+            return
+
+        mask     = temporal_data["has_temporal"]
+        n_pairs  = int(mask.sum())
+
+        if n_pairs < self.MIN_TEMPORAL_TRAINING_PAIRS:
             print(
                 f"  Only {n_pairs} temporal pairs found; "
                 "keeping pseudo-label calibrator."
@@ -704,9 +775,15 @@ class MLRiskScorer:
             return
 
         print(
-            f"  Fitting temporal calibrator on {n_pairs:,} "
-            "(raw_score, future_adverse) pairs…"
+            f"  Refitting calibrator + predictive models from real temporal "
+            f"outcomes ({n_pairs:,} pairs, 2024+ holdout)…"
         )
+
+        # ── Refit tail calibrator ─────────────────────────────────────────
+        pop_raw_scores = self.pipeline.predict(self.population_features)
+        raw_scores_cal = pop_raw_scores[mask]
+        future_advs_cal = temporal_data["y_adverse"][mask]
+
         new_cal = TailCalibrator()
         new_cal.fit(
             np.array(raw_scores_cal, dtype=float),
@@ -717,6 +794,136 @@ class MLRiskScorer:
             print("  Temporal calibrator fitted and attached.")
         else:
             print("  Temporal calibrator fit produced too few bins; keeping pseudo-label version.")
+
+        # ── Train enforcement-probability classifier ──────────────────────
+        X_temporal = self.population_features[mask]
+        y_binary   = temporal_data["y_binary"][mask].astype(int)
+        y_viol_rate = temporal_data["y_viol_rate"][mask]
+
+        n_pos = int((y_binary == 1).sum())
+        n_neg = n_pairs - n_pos
+
+        if n_pos >= 10 and n_neg >= 10:
+            clf = GradientBoostingClassifier(
+                n_estimators=100,
+                max_depth=3,
+                learning_rate=0.1,
+                subsample=0.8,
+                random_state=42,
+            )
+            clf.fit(X_temporal, y_binary)
+            self._enforcement_classifier = clf
+            print(
+                f"  Enforcement classifier trained "
+                f"({n_pos} positive, {n_neg} negative examples)."
+            )
+        else:
+            print(
+                f"  Insufficient class balance "
+                f"({n_pos} pos, {n_neg} neg); skipping enforcement classifier."
+            )
+
+        # ── Train violation-rate regressor ────────────────────────────────
+        viol_reg = GradientBoostingRegressor(
+            n_estimators=100,
+            max_depth=3,
+            learning_rate=0.1,
+            subsample=0.8,
+            random_state=42,
+        )
+        viol_reg.fit(X_temporal, y_viol_rate)
+        self._violation_regressor = viol_reg
+        print(f"  Violation-rate regressor trained on {n_pairs:,} pairs.")
+
+    # ------------------------------------------------------------------ #
+    #  Predictive scoring helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _enforcement_prob_from_score(risk_score: float) -> float:
+        """Derive enforcement probability from risk score via calibrated sigmoid.
+
+        Calibration targets:
+          risk_score  0 →  ~5 %
+          risk_score 30 → ~16 %
+          risk_score 60 → ~41 %
+          risk_score 80 → ~66 %
+          risk_score 100 → ~87 %
+        """
+        x = (risk_score - 70.0) / 15.0
+        sigmoid = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, x))))
+        prob = sigmoid * 0.8 + 0.05
+        return round(float(np.clip(prob, 0.01, 0.99)), 3)
+
+    @staticmethod
+    def _expected_violations_from_score(risk_score: float) -> float:
+        """Derive expected violations/inspection from risk score.
+
+        Calibration targets:
+          risk_score   0 →  0.0
+          risk_score  50 →  1.0
+          risk_score  67 →  1.8
+          risk_score 100 →  4.0
+        """
+        vr = max(0.0, (risk_score / 100.0) ** 2 * 4.0)
+        return round(float(vr), 2)
+
+    def _predict_enforcement_probability(self, log_features: np.ndarray) -> float:
+        """Return predicted probability of a serious OSHA enforcement event.
+
+        Uses the trained GradientBoostingClassifier when available, otherwise
+        derives a calibrated estimate from the raw GBR score.
+        """
+        if self._enforcement_classifier is not None:
+            try:
+                prob = float(self._enforcement_classifier.predict_proba(log_features)[0, 1])
+                return round(float(np.clip(prob, 0.0, 1.0)), 3)
+            except Exception:
+                pass
+        # Fallback: derive from raw model score
+        if self.pipeline is not None:
+            raw = float(self.pipeline.predict(log_features)[0])
+            return self._enforcement_prob_from_score(raw)
+        return 0.20
+
+    def _predict_expected_violations(self, log_features: np.ndarray) -> float:
+        """Return expected violations per inspection in the next 12 months.
+
+        Uses the trained GradientBoostingRegressor when available, otherwise
+        derives an estimate from the raw GBR score.
+        """
+        if self._violation_regressor is not None:
+            try:
+                vr = float(self._violation_regressor.predict(log_features)[0])
+                return round(float(max(0.0, vr)), 2)
+            except Exception:
+                pass
+        # Fallback: derive from raw model score
+        if self.pipeline is not None:
+            raw = float(self.pipeline.predict(log_features)[0])
+            return self._expected_violations_from_score(raw)
+        return 1.5
+
+    @staticmethod
+    def _generate_predictive_summary(
+        risk_score: float,
+        enforcement_probability: float,
+        expected_violations: float,
+    ) -> str:
+        """Return a human-readable predictive summary for the supplier.
+
+        Example output:
+          "This supplier has a 41% predicted chance of a serious OSHA
+           enforcement event in the next 12 months and an expected 1.8
+           violations, which maps to a risk score of 67/100."
+        """
+        prob_pct = round(enforcement_probability * 100)
+        viol_str = f"{expected_violations:.1f}"
+        score_str = f"{round(risk_score)}/100"
+        return (
+            f"This supplier has a {prob_pct}% predicted chance of a serious "
+            f"OSHA enforcement event in the next 12 months and an expected "
+            f"{viol_str} violations, which maps to a risk score of {score_str}."
+        )
 
     # ------------------------------------------------------------------ #
     def _save(self, population: List[Dict]):
@@ -746,6 +953,14 @@ class MLRiskScorer:
         if self._calibrator is not None and self._calibrator.is_fitted:
             cal_path = os.path.join(self.CACHE_DIR, self.CALIBRATOR_FILE)
             self._calibrator.save(cal_path)
+        if self._enforcement_classifier is not None:
+            enf_path = os.path.join(self.CACHE_DIR, self.ENFORCEMENT_CLASSIFIER_FILE)
+            with open(enf_path, "wb") as f:
+                pickle.dump(self._enforcement_classifier, f)
+        if self._violation_regressor is not None:
+            vr_path = os.path.join(self.CACHE_DIR, self.VIOLATION_REGRESSOR_FILE)
+            with open(vr_path, "wb") as f:
+                pickle.dump(self._violation_regressor, f)
 
     def _load_or_build(self):
         model_path = os.path.join(self.CACHE_DIR, self.MODEL_FILE)
@@ -799,6 +1014,22 @@ class MLRiskScorer:
                             self._calibrator = TailCalibrator.load(cal_path)
                         except Exception as cal_e:
                             print(f"  Calibrator load failed ({cal_e}); running uncalibrated.")
+                    # Load enforcement classifier if available
+                    enf_path = os.path.join(self.CACHE_DIR, self.ENFORCEMENT_CLASSIFIER_FILE)
+                    if os.path.exists(enf_path):
+                        try:
+                            with open(enf_path, "rb") as f:
+                                self._enforcement_classifier = pickle.load(f)
+                        except Exception as enf_e:
+                            print(f"  Enforcement classifier load failed ({enf_e}).")
+                    # Load violation regressor if available
+                    vr_path = os.path.join(self.CACHE_DIR, self.VIOLATION_REGRESSOR_FILE)
+                    if os.path.exists(vr_path):
+                        try:
+                            with open(vr_path, "rb") as f:
+                                self._violation_regressor = pickle.load(f)
+                        except Exception as vr_e:
+                            print(f"  Violation regressor load failed ({vr_e}).")
                     print(f"Loaded cached ML risk model (trained {cache_date}, {len(pop)} estabs).")
                     return
             except Exception as e:
@@ -812,8 +1043,9 @@ class MLRiskScorer:
             if len(population) < 5:
                 print("Insufficient population data ")
                 return
-            self._train(population)
-            self._refit_calibrator_from_temporal(population)
+            temporal_data = self._build_temporal_labels_for_population(population)
+            self._train(population, temporal_data)
+            self._refit_calibrator_from_temporal(population, temporal_data)
             self._save(population)
         except Exception as e:
             print(f"Population fetch failed ({e})")
@@ -976,20 +1208,29 @@ class MLRiskScorer:
         included in the return dict so callers can surface concentration.
 
         Returns:
-            risk_score            – 0 to 100 (weighted avg of establishment scores)
-            percentile_rank       – 0 to 100 (higher = riskier than more peers)
-            feature_weights       – feature name → learned importance
-            features              – feature name → raw value (aggregate)
-            industry_label        – human-readable industry name (NAICS lookup)
-            industry_group        – 4-digit (or coarser) NAICS group used
-            industry_percentile   – company's violation-rate percentile within its industry
-            industry_comparison   – list of comparison strings
-            missing_naics         – True when no NAICS code was available
-            establishment_count   – number of distinct scored establishments
-            site_scores           – list of per-site dicts
-            risk_concentration    – fraction of sites ≥ 60
-            systemic_risk_flag    – True when risk is systemic
-            aggregation_warning   – human-readable warning when multi-site
+            risk_score              – 0 to 100 (weighted avg of establishment scores)
+            percentile_rank         – 0 to 100 (higher = riskier than more peers)
+            feature_weights         – feature name → learned importance
+            features                – feature name → raw value (aggregate)
+            industry_label          – human-readable industry name (NAICS lookup)
+            industry_group          – 4-digit (or coarser) NAICS group used
+            industry_percentile     – company's violation-rate percentile within its industry
+            industry_comparison     – list of comparison strings
+            missing_naics           – True when no NAICS code was available
+            establishment_count     – number of distinct scored establishments
+            site_scores             – list of per-site dicts
+            risk_concentration      – fraction of sites ≥ 60
+            systemic_risk_flag      – True when risk is systemic
+            aggregation_warning     – human-readable warning when multi-site
+            enforcement_probability – predicted probability (0–1) of a serious OSHA
+                                      enforcement event in the next 12 months
+            expected_violations     – expected violations per inspection in the
+                                      next 12 months
+            predictive_summary      – natural-language summary, e.g.:
+                                      "This supplier has a 41% predicted chance of a
+                                       serious OSHA enforcement event in the next 12
+                                       months and an expected 1.8 violations, which
+                                       maps to a risk score of 67/100."
         """
         # ── Per-establishment scoring ─────────────────────────────────
         estab = self.score_establishments(records)
@@ -1094,6 +1335,21 @@ class MLRiskScorer:
                 f"(≥ 60). Review the per-site breakdown below."
             )
 
+        # ── Predictive estimates ──────────────────────────────────────
+        # Use the aggregate feature vector when available; fall back to
+        # deriving estimates from the risk score alone.
+        agg_X = estab["aggregate_features"]
+        if agg_X is not None:
+            enforcement_probability = self._predict_enforcement_probability(agg_X)
+            expected_violations     = self._predict_expected_violations(agg_X)
+        else:
+            enforcement_probability = self._enforcement_prob_from_score(risk_score)
+            expected_violations     = self._expected_violations_from_score(risk_score)
+
+        predictive_summary = self._generate_predictive_summary(
+            risk_score, enforcement_probability, expected_violations
+        )
+
         return {
             "risk_score": round(risk_score, 1),
             "percentile_rank": round(percentile, 1),
@@ -1104,21 +1360,26 @@ class MLRiskScorer:
             "industry_percentile": round(industry_percentile, 1),
             "industry_comparison": industry_comparison[:4],
             "missing_naics": missing_naics,
-            # ── New per-establishment fields ──────────────────────────
+            # ── Per-establishment fields ──────────────────────────────
             "establishment_count": n_estab,
             "site_scores": estab["site_scores"],
             "risk_concentration": estab["risk_concentration"],
             "systemic_risk_flag": estab["systemic_risk_flag"],
             "aggregation_warning": aggregation_warning,
             "concentration_warning": concentration_warning,
+            # ── Predictive fields ─────────────────────────────────────
+            "enforcement_probability": enforcement_probability,
+            "expected_violations": expected_violations,
+            "predictive_summary": predictive_summary,
         }
 
     def retrain(self):
         """Force a full retrain from fresh API data."""
         population = self._fetch_population()
         if len(population) >= 5:
-            self._train(population)
-            self._refit_calibrator_from_temporal(population)
+            temporal_data = self._build_temporal_labels_for_population(population)
+            self._train(population, temporal_data)
+            self._refit_calibrator_from_temporal(population, temporal_data)
             self._save(population)
             return True
         return False

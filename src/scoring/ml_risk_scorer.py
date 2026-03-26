@@ -6,7 +6,7 @@ from collections import defaultdict
 from datetime import date, timedelta
 from typing import List, Dict, Optional
 
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
@@ -17,13 +17,9 @@ class MLRiskScorer:
     """
     Machine-learning risk scorer using scikit-learn.
 
-    Trains a GradientBoostingClassifier on actual OSHA population data from
-    the DOL API.  The model predicts the *probability* that a manufacturer
-    will experience a serious OSHA enforcement event (serious/willful
-    violation or fatality), expressed as a percentage (0–100).
-
-    Labels are derived entirely from real inspection outcomes — no
-    heuristic pseudo-labeling is used during training.
+    Trains a GradientBoostingRegressor on OSHA population data from the
+    DOL API so that every manufacturer's risk score is *relative* to the
+    broader population of inspected establishments.
     """
 
     FEATURE_NAMES = [
@@ -181,6 +177,132 @@ class MLRiskScorer:
         ]])
 
     # ------------------------------------------------------------------ #
+    #  Pseudo-label generation (domain knowledge)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _pseudo_label(row: np.ndarray) -> float:
+        """
+        Generate a training label (0-100 risk) from raw features using
+        an explainable, credit-score-inspired heuristic.
+
+        Scoring philosophy:
+          direct harm signals         0-34   dominant, can create score floors
+          violation type             0-24   willful/repeat matter heavily
+          gravity / severity         0-14   serious + gravity corroborate risk
+          recency                    0-12   recent bad behavior matters more
+          violation rate             0-10   normalized by inspections
+          penalties                  0-6    log-scaled corroboration only
+          clean inspection credit    0 to -10  reward repeated clean history
+          uncertainty / sparse data  0-8    caution when evidence is thin
+
+        Modifiers:
+          + interaction penalties for compounding patterns
+          + catastrophic-event floors
+          + sparse-data floors
+        """
+        (n_insp, n_viols, serious, willful, repeat,
+         total_pen, avg_pen, max_pen, recent_ratio, severe, vpi,
+         accident_count, fatality_count, injury_count, avg_gravity,
+         pen_per_insp, clean_ratio) = row
+
+        # All count features (serious, willful, repeat, severe, accidents,
+        # fatalities, injuries) are now *rates per inspection* — a value of 1.0
+        # means every inspection had that event; 0.1 means 1-in-10 inspections.
+        # This keeps Walmart (1,000 locations) on the same scale as a single
+        # factory.  n_insp is retained raw so the scorer still knows how much
+        # evidence exists.
+
+        score = 0.0
+
+        # --- Direct harm signals (up to 34) ---
+        # Fatalities dominate: one death is categorically different from any number
+        # of paper violations.  fatality_count is a *rate* (fatality inspections /
+        # total inspections), so > 0 means at least one fatal inspection occurred;
+        # the nonlinear jump is preserved — a company with a 10 % fatality rate
+        # scores near the cap whereas a 0.1 % rate still triggers the floor.
+        if fatality_count > 0:
+            # Reconstruct a representative absolute count for the jump formula,
+            # bounded so a 100 % fatality rate doesn't inflate beyond the cap.
+            eff_fatalities = min(fatality_count * max(n_insp, 1), 5)
+            score += min(22.0 + (eff_fatalities - 1) * 6.0, 34)
+        score += min(severe * 25.0, 6)                      # rate × scale → up to 6
+        score += min(injury_count * 6.0, 4)                 # rate × scale → up to 4
+        score += min(accident_count * 10.0, 4)              # rate × scale → up to 4
+
+        # Cap the full direct-harm block at 34
+        score = min(score, 34)
+
+        # --- Violation type (up to 24) ---
+        # Willful violations = deliberate disregard for safety; treated more harshly
+        # than repeat, which is a pattern signal but may reflect complexity, not malice.
+        # Both are now rates: willful=1.0 means every inspection had a willful.
+        score += min(willful * 14.0, 14)                    # rate × scale → up to 14
+        score += min(repeat * 10.0, 10)                     # rate × scale → up to 10
+
+        # --- Gravity / severity (up to 14) ---
+        # Serious rate and avg_gravity corroborate real danger.
+        score += min(serious * 8.0, 8)                      # rate × scale → up to 8
+        if avg_gravity > 0:
+            score += min(avg_gravity * 0.6, 6)              # avg is already scale-invariant
+
+        # --- Recency — recent activity within 1yr (up to 12) ---
+        # raw ratio is already scale-invariant
+        score += recent_ratio * 12.0                        # up to 12
+
+        # --- Violation rate per inspection (up to 10) ---
+        # vpi is already a rate (violations / inspection); unchanged.
+        score += min(vpi * 2.5, 10)                         # up to 10
+
+        # --- Penalties — corroboration only (up to 6) ---
+        # pen_per_insp is already normalized; total_pen is intentionally raw
+        # (absolute fine size is a corroborating signal, not the primary driver).
+        if total_pen > 0:
+            score += min(np.log1p(total_pen) * 0.4, 4)     # up to 4
+        if pen_per_insp > 0:
+            score += min(np.log1p(pen_per_insp) * 0.3, 2)  # up to 2
+
+        # --- Clean inspection credit (up to -10) ---
+        # A pattern of clean inspections is genuinely positive, but it cannot
+        # offset catastrophic events — a company with a fatality rate > 0 is
+        # still high-risk even if most inspections were clean.
+        if (clean_ratio > 0
+                and fatality_count == 0
+                and accident_count == 0
+                and severe == 0):
+            if n_insp >= 3:
+                score -= clean_ratio * 10.0                 # full credit: sustained history
+            elif n_insp == 2:
+                score -= clean_ratio * 4.0                  # partial: only two data points
+            # n_insp <= 1: no credit — one clean inspection proves nothing
+
+        # --- Uncertainty / sparse data (up to 5) ---
+        # Sparse data means we don't know enough to call this company safe.
+        if n_insp <= 1:
+            score += 5.0
+        elif n_insp <= 3:
+            score += 2.5
+        elif n_insp <= 5:
+            score += 1.0
+
+        # --- Interaction effects ---
+        # Rate-based: both conditions can fire even for a single-inspection
+        # company if the rates are non-zero.
+        if fatality_count > 0 and (willful + repeat) > 0:
+            score += 8.0                                    # institutional disregard
+        if willful > 0 and repeat > 0:
+            score += 5.0                                    # known + ignored pattern
+        if recent_ratio > 0.5 and serious >= 0.25:          # ≥25 % of inspections serious
+            score += 4.0                                    # concentrated recent danger
+
+        # --- Conservative floors ---
+        if fatality_count > 0 and recent_ratio >= 0.25:
+            score = max(score, 65.0)                        # recent fatality rate: never low-risk
+        if n_insp <= 1 and score < 18:
+            score = 18.0                                    # single-inspection: insufficient data
+
+        return float(np.clip(score, 0, 100))
+
+    # ------------------------------------------------------------------ #
     #  Population data from bulk cache
     # ------------------------------------------------------------------ #
     def _fetch_population(self) -> List[Dict]:
@@ -285,22 +407,8 @@ class MLRiskScorer:
             fat_rate      = fat_count    / n_insp if n_insp else 0.0
             inj_rate      = inj_count    / n_insp if n_insp else 0.0
 
-            # Binary label: 1 if the establishment experienced a serious
-            # OSHA enforcement event (serious or willful violation, or fatality),
-            # 0 otherwise.  Repeat and severe violations are intentionally
-            # excluded from the label: they appear as *features* that the model
-            # can learn to associate with risk, but using them in the label too
-            # would make the classifier trivially predict based on label leakage.
-            # Serious violations, willful violations, and fatalities are the
-            # primary outcome signals used by OSHA itself to define "significant"
-            # enforcement actions.
-            had_serious_event = int(
-                serious_raw > 0 or willful_raw > 0 or fat_count > 0
-            )
-
             population.append({
                 "name": estab,
-                "label": had_serious_event,
                 "features": [
                     n_insp, n_viols, serious_rate, willful_rate, repeat_rate,
                     total_pen, avg_pen, max_pen, recent_ratio, severe_rate, vpi,
@@ -316,34 +424,13 @@ class MLRiskScorer:
     #  Model training
     # ------------------------------------------------------------------ #
     def _train(self, population: List[Dict]):
-        """Train a binary classifier on real OSHA enforcement outcomes.
-
-        Labels are 1 where an establishment had at least one serious,
-        willful violation or fatality — derived directly from inspection
-        data, with no heuristic pseudo-labeling.  The model then predicts
-        the *probability* of such an event for any new manufacturer.
-        """
+        """Build feature matrix, generate pseudo-labels, train pipeline."""
         X = np.array([p["features"] for p in population])
-        y = np.array([p["label"] for p in population])
-
-        # A classifier requires at least two classes to train.  With real
-        # OSHA data this should never happen, but guard against degenerate
-        # test fixtures or very small populations.
-        if len(population) == 0:
-            raise ValueError("Cannot train: population is empty.")
-        if len(np.unique(y)) < 2:
-            print(
-                "Warning: training labels contain only one class — "
-                "adding synthetic minority-class example so the classifier can fit."
-            )
-            # Append the feature mean as a synthetic opposite-class sample.
-            # This is a last-resort guard; model accuracy will be degraded.
-            X = np.vstack([X, X.mean(axis=0)])
-            y = np.append(y, 1 - int(y[0]))
+        y = np.array([self._pseudo_label(row) for row in X])
 
         self.pipeline = Pipeline([
             ("scaler", StandardScaler()),
-            ("model", GradientBoostingClassifier(
+            ("model", GradientBoostingRegressor(
                 n_estimators=100,
                 max_depth=3,
                 learning_rate=0.1,
@@ -352,11 +439,7 @@ class MLRiskScorer:
         ])
         self.pipeline.fit(X, y)
         self.population_features = X
-        pos_rate = float(y.mean() * 100)
-        print(
-            f"ML Risk Classifier trained on {len(X)} establishments "
-            f"({pos_rate:.1f}% had a serious enforcement event)."
-        )
+        print(f"ML Risk Model trained on {len(X)} establishments.")
 
     # ------------------------------------------------------------------ #
     #  Persistence
@@ -378,20 +461,13 @@ class MLRiskScorer:
                 with open(pop_path) as f:
                     meta = json.load(f)
                 cache_date = meta.get("date", "")
-                pop = meta["manufacturers"]
-                # Reject cached data that pre-dates the real-label classifier:
-                # old files lack the "label" key on each record.
-                has_labels = len(pop) > 0 and "label" in pop[0]
-                if (cache_date
-                        and has_labels
-                        and (date.today() - date.fromisoformat(cache_date)).days < 7):
+                if cache_date and (date.today() - date.fromisoformat(cache_date)).days < 7:
                     with open(model_path, "rb") as f:
                         self.pipeline = pickle.load(f)
+                    pop = meta["manufacturers"]
                     self.population_features = np.array([p["features"] for p in pop])
                     print(f"Loaded cached ML risk model (trained {cache_date}, {len(pop)} estabs).")
                     return
-                elif not has_labels:
-                    print("Cached model uses old pseudo-label format — rebuilding with real labels.")
             except Exception as e:
                 print(f"Cache load failed: {e}")
 
@@ -411,20 +487,17 @@ class MLRiskScorer:
     # ------------------------------------------------------------------ #
     def score(self, records: List[OSHARecord], reputation_data: list = None) -> Dict:
         """
-        Predict the probability of a serious OSHA enforcement event for a
-        manufacturer, expressed as a score on a 0–100 scale.
+        Predict risk score for a manufacturer relative to the population.
 
         Returns:
-            risk_score      – 0 to 100  (predicted probability × 100)
+            risk_score      – 0 to 100
             percentile_rank – 0 to 100 (higher = riskier than more peers)
             feature_weights – feature name → learned importance
             features        – feature name → raw value for this manufacturer
         """
         X = self.extract_features(records)
-
-        # predict_proba returns [[p_no_event, p_serious_event]]
-        prob_serious = float(self.pipeline.predict_proba(X)[0][1])
-        risk_score = float(np.clip(prob_serious * 100, 0, 100))
+        raw = float(self.pipeline.predict(X)[0])
+        risk_score = float(np.clip(raw, 0, 100))
 
         # Reputation adjustment (outside the OSHA ML pipeline)
         reputation_score = 50.0
@@ -452,10 +525,10 @@ class MLRiskScorer:
             else:
                 news_sentiment = "Neutral"
 
-        # Percentile rank within population (compare predicted probabilities)
+        # Percentile rank within population
         if self.population_features is not None and len(self.population_features) > 0:
-            pop_probs = self.pipeline.predict_proba(self.population_features)[:, 1] * 100
-            percentile = float(np.mean(pop_probs <= risk_score) * 100)
+            pop_scores = self.pipeline.predict(self.population_features)
+            percentile = float(np.mean(pop_scores <= risk_score) * 100)
         else:
             percentile = 50.0
 

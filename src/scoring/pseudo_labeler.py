@@ -24,7 +24,8 @@ def pseudo_label(row: np.ndarray) -> float:
     (n_insp, n_viols, serious, willful, repeat,
      total_pen, avg_pen, max_pen, recent_ratio, severe, vpi,
      accident_count, fatality_count, injury_count, avg_gravity,
-     pen_per_insp, clean_ratio) = row[:17]
+     pen_per_insp, clean_ratio,
+     time_adj_pen) = row[:18]
 
     # NAICS sector identity (last 25 elements: 24 sectors + unknown flag)
     naics_unknown = float(row[-1])  # 1.0 when NAICS is missing
@@ -56,24 +57,49 @@ def pseudo_label(row: np.ndarray) -> float:
     # the bonus scales with rate: fat_rate = 0.2 → eff_fat = 1 (base),
     # fat_rate = 0.6 → eff_fat = 3 (+6 pts),  fat_rate = 1.0 → eff_fat = 5 (+24).
     # The contribution is further weighted by insp_confidence: a fat_rate of 1.0
-    # computed from a single inspection (insp_confidence=0.2) earns only 4.8 pts
-    # instead of 24, preventing single-event catastrophes from dominating the score.
+    # computed from a single inspection (insp_confidence=0.6) earns 14.4 pts,
+    # preventing single-event catastrophes from dominating the score.
+    #
+    # Sustained-pattern boost: the feature vector only carries fat_rate, so a
+    # company with 1 fatality in 1 inspection looks identical to one with 20
+    # fatalities in 20 inspections at the same rate.  n_insp * fat_rate is a
+    # proxy for absolute fatality count — log-scaled so it can't overwhelm the
+    # rate signal, capped at +8 pts, and also gated by insp_confidence so
+    # sparse records don't receive an outsized pattern premium.
     if fatality_count > 0:
         eff_fatalities = min(fatality_count * 5.0, 5.0)
-        score += min(12.0 + max(eff_fatalities - 1.0, 0.0) * 3.0, 24.0) * fat_dormant_scale * insp_confidence
+        rate_contrib = min(12.0 + max(eff_fatalities - 1.0, 0.0) * 3.0, 24.0)
+        abs_proxy = n_insp * fatality_count          # ≈ estimated total fatalities
+        pattern_boost = min(np.log1p(abs_proxy) * 2.0, 8.0)
+        score += (rate_contrib + pattern_boost) * fat_dormant_scale * insp_confidence
     score += min(severe * 25.0, 6)
     score += min(injury_count * 6.0, 4)
     score += min(accident_count * 10.0, 4)
     score = min(score, 34)
 
-    # ── Violation type (up to 24) ─────────────────────────────────────
-    score += min(willful * 14.0, 14) * dormant_scale
-    score += min(repeat * 10.0, 10) * dormant_scale
+    # ── Violation type (up to 35) ─────────────────────────────────────
+    # Coefficients raised so that moderate violation RATES generate meaningful
+    # scores: willful_rate=0.1 → 6 pts, 0.33 → 20 pts (cap).  The old cap of
+    # 14 pts total meant even a company with every inspection flagged as willful
+    # only matched a company with a single historical fatality.
+    score += min(willful * 60.0, 20) * dormant_scale
+    score += min(repeat  * 50.0, 15) * dormant_scale
 
-    # ── Gravity / severity (up to 14) ────────────────────────────────
-    score += min(serious * 8.0, 8)
+    # ── Gravity / severity (up to 21) ────────────────────────────────
+    # Serious violations raised: rate=0.2 → 5 pts, 0.6 → 15 pts.
+    score += min(serious * 25.0, 15)
     if avg_gravity > 0:
         score += min(avg_gravity * 0.6, 6)
+
+    # ── Active non-compliance interaction (up to 20) ──────────────────
+    # The single strongest forward-looking predictor missing from the old
+    # formula: a company that is CURRENTLY being inspected AND continuing to
+    # receive willful/repeat citations.  Scales with both recency_ratio (how
+    # recently active) and the W/R rate.  Dormant companies earn 0; active
+    # recidivists with willful_rate=0.2 and recent_ratio=0.5 earn ~10 pts.
+    if recent_ratio > 0 and (willful + repeat) > 0:
+        active_wr = recent_ratio * (willful * 3.0 + repeat * 2.0) * 25.0
+        score += min(active_wr, 20.0)
 
     # ── Recency component (up to 12) ──────────────────────────────────
     # Added directly after gravity so it contributes even when absolute
@@ -103,11 +129,22 @@ def pseudo_label(row: np.ndarray) -> float:
     elif recent_ratio < 0.2 and vpi < 0.5 and n_insp >= 3:
         score -= min((0.2 - recent_ratio) * 10.0, 5.0)
 
-    # ── Penalties — corroboration only (up to 6) ──────────────────────
-    if total_pen > 0:
-        score += min(np.log1p(total_pen) * 0.4, 4)
+    # ── Penalties — linear scaling so large amounts generate proportionally
+    # higher risk labels (up to 16) ────────────────────────────────────────
+    # time_adj_pen is the primary signal: recent penalties are nearly full-weight,
+    # older ones are decayed exponentially (τ=3y).  Linear scaling with a cap
+    # gives $10K → 0.25 pts, $200K → 5 pts, $400K → 10 pts — vs log1p which
+    # compressed $10K and $1M to within 30% of each other.
+    if time_adj_pen > 0:
+        score += min(time_adj_pen / 40_000, 10.0)
+    # Per-inspection average: flags single catastrophic inspections.
+    # Raised cap to 6 pts ($120K+ per inspection = severe signal).
     if pen_per_insp > 0:
-        score += min(np.log1p(pen_per_insp) * 0.3, 2)
+        score += min(pen_per_insp / 20_000, 6.0)
+    # total_pen (flat historical accumulation) removed: it rewarded companies
+    # with large OLD penalty records without requiring current activity, which
+    # was driving band inversion.  time_adj_pen already captures the meaningful
+    # penalty signal with exponential recency decay.
 
     # ── Missing-NAICS uncertainty penalty ────────────────────────────
     if naics_unknown > 0.5:

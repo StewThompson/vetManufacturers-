@@ -90,9 +90,10 @@ from src.data_retrieval.naics_lookup import load_naics_map
 CUTOFF_DATE = date(2024, 1, 1)
 
 # Additional cutoffs for sensitivity analysis (multi-split).
-# NOTE: the bulk cache only contains inspections from 2023-01-01 onwards,
-# so the earliest usable "historical" cutoff is mid-2023.
-MULTI_CUTOFF_DATES = [date(2023, 7, 1), date(2024, 1, 1)]
+# The bulk cache covers a 10-year rolling window (from ~2016-03 onwards),
+# so the earliest usable "historical" cutoff is early 2017 (giving at
+# least one full year of training history before the split).
+MULTI_CUTOFF_DATES = [date(2018, 1, 1), date(2020, 1, 1), date(2022, 1, 1), date(2024, 1, 1)]
 
 CACHE_DIR = "ml_cache"
 
@@ -445,20 +446,22 @@ def _build_per_establishment_data(
 
         # ── Historical feature aggregation ─────────────────────────────
         # LEAKAGE GUARD: only hist_list activity_nrs are looked up below.
-        n_insp    = len(hist_list)
-        recent    = 0
-        severe    = 0
-        clean     = 0
+        n_insp       = len(hist_list)
+        recent       = 0
+        severe       = 0
+        clean        = 0
         viols:    list = []
-        acc_count = fat_count = inj_count = 0
+        acc_count    = fat_count = inj_count = 0
+        time_adj_pen = 0.0
         naics_votes: Dict[str, int] = defaultdict(int)
 
         for insp in hist_list:
             act = str(insp.get("activity_nr", ""))
             od  = insp.get("open_date", "")
+            insp_d: Optional[date] = None
             try:
-                d = date.fromisoformat(od[:10])
-                if d >= one_year_ago:
+                insp_d = date.fromisoformat(od[:10])
+                if insp_d >= one_year_ago:
                     recent += 1
             except (ValueError, TypeError):
                 pass
@@ -467,6 +470,16 @@ def _build_per_establishment_data(
             viols.extend(insp_viols)
             if not insp_viols:
                 clean += 1
+
+            # Time-adjusted penalty: per-inspection penalty sum * exp(-age/3y)
+            if insp_viols and insp_d:
+                insp_pen_sum = sum(
+                    float(v.get("current_penalty") or v.get("initial_penalty") or 0)
+                    for v in insp_viols
+                )
+                if insp_pen_sum > 0:
+                    age_years = max(0.0, (date.today() - insp_d).days / 365.25)
+                    time_adj_pen += insp_pen_sum * math.exp(-age_years / 3.0)
 
             acc = accident_stats.get(act, {"accidents": 0, "fatalities": 0, "injuries": 0})
             acc_count += acc["accidents"]
@@ -522,12 +535,13 @@ def _build_per_establishment_data(
             "name": estab,
             "n_inspections": n_insp,
             "n_future_inspections": len(future_list),
-            # 17 absolute features — same ordering as MLRiskScorer.FEATURE_NAMES[:17]
+            # 18 absolute features — same ordering as MLRiskScorer.FEATURE_NAMES[:18]
             "features": [
                 n_insp, n_viols, serious_rate, willful_rate, repeat_rate,
                 total_pen, avg_pen, max_pen, recent_ratio, severe_rate, vpi,
                 acc_rate, fat_rate, inj_rate, avg_gravity,
                 pen_per_insp, clean_ratio,
+                time_adj_pen,
             ],
             "_industry_group":   naics_group,
             "_raw_vpi":          vpi,
@@ -563,7 +577,7 @@ def _build_feature_matrix(
     naics_map: dict,
     scorer: MLRiskScorer,
 ) -> np.ndarray:
-    """Append industry z-scores + NAICS one-hot to 17-feature rows → n × 46 array.
+    """Append industry z-scores + NAICS one-hot to 18-feature rows → n × 47 array.
 
     LEAKAGE GUARD: industry_stats must have been computed from the historical
     population only (never the full or future population).
@@ -637,6 +651,90 @@ def _train_and_score_historical(
     baseline_scores = np.clip(a + b * raw_preds, 0.0, 100.0)
 
     return baseline_scores, pipeline
+
+
+def _train_and_score_with_temporal_labels(
+    hist_X: np.ndarray,
+    hist_y: np.ndarray,
+    temporal_rows: list,
+    random_state: int = 42,
+) -> np.ndarray:
+    """Train a GBR augmented with real temporal labels, then score all establishments.
+
+    Stacks real-label rows (pre-cutoff features, post-cutoff adverse outcome)
+    on top of the pseudo-label population, giving real rows 3× sample weight.
+    This mirrors the augmentation strategy used in MLRiskScorer._train() but
+    uses the same lightweight GBR params as _train_and_score_historical() for
+    fast test execution.
+
+    Args:
+        hist_X         : n × 47 historical feature matrix (pseudo-label population)
+        hist_y         : n pseudo-labels in [0, 100]
+        temporal_rows  : list of dicts from load_or_build_temporal_labels;
+                         each dict has keys 'features_46' and 'real_label'
+        random_state   : RNG seed
+
+    Returns:
+        temporal_scores : calibrated predictions for ALL hist_X establishments,
+                          in [0, 100], shape (n,).  If temporal_rows is empty,
+                          falls back to _train_and_score_historical.
+    """
+    if not temporal_rows:
+        scores, _ = _train_and_score_historical(hist_X, hist_y, random_state)
+        return scores
+
+    TEMPORAL_LABEL_WEIGHT = MLRiskScorer.TEMPORAL_LABEL_WEIGHT
+
+    # Build real-label matrix; log-transform matches production scorer.
+    X_real = np.array([r["features_46"] for r in temporal_rows], dtype=float)
+    X_real = np.nan_to_num(X_real, nan=0.0)
+    X_real = MLRiskScorer._log_transform_features(X_real)
+    y_real = np.array([r["real_label"] for r in temporal_rows], dtype=float)
+
+    hist_X_log = MLRiskScorer._log_transform_features(hist_X)
+
+    # Rescale pseudo-labels to match real adverse distribution.
+    # Pseudo-labels over-predict by ~2.4x (mean~29 vs real mean~12).  Without
+    # rescaling, the two label sets pull the GBR toward contradictory targets
+    # and the real-label signal is partially washed out even with high weights.
+    p_mean = float(hist_y.mean())
+    p_std  = max(float(hist_y.std()), 1e-6)
+    r_mean = float(y_real.mean())
+    r_std  = max(float(y_real.std()), 1e-6)
+    hist_y_scaled = np.clip(
+        (hist_y - p_mean) * (r_std / p_std) + r_mean, 0.0, 100.0
+    )
+
+    # Combine: rescaled pseudo-label population + real-label rows
+    X_train = np.vstack([hist_X_log, X_real])
+    y_train = np.concatenate([hist_y_scaled, y_real])
+
+    # Sample weights: pseudo rows uniform, real rows TEMPORAL_LABEL_WEIGHT x
+    w_pseudo = np.ones(len(hist_y_scaled), dtype=float)
+    w_real   = np.full(len(y_real), TEMPORAL_LABEL_WEIGHT, dtype=float)
+    sample_weight = np.concatenate([w_pseudo, w_real])
+
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model",  GradientBoostingRegressor(
+            n_estimators=100, max_depth=3, learning_rate=0.1,
+            random_state=random_state,
+        )),
+    ])
+    pipeline.fit(X_train, y_train, model__sample_weight=sample_weight)
+
+    raw_preds = pipeline.predict(hist_X_log)
+
+    # Calibrate against rescaled pseudo-labels (mean≈real_mean, std≈real_std).
+    # Using the full ~400K population gives a well-conditioned, low-variance
+    # estimate of r and std.  hist_y_scaled already has the same distribution
+    # as y_real, so outputs are anchored to the correct absolute scale.
+    r = float(np.corrcoef(hist_y_scaled, raw_preds)[0, 1])
+    b = float(np.std(hist_y_scaled)) / max(abs(r) * float(np.std(raw_preds)), 1e-9)
+    a = float(np.mean(hist_y_scaled)) - b * float(np.mean(raw_preds))
+    temporal_scores = np.clip(a + b * raw_preds, 0.0, 100.0)
+
+    return temporal_scores
 
 
 # ====================================================================== #
@@ -1004,6 +1102,10 @@ class RealWorldData:
         self.swr_75th_flags: np.ndarray = np.array([])
         # "High" / "Medium" / "Low" confidence tag per paired establishment
         self.confidence_tags: List[str] = []
+        # Temporal-label model: scores produced by augmented GBR (real labels)
+        self.temporal_rows: list = []
+        self.temporal_scores: np.ndarray = np.array([])
+        self.paired_temporal_scores: np.ndarray = np.array([])
     @classmethod
     def get(cls) -> "RealWorldData":
         if cls._instance is None:
@@ -1078,14 +1180,61 @@ class RealWorldData:
               f"mean={self.baseline_scores.mean():.1f}  "
               f"std={self.baseline_scores.std():.1f}")
 
+        # ── Temporal-label augmented model ──────────────────────────────
+        # Load (or build) real-label training rows using a 2020 training
+        # cutoff so the outcome window is 2020–2024 (fully within cache).
+        try:
+            from src.scoring.labeling.temporal_labeler import (
+                load_or_build_temporal_labels,
+                summarise_temporal_labels,
+            )
+            _label_cutoff = MLRiskScorer.TEMPORAL_LABEL_CUTOFF
+            self.temporal_rows = load_or_build_temporal_labels(
+                scorer=self.scorer,
+                inspections_path=os.path.join(CACHE_DIR, "inspections_bulk.csv"),
+                violations_path=os.path.join(CACHE_DIR, "violations_bulk.csv"),
+                accidents_path=os.path.join(CACHE_DIR, "accidents_bulk.csv"),
+                injuries_path=os.path.join(CACHE_DIR, "accident_injuries_bulk.csv"),
+                naics_map=self.naics_map,
+                cache_dir=CACHE_DIR,
+                cutoff_date=_label_cutoff,
+                outcome_end_date=CUTOFF_DATE,
+            )
+            if self.temporal_rows:
+                summarise_temporal_labels(self.temporal_rows)
+                self.temporal_scores = _train_and_score_with_temporal_labels(
+                    self.hist_X, self.hist_y, self.temporal_rows,
+                )
+                print(f"  Temporal-label model score range: "
+                      f"[{self.temporal_scores.min():.1f}, "
+                      f"{self.temporal_scores.max():.1f}]  "
+                      f"mean={self.temporal_scores.mean():.1f}")
+            else:
+                print("  WARNING: No temporal training labels found — "
+                      "temporal model will mirror baseline.")
+                self.temporal_scores = self.baseline_scores.copy()
+        except Exception as exc:
+            print(f"  WARNING: Could not build temporal labels ({exc}) — "
+                  "temporal model will mirror baseline.")
+            self.temporal_scores = self.baseline_scores.copy()
+
         # ── Build paired subset ─────────────────────────────────────────
-        for p, outc, score in zip(
-            self.hist_pop, self.future_outcomes, self.baseline_scores
+        temporal_scores_aligned = (
+            self.temporal_scores
+            if len(self.temporal_scores) == len(self.hist_pop)
+            else self.baseline_scores
+        )
+        for p, outc, score, t_score in zip(
+            self.hist_pop, self.future_outcomes,
+            self.baseline_scores, temporal_scores_aligned,
         ):
             if outc["has_future_data"]:
                 self.paired_pop.append(p)
                 self.paired_outcomes.append(outc)
                 self.paired_scores = np.append(self.paired_scores, score)
+                self.paired_temporal_scores = np.append(
+                    self.paired_temporal_scores, t_score
+                )
 
         print(f"  Paired establishments (score + future outcomes): "
               f"{len(self.paired_pop):,}")
@@ -1138,6 +1287,20 @@ class RealWorldData:
             self.paired_scores, self.paired_adverse_scores
         ) if len(self.paired_pop) >= MIN_FUTURE_ESTABLISHMENTS else (float("nan"), 0, 0)
         print(f"  Spearman(score, future_adverse): rho={rho_adv:.3f}")
+
+        if (
+            len(self.paired_temporal_scores) == len(self.paired_scores)
+            and len(self.paired_scores) >= MIN_FUTURE_ESTABLISHMENTS
+        ):
+            rho_temp, _, _ = _spearman_bootstrap_ci(
+                self.paired_temporal_scores, self.paired_adverse_scores
+            )
+            delta = rho_temp - rho_adv
+            direction = "improved" if delta > 0 else ("equal" if delta == 0 else "regressed")
+            print(
+                f"  Spearman(temporal, future_adverse): rho={rho_temp:.3f}  "
+                f"delta_rho={delta:+.3f} ({direction})"
+            )
         print("=" * 70 + "\n")
 
         self.loaded = True
@@ -2799,3 +2962,159 @@ class TestWithinIndustryValidation:
             f"Within-sector top-decile lift < 1.0 in majority of sectors: "
             f"{n_positive}/{n_total}.  Score may not discriminate within industries."
         )
+
+
+# ====================================================================== #
+#  Temporal Supervision Validation
+# ====================================================================== #
+
+class TestTemporalSupervision:
+    """Validate that the temporal-label augmented model is at least as
+    predictive as the pseudo-label baseline.
+
+    These tests are explicitly tolerant: temporal supervision is expected to
+    reduce circularity (the labels are not derived from the scoring function
+    itself) so the primary requirement is that prediction quality does not
+    regress materially.  A temporal model that matches or exceeds the baseline
+    on real-world future outcomes confirms the augmentation strategy is sound.
+    """
+
+    def test_temporal_label_build_sample_nonempty(self, rw_data: RealWorldData):
+        """Temporal label builder must find at least some paired establishments.
+
+        Skips gracefully when the cache has insufficient temporal coverage
+        (e.g. when running against a truncated development cache).
+        """
+        if not rw_data.temporal_rows:
+            pytest.skip(
+                "No temporal training labels found — cache may lack pre-2020 data. "
+                "Run build_cache.py with CUTOFF_YEARS >= 10 to populate."
+            )
+        assert len(rw_data.temporal_rows) > 0, (
+            "temporal_rows is unexpectedly empty after successful load."
+        )
+        print(f"\n  Temporal training label sample: {len(rw_data.temporal_rows):,} rows")
+
+    def test_temporal_label_distribution_realistic(self, rw_data: RealWorldData):
+        """Real adverse labels must be non-trivial: mean > 0, std > 0, max <= 100."""
+        if not rw_data.temporal_rows:
+            pytest.skip("No temporal training labels — see test_temporal_label_build_sample_nonempty")
+
+        real_labels = np.array([r["real_label"] for r in rw_data.temporal_rows])
+        assert real_labels.mean() > 0, (
+            "All temporal real labels are 0 — no adverse outcomes recorded in the "
+            "2020–2024 outcome window.  Check that build_cache.py includes recent data."
+        )
+        assert real_labels.std() > 0, (
+            "All temporal real labels are identical — label computation may be broken."
+        )
+        assert real_labels.max() <= 100.0, (
+            f"Temporal real label max={real_labels.max():.1f} exceeds 100 — "
+            "normalisation is broken."
+        )
+        pseudo_labels = np.array([r["pseudo_label"] for r in rw_data.temporal_rows])
+        print(
+            f"\n  Real adverse labels  : mean={real_labels.mean():.2f}  "
+            f"std={real_labels.std():.2f}  max={real_labels.max():.1f}"
+        )
+        print(
+            f"  Pseudo labels (same) : mean={pseudo_labels.mean():.2f}  "
+            f"std={pseudo_labels.std():.2f}"
+        )
+
+    def test_temporal_sample_stratification(self, rw_data: RealWorldData):
+        """Temporal sample must cover multiple 2-digit NAICS sectors.
+
+        A sample drawn from a single sector would bias the temporal model
+        heavily toward that industry.
+        """
+        if not rw_data.temporal_rows:
+            pytest.skip("No temporal training labels — see test_temporal_label_build_sample_nonempty")
+
+        sectors = {r.get("naics_2digit", r.get("name", "")[:2])
+                   for r in rw_data.temporal_rows
+                   if r.get("naics_2digit") or len(r.get("name", "")) >= 2}
+        # Fall back to stratum key sector prefix if naics_2digit not present
+        if not sectors:
+            sectors = {r.get("stratum_key", "XX")[:2]
+                       for r in rw_data.temporal_rows}
+
+        print(f"\n  Unique 2-digit NAICS sectors in temporal sample: {len(sectors)}")
+        assert len(sectors) >= 2, (
+            f"Temporal sample only covers {len(sectors)} NAICS sector(s). "
+            "Stratification may have failed."
+        )
+
+    def test_temporal_model_spearman_not_worse_than_pseudo(
+        self, rw_data: RealWorldData
+    ):
+        """Temporal-label model must not materially regress below the pseudo-label baseline.
+
+        Tolerance of 0.05 in Spearman rho allows for legitimate variance at
+        smaller paired-set sizes without falsely failing a sound temporal model.
+        """
+        rw_data._skip_if_insufficient()
+        if len(rw_data.paired_temporal_scores) != len(rw_data.paired_scores):
+            pytest.skip(
+                "paired_temporal_scores not populated — temporal model may have "
+                "fallen back to baseline due to missing labels."
+            )
+
+        rho_baseline = float(spearmanr(
+            rw_data.paired_scores, rw_data.paired_adverse_scores
+        )[0])
+        rho_temporal = float(spearmanr(
+            rw_data.paired_temporal_scores, rw_data.paired_adverse_scores
+        )[0])
+
+        TOLERANCE = 0.05
+        print(
+            f"\n  Spearman rho — baseline:  {rho_baseline:+.4f}  "
+            f"temporal: {rho_temporal:+.4f}  "
+            f"delta: {rho_temporal - rho_baseline:+.4f}"
+        )
+        assert rho_temporal >= rho_baseline - TOLERANCE, (
+            f"Temporal model Spearman rho ({rho_temporal:.4f}) is more than "
+            f"{TOLERANCE} below baseline ({rho_baseline:.4f}).  "
+            "Temporal label augmentation may be introducing noise or the real-label "
+            "distribution is very different from the pseudo-label distribution."
+        )
+
+    def test_temporal_label_coverage_report(self, rw_data: RealWorldData):
+        """Diagnostic: print a summary comparing temporal vs pseudo label stats.
+
+        Always passes.  Provides a structured comparison useful for reviewing
+        whether real adverse labels are systematically higher or lower than
+        the pseudo-labels for the same establishments.
+        """
+        if not rw_data.temporal_rows:
+            pytest.skip("No temporal training labels — see test_temporal_label_build_sample_nonempty")
+
+        real_labels   = np.array([r["real_label"]   for r in rw_data.temporal_rows])
+        pseudo_labels = np.array([r["pseudo_label"] for r in rw_data.temporal_rows])
+        raw_labels    = np.array([r["real_label_raw"] for r in rw_data.temporal_rows])
+
+        col_w = 70
+        sep   = "=" * col_w
+        print("\n" + sep)
+        print("TEMPORAL LABEL COVERAGE REPORT")
+        print(sep)
+        print(f"  Training label pairs     : {len(rw_data.temporal_rows):,}")
+        print(f"  Real adverse labels      : mean={real_labels.mean():.2f}  "
+              f"std={real_labels.std():.2f}  "
+              f"median={float(np.median(real_labels)):.2f}  "
+              f"max={real_labels.max():.1f}")
+        print(f"  Raw adverse scores       : mean={raw_labels.mean():.2f}  "
+              f"std={raw_labels.std():.2f}  max={raw_labels.max():.1f}")
+        print(f"  Pseudo-labels (same set) : mean={pseudo_labels.mean():.2f}  "
+              f"std={pseudo_labels.std():.2f}  "
+              f"median={float(np.median(pseudo_labels)):.2f}")
+        delta_mean = real_labels.mean() - pseudo_labels.mean()
+        direction  = "higher" if delta_mean > 0 else "lower"
+        print(f"  Mean real vs pseudo delta: {delta_mean:+.2f}  "
+              f"(real labels are {direction} on average)")
+        corr = float(np.corrcoef(pseudo_labels, real_labels)[0, 1])
+        print(f"  Pearson(pseudo, real)     : {corr:.4f}  "
+              f"({'strong' if abs(corr) > 0.5 else 'moderate' if abs(corr) > 0.3 else 'weak'} "
+              f"agreement)")
+        print(sep)

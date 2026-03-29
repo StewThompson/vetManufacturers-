@@ -20,16 +20,12 @@ function naicsLabel(code: string): string {
 
 interface Props {
   onSelectionChange: (rawNames: string[], displayName: string) => void
-  yearsBack: number
-  onYearsBackChange: (v: number) => void
   isRunning: boolean
   onRun: () => void
 }
 
 export default function SearchCard({
   onSelectionChange,
-  yearsBack,
-  onYearsBackChange,
   isRunning,
   onRun,
 }: Props) {
@@ -331,32 +327,8 @@ export default function SearchCard({
         </div>
       )}
 
-      {/* Years back + run button */}
+      {/* Run button */}
       <div className="card">
-        <div className="card-title">Assessment Window</div>
-
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 12 }}>
-          <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-            Years back: <strong>{yearsBack}</strong>
-          </label>
-
-          <input
-            type="range"
-            min={1}
-            max={3}
-            step={1}
-            value={yearsBack}
-            onChange={(e) => onYearsBackChange(Number(e.target.value))}
-            disabled={isRunning}
-          />
-
-          {/* Optional tick labels */}
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-muted)' }}>
-            <span>1</span>
-            <span>2</span>
-            <span>3</span>
-          </div>
-        </div>
         <button
           className="btn btn-primary btn-full"
           disabled={isRunning || filteredRawNames.length === 0}

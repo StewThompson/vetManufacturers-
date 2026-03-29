@@ -34,7 +34,11 @@ class MLRiskScorer:
     """
     INDUSTRY_MIN_SAMPLE = 10
     # Expand log transformation to more features with large ranges
-    LOG_FEATURE_INDICES = [0, 1, 5, 6, 7, 11, 12, 13, 15]  # log-scale counts, penalties, accident/injury counts
+    # Log-compress only volume counts and accident/fatality/injury rates —
+    # NOT penalty amounts.  Large penalties directly signal severity;
+    # compressing $10K → $1M to 5.5 → 13.8 destroys high-end differentiation.
+    # time_adjusted_penalty (17) is also intentionally unlogged.
+    LOG_FEATURE_INDICES = [0, 1, 11, 12, 13]  # inspection/violation counts, accident/fatality/injury rates
 
     # Canonical 2-digit NAICS sectors for one-hot encoding.
     NAICS_SECTORS = [
@@ -45,7 +49,7 @@ class MLRiskScorer:
     ]
 
     FEATURE_NAMES = [
-        # ── Absolute signals (17) ──────────────────────────────────────
+        # ── Absolute signals (18) ──────────────────────────────────────
         "log_inspections",
         "log_violations",
         "serious_violations",
@@ -63,6 +67,7 @@ class MLRiskScorer:
         "avg_gravity",
         "penalties_per_inspection",
         "clean_ratio",
+        "time_adjusted_penalty",
         # ── Industry-relative z-scores (4) ────────────────────────────
         # 0.0 sentinel when NAICS unavailable
         "relative_violation_rate",
@@ -98,6 +103,7 @@ class MLRiskScorer:
         "avg_gravity": "Avg Violation Gravity",
         "penalties_per_inspection": "Penalties / Inspection ($)",
         "clean_ratio": "Clean Inspection Ratio",
+        "time_adjusted_penalty": "Time-Adjusted Penalty ($)",
         "relative_violation_rate": "Violation Rate vs. Industry (z)",
         "relative_penalty": "Avg Penalty vs. Industry (z)",
         "relative_serious_ratio": "Serious Ratio vs. Industry (z)",
@@ -134,6 +140,32 @@ class MLRiskScorer:
     POP_FILE = "population_data.json"
     CALIBRATOR_FILE = "tail_calibrator.pkl"
 
+    # ── Temporal supervision ──────────────────────────────────────────────
+    # Cutoff used to build the real-label training sample.  Establishments
+    # with inspections before this date get their features aggregated;
+    # those same establishments' post-cutoff inspections become the
+    # real outcome labels that replace circular pseudo-labels during training.
+    #
+    # Pushing this back (earlier than today-minus-1yr) gives a richer paired
+    # sample because more establishments have had time to accumulate post-
+    # cutoff inspections.  The current default (2020-01-01) gives ≥6 years of
+    # outcome data within the 10-year bulk cache.
+    #
+    # NOTE: if TEMPORAL_CUTOFF falls outside the bulk cache window
+    # (< today - 10yr) the labeler will find no pre-cutoff inspections and
+    # fall back gracefully to pseudo-labels only.
+    TEMPORAL_LABEL_CUTOFF = date(2020, 1, 1)
+
+    # Maximum number of real-label rows to add to the training matrix.
+    # 50_000 exceeds the ~30k paired pool so effectively "use all paired rows".
+    TEMPORAL_SAMPLE_SIZE = 50_000
+
+    # Weight multiplier applied to real-label training rows.
+    # 8× gives real-label rows ~27% of the effective gradient signal even
+    # when the pseudo-label population is 10× larger.  Real labels are direct
+    # OSHA observations and should outweigh the heuristic pseudo-labels.
+    TEMPORAL_LABEL_WEIGHT = 8.0
+
     def __init__(self, osha_client=None):
         self.osha_client = osha_client
         self.pipeline: Optional[Pipeline] = None
@@ -141,6 +173,7 @@ class MLRiskScorer:
         self._industry_stats: dict = {}
         self._calibrator: Optional[TailCalibrator] = None
         self._naics_map: dict = load_naics_map()
+        self._n_temporal_labels: int = 0  # set by _train(); 0 when not yet trained
         os.makedirs(self.CACHE_DIR, exist_ok=True)
         self._load_or_build()
 
@@ -200,6 +233,7 @@ class MLRiskScorer:
         fat_count = 0
         inj_count = 0
         gravities: list = []
+        time_adj_pen = 0.0
 
         naics_votes: Counter = Counter()
 
@@ -212,8 +246,11 @@ class MLRiskScorer:
             repeat_raw  += sum(1 for v in viols if v.is_repeat)
 
             pens = [v.penalty_amount for v in viols]
-            total_pen += sum(pens)
+            insp_pen = sum(pens)
+            total_pen += insp_pen
             all_penalties.extend(pens)
+            age_years = max(0.0, (date.today() - r.date_opened).days / 365.25)
+            time_adj_pen += insp_pen * math.exp(-age_years / 3.0)
 
             if r.date_opened >= one_year_ago:
                 recent += 1
@@ -266,6 +303,7 @@ class MLRiskScorer:
             total_pen, avg_pen, max_pen, recent_ratio, severe_rate, vpi,
             acc_rate, fat_rate, inj_rate, avg_gravity,
             pen_per_insp, clean_ratio,
+            time_adj_pen,
         ]
 
         return features_17, naics_code, vpi, avg_pen, raw_serious_rate, raw_wr_rate
@@ -376,6 +414,7 @@ class MLRiskScorer:
             acc_count = 0
             fat_count = 0
             inj_count = 0
+            time_adj_pen = 0.0
 
             # Majority-vote NAICS code for this establishment
             naics_votes: dict = defaultdict(int)
@@ -386,9 +425,15 @@ class MLRiskScorer:
                     d = date.fromisoformat(od[:10])
                     if d >= one_year_ago:
                         recent += 1
+                    age_years = max(0.0, (date.today() - d).days / 365.25)
                 except (ValueError, TypeError):
-                    pass
+                    age_years = 0.0
                 insp_viols = client.get_violations_for_activity(act)
+                insp_pen = sum(
+                    float(v.get("current_penalty") or v.get("initial_penalty") or 0)
+                    for v in insp_viols
+                )
+                time_adj_pen += insp_pen * math.exp(-age_years / 3.0)
                 viols.extend(insp_viols)
                 if not insp_viols:
                     clean += 1
@@ -456,6 +501,7 @@ class MLRiskScorer:
                     total_pen, avg_pen, max_pen, recent_ratio, severe_rate, vpi,
                     acc_rate, fat_rate, inj_rate, avg_gravity,
                     pen_per_insp, clean_ratio,
+                    time_adj_pen,
                     # Relative features will be appended below
                 ],
                 # Scratch fields for industry stats — removed before persisting
@@ -515,45 +561,165 @@ class MLRiskScorer:
         return population
 
     # ------------------------------------------------------------------ #
+    #  Temporal label loading
+    # ------------------------------------------------------------------ #
+
+    def _load_temporal_labels(self) -> List[Dict]:
+        """Load (or build) the real-label training sample from the bulk cache.
+
+        Returns a list of row-dicts from ``temporal_labeler.load_or_build``.
+        Returns an empty list when the bulk CSVs are unavailable or the build
+        fails gracefully, so callers can treat it as an optional augmentation.
+        """
+        from src.scoring.labeling.temporal_labeler import load_or_build_temporal_labels
+
+        insp_path = os.path.join(self.CACHE_DIR, "inspections_bulk.csv")
+        viol_path = os.path.join(self.CACHE_DIR, "violations_bulk.csv")
+        acc_path  = os.path.join(self.CACHE_DIR, "accidents_bulk.csv")
+        inj_path  = os.path.join(self.CACHE_DIR, "accident_injuries_bulk.csv")
+
+        outcome_end = date.today()  # use all available post-cutoff data
+
+        try:
+            rows = load_or_build_temporal_labels(
+                scorer=self,
+                cutoff_date=self.TEMPORAL_LABEL_CUTOFF,
+                outcome_end_date=outcome_end,
+                cache_dir=self.CACHE_DIR,
+                inspections_path=insp_path,
+                violations_path=viol_path,
+                accidents_path=acc_path,
+                injuries_path=inj_path,
+                naics_map=self._naics_map,
+                sample_size=self.TEMPORAL_SAMPLE_SIZE,
+            )
+        except Exception as e:
+            print(f"  Temporal label build failed ({e}); using pseudo-labels only.")
+            rows = []
+        return rows
+
+    # ------------------------------------------------------------------ #
     #  Model training
     # ------------------------------------------------------------------ #
     def _train(self, population: List[Dict]):
-        """Build feature matrix, generate pseudo-labels, train pipeline."""
+        """Build feature matrix, generate pseudo-labels, train pipeline.
+
+        Training label strategy
+        -----------------------
+        Step 1 — Pseudo-label population (all ~370k establishments):
+            Each row receives a heuristic pseudo-label computed from raw
+            OSHA features.  These form the bulk of the training set and
+            ensure the model covers all industries and risk levels.
+
+        Step 2 — Real-label augmentation (≤ TEMPORAL_SAMPLE_SIZE rows):
+            A stratified sample of paired establishments (pre-TEMPORAL_LABEL_
+            CUTOFF features → post-cutoff real adverse outcomes) is appended
+            to the training matrix.  These rows break the circular dependency
+            for the labeled fraction.
+
+            Real-label rows use features aggregated from pre-cutoff inspections
+            only (LEAKAGE GUARD: no future information in features).  Their
+            pre-cutoff feature distribution is compatible with the full-history
+            population because all features are per-inspection RATES.
+
+            A TEMPORAL_LABEL_WEIGHT × sample-weight multiplier ensures real
+            labels exert proportionally more influence on the loss than
+            pseudo-labels (which have higher uncertainty).
+
+        Step 3 — 80/20 split and tail calibration:
+            The augmented matrix is split 80/20.  The 20% calibration fold
+            is drawn from the pseudo-label population only (real-label rows
+            all go into training) so the calibrator still maps raw GBR scores
+            onto the pseudo-label scale for backward compatibility.
+        """
         # X_raw may contain NaN in z-score features for NAICS-missing rows.
         # Pseudo-labels use only absolute signals + naics_unknown flag;
         # the model trains on NaN→0.0 matrix for z-scores.
         X_raw = np.array([p["features"] for p in population], dtype=float)
-        y = np.array([self._pseudo_label(row) for row in X_raw])  # labels from raw values
-        X = np.nan_to_num(X_raw, nan=0.0)
-        X = self._log_transform_features(X)  # model trains on log-scaled counts
+        y_pseudo = np.array([self._pseudo_label(row) for row in X_raw])
+        X_pop = np.nan_to_num(X_raw, nan=0.0)
+        X_pop = self._log_transform_features(X_pop)
 
-        # ── 80/20 split: train GBR on 80%, fit calibrator on held-out 20% ─
-        # Using a random split (not temporal) because the population dict
-        # carries no date field.  Fitting the calibrator on held-out data
-        # ensures it corrects GBR compression without overfitting to the
-        # training targets.
+        # ── Step 2: load real-label augmentation rows ─────────────────────
+        temporal_rows = self._load_temporal_labels()
+        n_real = len(temporal_rows)
+
+        if n_real > 0:
+            X_real_raw = np.array(
+                [r["features_46"] for r in temporal_rows], dtype=float
+            )
+            X_real_raw = np.nan_to_num(X_real_raw, nan=0.0)
+            X_real = self._log_transform_features(X_real_raw)
+            y_real = np.array([r["real_label"] for r in temporal_rows], dtype=float)
+            print(
+                f"  Temporal label augmentation: {n_real:,} real-label rows added "
+                f"(cutoff={self.TEMPORAL_LABEL_CUTOFF}).  "
+                f"Real label mean={y_real.mean():.1f}  "
+                f"pseudo mean={y_pseudo.mean():.1f}"
+            )
+        else:
+            print("  No temporal labels available; training on pseudo-labels only.")
+
+        # ── Step 2b: rescale pseudo-labels to match real adverse distribution ──
+        # Pseudo-labels are heuristic proxies that systematically over-predict
+        # (mean≈29 vs real adverse mean≈12).  When real-label rows are present,
+        # we z-score the pseudo-labels to share the same mean and std as the
+        # real distribution.  This removes the contradictory gradient pull
+        # (pseudo rows pushing toward 29, real rows pushing toward 12) while
+        # preserving the rank structure (Spearman ρ≈0.25 with real adverses).
+        if n_real >= 10:
+            p_mean = float(y_pseudo.mean())
+            p_std  = max(float(y_pseudo.std()), 1e-6)
+            r_mean = float(y_real.mean())
+            r_std  = max(float(y_real.std()), 1e-6)
+            y_pseudo = np.clip(
+                (y_pseudo - p_mean) * (r_std / p_std) + r_mean, 0.0, 100.0
+            )
+            print(
+                f"  Pseudo-labels rescaled: mean {p_mean:.1f}->{y_pseudo.mean():.1f}  "
+                f"std {p_std:.1f}->{y_pseudo.std():.1f}  "
+                f"(matched to real adverse distribution)"
+            )
+
+        # ── Step 3: 80/20 split on the pseudo-label population ────────────
+        # Real-label rows are always placed in the training fold so that the
+        # calibration fold remains purely pseudo-label for backward compat.
         rng = np.random.default_rng(42)
-        n = len(X)
-        idx = rng.permutation(n)
-        split = int(n * 0.8)
+        n_pop = len(X_pop)
+        idx = rng.permutation(n_pop)
+        split = int(n_pop * 0.8)
         train_idx, cal_idx = idx[:split], idx[split:]
-        X_train, y_train = X[train_idx], y[train_idx]
-        X_cal, y_cal = X[cal_idx], y[cal_idx]
+
+        X_train_pop, y_train_pop = X_pop[train_idx], y_pseudo[train_idx]
+        X_cal,        y_cal       = X_pop[cal_idx],   y_pseudo[cal_idx]
+
+        # ── Combine pseudo-label train fold with real-label rows ──────────
+        if n_real > 0:
+            X_train = np.vstack([X_train_pop, X_real])
+            y_train = np.concatenate([y_train_pop, y_real])
+        else:
+            X_train = X_train_pop
+            y_train = y_train_pop
+
         # ── Tail sample weights ───────────────────────────────────────────
         # Ramp starts at the Recommend→Caution boundary (y=30) rather than 40
         # to give the model a stronger gradient signal throughout the Caution
         # band.  Steeper slope (1 unit per 10 score points) and an 8× cap
-        # (vs. the old 3×) counteract the 79:1 class imbalance between
-        # Recommend and Do-Not-Recommend establishments.
-        sw_train = np.clip(1.0 + np.maximum(0.0, y_train - 30.0) / 10.0, 1.0, 8.0)
+        # counteract the 79:1 class imbalance between Recommend and
+        # Do-Not-Recommend establishments.
+        sw_pseudo = np.clip(1.0 + np.maximum(0.0, y_train_pop - 30.0) / 10.0, 1.0, 8.0)
+        if n_real > 0:
+            # Flat weight for real rows — no tail ramp.
+            # Real adverse labels are direct observations; their own magnitude
+            # already encodes severity.  Applying the pseudo-label tail ramp
+            # (calibrated for mean=29) to real labels (mean≈12) would suppress
+            # most real rows to near-1× weight, negating the multiplier.
+            sw_real   = np.full(len(y_real), self.TEMPORAL_LABEL_WEIGHT, dtype=float)
+            sw_train  = np.concatenate([sw_pseudo, sw_real])
+        else:
+            sw_train = sw_pseudo
 
-        # ── Model: Huber loss + higher capacity + min leaf ────────────
-        # Huber loss (alpha=0.9 ≈ 90th-percentile transition) is less
-        # aggressive than squared-error at penalising tail deviations,
-        # reducing regression of high-scored establishments toward the mean.
-        # n_estimators 300 → 400 gives the model more capacity to learn
-        # the thinly-populated tail; min_samples_leaf=3 prevents over-
-        # smoothing of the rare extreme examples.
+        # ── Model: Huber loss + higher capacity + min leaf ────────────────
         self.pipeline = Pipeline([
             ("scaler", StandardScaler()),
             ("model", GradientBoostingRegressor(
@@ -567,22 +733,30 @@ class MLRiskScorer:
                 random_state=42,
             )),
         ])
-        # Pipeline.fit() routes extra kwargs to the final estimator via
-        # the "stepname__param" convention.
         self.pipeline.fit(X_train, y_train, model__sample_weight=sw_train)
-        self.population_features = X
+        self.population_features = X_pop
+        self._n_temporal_labels = n_real  # stored for diagnostics / tests
 
-        # ── Fit tail calibrator on held-out 20% ───────────────────────
-        # Predicts raw scores for the calibration fold and maps them to
-        # the pseudo-labels those establishments should have received.
-        # This corrects for GBR's MSE-driven tail compression without
-        # touching the rank order of any two establishments.
-        cal_preds = self.pipeline.predict(X_cal)
+        # ── Fit calibrator on real-label pairs (raw_pred → real adverse) ─────
+        # TailCalibrator was designed to fit on (raw_score, future_adverse).
+        # Using pseudo-labels here was feeding it circular targets (the same
+        # heuristic the model was trained to reproduce).  Real adverse outcomes
+        # are the correct calibration target: they tell the calibrator exactly
+        # how each raw prediction level maps to observed future compliance harm.
         self._calibrator = TailCalibrator()
-        self._calibrator.fit(cal_preds, y_cal)
+        if n_real >= 10:
+            pred_real = self.pipeline.predict(X_real)
+            self._calibrator.fit(pred_real, y_real)
+            _cal_note = f"{n_real:,} real-label pairs (pred → real adverse outcome)"
+        else:
+            # Fallback when temporal labels unavailable
+            cal_preds = self.pipeline.predict(X_cal)
+            self._calibrator.fit(cal_preds, y_cal)
+            _cal_note = f"{len(X_cal):,} pseudo-label holdout rows"
         print(
-            f"ML Risk Model trained on {len(X_train)} establishments "
-            f"(calibrator fitted on {len(X_cal)})."
+            f"ML Risk Model trained on {len(X_train):,} rows "
+            f"({len(X_train_pop):,} pseudo-label + {n_real:,} real-label);  "
+            f"calibrator fitted on {_cal_note}."
         )
 
     # ------------------------------------------------------------------ #
@@ -917,6 +1091,7 @@ class MLRiskScorer:
                 "city": city,
                 "state": state,
                 "evidence_capped": evidence_capped,
+                "_log_feats": log_feats,  # retained for MT per-site scoring; stripped before API serialisation
             })
             total_inspections += n
 
@@ -953,6 +1128,9 @@ class MLRiskScorer:
         # Aggregate features (all records as one blob) for display
         agg_feats = self.extract_features(records) if records else None
 
+        # Per-site log-transformed feature arrays for MT model per-site scoring
+        per_site_features = [s.get("_log_feats") for s in site_scores]
+
         return {
             "weighted_avg_score": round(weighted_avg, 1),
             "max_score": round(max_score, 1),
@@ -962,6 +1140,7 @@ class MLRiskScorer:
             "risk_concentration": round(risk_concentration, 2),
             "systemic_risk_flag": systemic,
             "aggregate_features": agg_feats,
+            "per_site_features": per_site_features,
         }
 
     # ------------------------------------------------------------------ #

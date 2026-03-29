@@ -1,15 +1,31 @@
-from typing import List
+from typing import List, Optional
+import math
 from datetime import date, timedelta
 
 from src.models.manufacturer import Manufacturer
 from src.models.osha_record import OSHARecord
-from src.models.assessment import RiskAssessment
+from src.models.assessment import RiskAssessment, ProbabilisticRiskTargets
 from src.scoring.ml_risk_scorer import MLRiskScorer
+from src.scoring.score_outlook import compute_12m_outlook
+
+# Bühlmann credibility prior: sites with fewer than K inspections regress
+# toward the portfolio mean; K=5 matches NCCI workers'-comp experience-rating.
+_CREDIBILITY_K = 5
+
+# Tail-exposure blend: final composite = (1-α)*credibility_mean + α*max_composite
+# where α scales with risk_concentration so concentrated risk weighs the worst
+# site more heavily (capped at 30% to avoid max dominating large clean portfolios).
+_TAIL_BLEND_MAX_ALPHA = 0.30
 
 
 class RiskAssessor:
     def __init__(self, osha_client=None):
         self.ml_scorer = MLRiskScorer(osha_client=osha_client)
+        # Load multi-target scorer lazily (no exception if not yet built)
+        from src.scoring.multi_target_scorer import MultiTargetRiskScorer
+        self._mt_scorer: Optional[MultiTargetRiskScorer] = (
+            MultiTargetRiskScorer.load_if_exists(self.ml_scorer.CACHE_DIR)
+        )
 
     def assess(self, manufacturer: Manufacturer, records: List[OSHARecord]) -> RiskAssessment:
         """
@@ -18,7 +34,7 @@ class RiskAssessor:
         """
         print(f"Assessing risk for: {manufacturer.name} based on {len(records)} records.")
 
-        # --- ML scoring ---
+        # --- ML scoring (legacy GBR — provides features, percentiles, site scores) ---
         ml_result = self.ml_scorer.score(records)
         risk_score = ml_result["risk_score"]
         percentile_rank = ml_result["percentile_rank"]
@@ -38,18 +54,163 @@ class RiskAssessor:
         aggregation_warning = ml_result.get("aggregation_warning", "")
         concentration_warning = ml_result.get("concentration_warning", "")
 
+        # ── Multi-target probabilistic predictions ─────────────────────
+        # Canonical approach: run the MT model **per establishment**, then
+        # aggregate per-site composites using Bühlmann credibility theory.
+        #
+        # Rationale: pooling all records across N sites conflates per-inspection
+        # rates — one low-risk site with 100 inspections can drown out a
+        # high-risk site with 5 inspections.  Per-site scoring then credibility-
+        # weighted aggregation (same math as NCCI workers'-comp experience
+        # rating) preserves site-level signal throughout.
+        #
+        # Fallback: when per-site features are unavailable, falls back to the
+        # legacy pooled approach so single-establishment companies are unaffected.
+        risk_targets_obj: Optional[ProbabilisticRiskTargets] = None
+        mt_predictions: Optional[dict] = None  # used by compute_12m_outlook
+
+        if self._mt_scorer is not None and self._mt_scorer.is_fitted:
+            try:
+                from src.scoring.penalty_percentiles import load_percentiles, lookup_threshold
+                import os
+                from collections import Counter
+
+                thresh_path = os.path.join(self.ml_scorer.CACHE_DIR, "penalty_percentiles.json")
+                thresholds  = load_percentiles(thresh_path)
+                naics_votes = Counter(r.naics_code for r in records if r.naics_code)
+                top_naics   = naics_votes.most_common(1)[0][0] if naics_votes else None
+                naics_2d    = str(top_naics)[:2] if top_naics else None
+                p90_thresh  = lookup_threshold(thresholds, naics_2d, "p90")
+
+                per_site_features = ml_result.get("per_site_features", [])
+                has_per_site = (
+                    len(per_site_features) == len(site_scores)
+                    and all(f is not None for f in per_site_features)
+                )
+
+                if has_per_site and establishment_count >= 2:
+                    # ── Per-site MT scoring ───────────────────────────────
+                    site_composites: list[float] = []
+                    site_n_insps:    list[int]   = []
+                    per_site_preds:  list[dict]  = []
+
+                    for site, log_feats in zip(site_scores, per_site_features):
+                        n_site = site["n_inspections"]
+                        site_records = [r for r in records
+                                        if (r.estab_name or "UNKNOWN").upper().strip()
+                                        == site["name"]]
+                        has_fat = any(a.fatality for r in site_records for a in r.accidents)
+                        has_wil = any(v.is_willful for r in site_records for v in r.violations)
+
+                        pred = self._mt_scorer.predict(log_feats[0])
+                        comp = self._mt_scorer.composite_score(
+                            pred,
+                            n_inspections=n_site,
+                            has_fatality=has_fat,
+                            has_willful=has_wil,
+                        )
+                        site_composites.append(comp)
+                        site_n_insps.append(n_site)
+                        per_site_preds.append(pred)
+
+                    # ── Bühlmann credibility aggregation ─────────────────
+                    # Step 1: compute portfolio prior (simple mean — no self-
+                    # referential dependence on the value we're computing).
+                    portfolio_prior = sum(site_composites) / len(site_composites)
+
+                    # Step 2: credibility-adjust each site score.
+                    credible = []
+                    for comp_i, n_i in zip(site_composites, site_n_insps):
+                        Z = n_i / (n_i + _CREDIBILITY_K)
+                        credible.append(Z * comp_i + (1.0 - Z) * portfolio_prior)
+
+                    credibility_mean = sum(credible) / len(credible)
+                    max_credible     = max(credible)
+
+                    # Step 3: tail-exposure blend — weight worst site more
+                    # heavily when risk is concentrated across many sites.
+                    alpha = min(risk_concentration * _TAIL_BLEND_MAX_ALPHA, _TAIL_BLEND_MAX_ALPHA)
+                    composite = (1.0 - alpha) * credibility_mean + alpha * max_credible
+
+                    # For the outlook and RiskTargets, use the portfolio-level
+                    # predictions from the pooled features (rates are already
+                    # well-defined at portfolio level for forward projection).
+                    agg_X = ml_result.get("_aggregate_features_raw")
+                    if agg_X is None:
+                        agg_X = self.ml_scorer.extract_features(records)
+                    mt_predictions = self._mt_scorer.predict(agg_X[0])
+
+                    # Weighted-average the per-head probabilities for RiskTargets display
+                    total_n = sum(site_n_insps)
+                    def _wavg(key: str) -> float:
+                        return sum(p[key] * n for p, n in zip(per_site_preds, site_n_insps)) / total_n
+
+                    mt_predictions = {
+                        "p_serious_wr_event":  _wavg("p_serious_wr_event"),
+                        "expected_penalty_usd": _wavg("expected_penalty_usd"),
+                        "expected_citations":   _wavg("expected_citations"),
+                        "p_moderate_penalty":  _wavg("p_moderate_penalty"),
+                        "p_large_penalty":     _wavg("p_large_penalty"),
+                        "p_extreme_penalty":   _wavg("p_extreme_penalty"),
+                    }
+
+                else:
+                    # Single establishment or missing per-site features — pooled path unchanged
+                    agg_X = ml_result.get("_aggregate_features_raw")
+                    if agg_X is None:
+                        agg_X = self.ml_scorer.extract_features(records)
+                    mt_predictions = self._mt_scorer.predict(agg_X[0])
+
+                    n_total_insp = len(records)
+                    has_fatality = any(a.fatality for r in records for a in r.accidents)
+                    has_willful  = any(v.is_willful for r in records for v in r.violations)
+                    composite = self._mt_scorer.composite_score(
+                        mt_predictions,
+                        n_inspections=n_total_insp,
+                        has_fatality=has_fatality,
+                        has_willful=has_willful,
+                    )
+
+                risk_targets_obj = ProbabilisticRiskTargets(
+                    p_serious_wr_event=round(mt_predictions["p_serious_wr_event"], 4),
+                    expected_penalty_usd_12m=round(mt_predictions["expected_penalty_usd"], 2),
+                    expected_citations_12m=round(mt_predictions["expected_citations"], 2),
+                    p_moderate_penalty_event=round(mt_predictions["p_moderate_penalty"], 4),
+                    p_large_penalty_event=round(mt_predictions["p_large_penalty"], 4),
+                    p_extreme_penalty_event=round(mt_predictions["p_extreme_penalty"], 4),
+                    composite_risk_score=round(composite, 1),
+                    large_penalty_threshold_usd=round(p90_thresh, 0),
+                )
+
+                # Promote composite to canonical risk_score so score, recommendation,
+                # and outlook band are all consistent.
+                risk_score = round(composite, 1)
+
+            except Exception as _mt_err:
+                print(f"  [RiskAssessor] Multi-target prediction failed: {_mt_err}")
+
         # --- Recommendation ---
-        # For multi-establishment companies, "Do Not Recommend" requires
-        # systemic risk — not just one bad site inflating the aggregate.
+        # Derived from the final risk_score (composite when MT model is available,
+        # legacy GBR score otherwise).
+        #
+        # Multi-site rule: "Do Not Recommend" requires systemic risk spread across
+        # sites — a single bad actor in a large portfolio should not trigger a
+        # blanket rejection.  However, any site individually scoring ≥ 70 caps
+        # the recommendation at "Proceed with Caution" (worst-site exposure floor).
+        worst_site_score = max((s["score"] for s in site_scores), default=0.0)
+
         if risk_score >= 60 and (establishment_count <= 1 or systemic_risk_flag):
             recommendation = "Do Not Recommend"
         elif risk_score >= 60:
-            # High aggregate but risk not systemic — flag caution with
-            # per-site context instead of a blanket rejection.
             recommendation = "Proceed with Caution"
         elif risk_score < 30:
             recommendation = "Recommend"
         else:
+            recommendation = "Proceed with Caution"
+
+        # Worst-site exposure: if any single establishment carries very high risk,
+        # the portfolio cannot be recommended regardless of aggregate dilution.
+        if recommendation == "Recommend" and worst_site_score >= 70:
             recommendation = "Proceed with Caution"
 
         # --- Explanation ---
@@ -69,6 +230,13 @@ class RiskAssessor:
         explanation = "\n".join(explanation_lines)
 
         confidence = 0.9 if records else 0.4
+
+        outlook = compute_12m_outlook(
+            risk_score=risk_score,
+            features=features,
+            n_sites=establishment_count,
+            risk_targets=mt_predictions,
+        )
 
         return RiskAssessment(
             manufacturer=manufacturer,
@@ -90,6 +258,8 @@ class RiskAssessor:
             systemic_risk_flag=systemic_risk_flag,
             aggregation_warning=aggregation_warning,
             concentration_warning=concentration_warning,
+            outlook=outlook,
+            risk_targets=risk_targets_obj,
         )
 
     # ------------------------------------------------------------------ #

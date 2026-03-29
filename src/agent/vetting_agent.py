@@ -60,10 +60,12 @@ class VettingAgent:
 
         if self.osha_client._use_sqlite:
             for raw in raw_names:
-                # Use company_match_key for consistent lookup with how build_cache stores keys
-                key = self.osha_client.company_match_key(raw.upper()).upper()
+                # Query by estab_name directly so only the selected facility's
+                # inspections are returned, not every facility sharing the same
+                # company_key across all states.
                 rows = self.osha_client._db_rows(
-                    "SELECT * FROM inspections WHERE company_key = ?", (key,)
+                    "SELECT * FROM inspections WHERE estab_name = ? COLLATE NOCASE",
+                    (raw.upper(),),
                 )
                 for row in rows:
                     act_nr = str(row.get("activity_nr", ""))
@@ -72,19 +74,12 @@ class VettingAgent:
                         all_inspections.append(row)
         else:
             for raw in raw_names:
-                # _inspections_by_estab is keyed by raw estab_name, not company key.
-                # Use _estab_names_for_company to expand the company key to all its
-                # individual establishment names first (same logic as _search_cache).
-                key = self.osha_client.company_match_key(raw.upper()).upper()
-                estab_names = self.osha_client._estab_names_for_company.get(key, [])
-                if not estab_names and raw.upper() in self.osha_client._inspections_by_estab:
-                    estab_names = [raw.upper()]
-                for estab in estab_names:
-                    for insp in self.osha_client._inspections_by_estab.get(estab, []):
-                        act_nr = str(insp.get("activity_nr", ""))
-                        if act_nr and act_nr not in seen_activity_nrs:
-                            seen_activity_nrs.add(act_nr)
-                            all_inspections.append(insp)
+                # _inspections_by_estab is keyed by uppercase raw estab_name.
+                for insp in self.osha_client._inspections_by_estab.get(raw.upper(), []):
+                    act_nr = str(insp.get("activity_nr", ""))
+                    if act_nr and act_nr not in seen_activity_nrs:
+                        seen_activity_nrs.add(act_nr)
+                        all_inspections.append(insp)
 
         print(f"  vet_by_raw_estab_names: {len(raw_names)} selected name(s) → "
               f"{len(seen_activity_nrs)} unique inspections")

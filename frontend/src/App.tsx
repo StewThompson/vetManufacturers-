@@ -4,7 +4,9 @@ import type { AssessmentResponse, SSEEvent } from './types/assessment'
 import SearchCard from './components/SearchCard'
 import ProgressStream, {
   ExplanationPanel,
+  OutlookPanel,
   RiskBanner,
+  RiskTargetsPanel,
   StatsGrid,
 } from './components/AssessmentResult'
 import ViolationsGrid from './components/ViolationsGrid'
@@ -16,7 +18,6 @@ type Tab = 'overview' | 'violations' | 'sites' | 'details'
 export default function App() {
   const [selectedRawNames, setSelectedRawNames] = useState<string[]>([])
   const [displayName, setDisplayName] = useState<string>('')
-  const [yearsBack, setYearsBack] = useState(10)
   const [isRunning, setIsRunning] = useState(false)
   const [progress, setProgress] = useState<string[]>([])
   const [result, setResult] = useState<AssessmentResponse | null>(null)
@@ -57,10 +58,10 @@ export default function App() {
     }
 
     cleanupRef.current = openAssessStream(
-      { raw_names: selectedRawNames, display_name: displayName, years_back: yearsBack },
+      { raw_names: selectedRawNames, display_name: displayName, years_back: 10 },
       handleEvent,
     )
-  }, [selectedRawNames, displayName, yearsBack])
+  }, [selectedRawNames, displayName])
 
   const tabs: { id: Tab; label: string }[] = [
     { id: 'overview', label: 'Overview' },
@@ -86,8 +87,6 @@ export default function App() {
         <aside className="sidebar">
           <SearchCard
             onSelectionChange={handleSelectionChange}
-            yearsBack={yearsBack}
-            onYearsBackChange={setYearsBack}
             isRunning={isRunning}
             onRun={handleRun}
           />
@@ -132,10 +131,18 @@ export default function App() {
               </div>
 
               {tab === 'overview' && (
-                <div className="card">
-                  <div className="card-title">Summary</div>
-                  <p className="explanation-text">{result.explanation}</p>
-                </div>
+                <>
+                  {result.risk_targets && (
+                    <RiskTargetsPanel targets={result.risk_targets} />
+                  )}
+                  {result.outlook && (
+                    <OutlookPanel outlook={result.outlook} />
+                  )}
+                  <div className="card">
+                    <div className="card-title">Summary</div>
+                    <p className="explanation-text">{result.explanation}</p>
+                  </div>
+                </>
               )}
 
               {tab === 'violations' && (

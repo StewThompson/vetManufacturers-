@@ -297,6 +297,135 @@ def build_sqlite_db():
 
 
 # ------------------------------------------------------------------ #
+#  Multi-target model helpers
+# ------------------------------------------------------------------ #
+def _build_penalty_percentiles(scorer):
+    """Compute NAICS-stratified P75/P90/P95 from violations_bulk.csv.
+
+    Uses only training-period data (pre-TEMPORAL_LABEL_CUTOFF) to avoid
+    leakage into the multi-target outcome labels.
+    """
+    import pandas as pd
+    from src.scoring.penalty_percentiles import (
+        compute_penalty_percentiles,
+        save_percentiles,
+        CACHE_FILENAME,
+    )
+
+    viol_path = os.path.join(CACHE_DIR, "violations_bulk.csv")
+    if not os.path.exists(viol_path):
+        print("  WARNING: violations_bulk.csv not found; skipping penalty percentiles.")
+        return
+
+    cutoff_str = scorer.TEMPORAL_LABEL_CUTOFF.isoformat()
+    insp_path  = os.path.join(CACHE_DIR, "inspections_bulk.csv")
+
+    # Build activity_nr → naics_code mapping from inspections (violations lack naics_code)
+    naics_by_act: dict = {}
+    if os.path.exists(insp_path):
+        print("  Building activity_nr → NAICS map from inspections …")
+        with open(insp_path, "r", newline="", encoding="utf-8", errors="replace") as f:
+            for row in csv.DictReader(f):
+                act   = row.get("activity_nr", "").strip()
+                naics = row.get("naics_code",  "").strip()
+                if act and naics:
+                    naics_by_act[act] = naics[:2]
+        print(f"  {len(naics_by_act):,} inspection records indexed")
+
+    print(f"  Reading violations pre-{cutoff_str} for threshold computation …")
+
+    rows = []
+    csv.field_size_limit(10 * 1024 * 1024)
+    with open(viol_path, "r", newline="", encoding="utf-8", errors="replace") as f:
+        for row in csv.DictReader(f):
+            iso = row.get("issuance_date", "")[:10]
+            if iso and iso < cutoff_str:
+                penalty = float(
+                    row.get("current_penalty") or row.get("initial_penalty") or 0
+                )
+                act      = row.get("activity_nr", "").strip()
+                naics_2d = naics_by_act.get(act, "__unknown__")
+                if penalty > 0:
+                    rows.append({"naics_2digit": naics_2d, "penalty_amount": penalty})
+
+    if not rows:
+        print("  No pre-cutoff violations found; skipping penalty percentiles.")
+        return
+
+    df = pd.DataFrame(rows)
+    thresholds = compute_penalty_percentiles(df, min_group_n=50)
+    out_path   = os.path.join(CACHE_DIR, CACHE_FILENAME)
+    save_percentiles(thresholds, out_path)
+    print(
+        f"  Penalty percentiles: {len(thresholds)-1} NAICS groups + global fallback "
+        f"→ {out_path}"
+    )
+    global_t = thresholds["__global__"]
+    print(
+        f"    Global: P75=${global_t['p75']:,.0f}  "
+        f"P90=${global_t['p90']:,.0f}  P95=${global_t['p95']:,.0f}"
+    )
+
+
+def _build_multi_target_model(scorer):
+    """Train and save MultiTargetRiskScorer from the bulk cache CSVs."""
+    import numpy as np
+    from src.scoring.multi_target_labeler import load_or_build as _mt_load_or_build
+    from src.scoring.multi_target_scorer import MultiTargetRiskScorer, MODEL_FILE
+    from src.scoring.penalty_percentiles import load_percentiles, CACHE_FILENAME
+    from datetime import date as _date
+
+    insp_path   = os.path.join(CACHE_DIR, "inspections_bulk.csv")
+    viol_path   = os.path.join(CACHE_DIR, "violations_bulk.csv")
+    acc_path    = os.path.join(CACHE_DIR, "accidents_bulk.csv")
+    inj_path    = os.path.join(CACHE_DIR, "accident_injuries_bulk.csv")
+    thresh_path = os.path.join(CACHE_DIR, CACHE_FILENAME)
+
+    for p, label in [
+        (insp_path,  "inspections_bulk.csv"),
+        (viol_path,  "violations_bulk.csv"),
+    ]:
+        if not os.path.exists(p):
+            print(f"  WARNING: {label} not found; skipping multi-target model.")
+            return
+
+    penalty_thresholds = load_percentiles(thresh_path)
+    cutoff_date        = scorer.TEMPORAL_LABEL_CUTOFF
+    outcome_end        = _date.today()
+
+    rows = _mt_load_or_build(
+        scorer=scorer,
+        cutoff_date=cutoff_date,
+        outcome_end_date=outcome_end,
+        cache_dir=CACHE_DIR,
+        inspections_path=insp_path,
+        violations_path=viol_path,
+        accidents_path=acc_path,
+        injuries_path=inj_path,
+        naics_map=scorer._naics_map,
+        penalty_thresholds=penalty_thresholds,
+        sample_size=scorer.TEMPORAL_SAMPLE_SIZE,
+    )
+
+    if len(rows) < 50:
+        print(f"  Only {len(rows)} multi-target rows; skipping model training.")
+        return
+
+    # Build feature matrix (log-transformed, same as training)
+    X_raw = np.array([r["features_46"] for r in rows], dtype=float)
+    X     = scorer._log_transform_features(
+        np.nan_to_num(X_raw, nan=0.0)
+    )
+
+    mt_scorer = MultiTargetRiskScorer()
+    mt_scorer.fit(X, rows, optimize_weights=True, val_fraction=0.20)
+
+    out_path = os.path.join(CACHE_DIR, MODEL_FILE)
+    mt_scorer.save(out_path)
+    print(f"  Multi-target model saved → {out_path}  ({len(rows):,} training rows)")
+
+
+# ------------------------------------------------------------------ #
 #  Main
 # ------------------------------------------------------------------ #
 def main():
@@ -402,6 +531,22 @@ def main():
         if os.path.exists(p):
             os.remove(p)
             print(f"  Removed stale {stale}")
+
+    # ── Build ML risk model (trains GBR + temporal calibration) ──────────
+    print("\nBuilding ML risk model …")
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    from src.scoring.ml_risk_scorer import MLRiskScorer
+    from datetime import date as _date
+
+    scorer = MLRiskScorer()  # triggers _load_or_build() → trains fresh model
+
+    # ── Build penalty percentile thresholds (training data only) ─────────
+    print("\nBuilding NAICS penalty percentiles …")
+    _build_penalty_percentiles(scorer)
+
+    # ── Build multi-target model ──────────────────────────────────────────
+    print("\nBuilding multi-target probabilistic risk model …")
+    _build_multi_target_model(scorer)
 
     print(f"\n{'='*60}")
     print(f"  DONE")

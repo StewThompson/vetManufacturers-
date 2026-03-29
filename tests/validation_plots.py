@@ -13,6 +13,15 @@ Plots produced
   04_capture_curve.png              -- Top-K cumulative event capture curve
   05_distribution_overlay.png      -- Score distribution: all vs. high-future-risk
   06_decile_boxplot.png             -- Boxplot of adverse outcome by score decile
+  07_threshold_pr_f1.png            -- Precision / Recall / F1 vs score threshold
+  08_rec_band_outcomes.png          -- Grouped bar: outcomes per recommendation band
+  09_confidence_subgroup.png        -- Scatter per confidence tier (High/Med/Low)
+  10_label_distribution.png         -- Pseudo-label vs real adverse: overlay + scatter
+  11_model_comparison.png           -- Pseudo-only vs temporal-augmented model scatter
+  12_mt_composite_scatter.png       -- Multi-target composite vs adverse (2-panel)
+  13_mt_head_comparison.png         -- Per-head Spearman ρ horizontal bar chart
+  14_mt_lift_capture.png            -- MT composite decile lift + P95 capture curve
+  15_mt_penalty_calibration.png     -- Penalty-tier probability reliability curves
 
 Console output
 --------------
@@ -869,6 +878,645 @@ def _plot_confidence_subgroup(
     return path
 
 
+def _plot_label_distribution(
+    rw_data: RealWorldData,
+    plots_dir: str,
+) -> str:
+    """Plot 10 -- side-by-side histogram comparing pseudo-label vs real adverse
+    label distributions for the shared temporal training sample.
+
+    This directly answers: "Do pseudo-labels systematically over- or under-estimate
+    the real adverse outcomes observed in the outcome window?"
+
+    If the real adverse label distribution is shifted significantly relative to
+    pseudo-labels the training objective may need recalibration.  Conversely,
+    similar distributions confirm that pseudo-labels are a reasonable proxy.
+    """
+    from scipy.stats import spearmanr  # local import; already in test module
+
+    temporal_rows = getattr(rw_data, "temporal_rows", [])
+    if not temporal_rows:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.text(0.5, 0.5, "No temporal training labels available",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=FONT_LABEL)
+        ax.set_title("Label Distribution (N/A)", fontsize=FONT_TITLE)
+        path = os.path.join(plots_dir, "10_label_distribution.png")
+        fig.savefig(path, dpi=FIG_DPI)
+        plt.close(fig)
+        return path
+
+    pseudo = np.array([r["pseudo_label"]   for r in temporal_rows], dtype=float)
+    real   = np.array([r["real_label"]     for r in temporal_rows], dtype=float)
+
+    bins = np.linspace(0, 100, 41)  # 40 bins of width 2.5 across [0, 100]
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=False)
+
+    # Left panel: overlapping histogram
+    ax = axes[0]
+    ax.hist(pseudo, bins=bins, alpha=0.55, color=COLOR_MAIN, label="Pseudo-label",
+            density=True, edgecolor="white")
+    ax.hist(real,   bins=bins, alpha=0.55, color=COLOR_ALT,  label="Real adverse",
+            density=True, edgecolor="white")
+    ax.axvline(pseudo.mean(), color=COLOR_MAIN, linestyle="--", linewidth=1.8,
+               label=f"Pseudo \u03bc={pseudo.mean():.1f}")
+    ax.axvline(real.mean(),   color=COLOR_ALT,  linestyle="--", linewidth=1.8,
+               label=f"Real \u03bc={real.mean():.1f}")
+    ax.set_xlabel("Score / Label Value  [0\u2013100]", fontsize=FONT_LABEL)
+    ax.set_ylabel("Density", fontsize=FONT_LABEL)
+    ax.set_title("Pseudo-label vs Real Adverse\n(overlapping)", fontsize=FONT_LABEL,
+                 fontweight="bold")
+    ax.tick_params(labelsize=FONT_TICK)
+    ax.legend(fontsize=FONT_LEGEND - 1)
+    ax.grid(True, linewidth=0.4)
+
+    # Right panel: scatter pseudo vs real for each establishment
+    ax = axes[1]
+    ax.scatter(pseudo, real, alpha=0.20, s=6, color="#4d4d4d", rasterized=True)
+    lims = [0, 100]
+    ax.plot(lims, lims, color=COLOR_REF, linewidth=1.2, linestyle=":", label="y = x")
+    rho_val = float(spearmanr(pseudo, real)[0])
+    corr_val = float(np.corrcoef(pseudo, real)[0, 1])
+    ax.set_xlabel("Pseudo-label", fontsize=FONT_LABEL)
+    ax.set_ylabel("Real Adverse Label", fontsize=FONT_LABEL)
+    ax.set_title(
+        f"Pseudo vs Real  (n={len(pseudo):,})\n"
+        f"Spearman \u03c1={rho_val:.3f}  Pearson r={corr_val:.3f}",
+        fontsize=FONT_LABEL, fontweight="bold",
+    )
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+    ax.tick_params(labelsize=FONT_TICK)
+    ax.legend(fontsize=FONT_LEGEND - 1)
+    ax.grid(True, linewidth=0.4)
+
+    fig.suptitle(
+        "Training Label Distribution: Pseudo-label vs Real Adverse Outcome",
+        fontsize=FONT_TITLE, fontweight="bold",
+    )
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "10_label_distribution.png")
+    fig.savefig(path, dpi=FIG_DPI)
+    plt.close(fig)
+    return path
+
+
+def _plot_model_comparison(
+    rw_data: RealWorldData,
+    plots_dir: str,
+) -> str:
+    """Plot 11 -- side-by-side scatter comparing pseudo-only baseline vs
+    temporal-label augmented model against future adverse outcomes.
+
+    This is the core diagnostic for the temporal supervision strategy:
+    a higher Spearman rho or tighter rolling-mean trend in the right panel
+    confirms that incorporating real adverse outcomes in training improves
+    the model's ability to predict future compliance problems.
+
+    Business interpretation: if the two panels look similar, temporal labels
+    are harmless (no regression); if the right panel shows steeper trend lines
+    and higher rho, temporal supervision has measurably improved ranking quality.
+    """
+    from scipy.stats import spearmanr
+
+    if len(rw_data.paired_scores) == 0:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.text(0.5, 0.5, "No paired establishments -- cannot compare models",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=FONT_LABEL)
+        ax.set_title("Model Comparison (N/A)", fontsize=FONT_TITLE)
+        path = os.path.join(plots_dir, "11_model_comparison.png")
+        fig.savefig(path, dpi=FIG_DPI)
+        plt.close(fig)
+        return path
+
+    baseline  = rw_data.paired_scores
+    paired_temporal = getattr(rw_data, "paired_temporal_scores", np.array([]))
+    temporal  = (
+        paired_temporal
+        if len(paired_temporal) == len(baseline)
+        else baseline
+    )
+    adverse   = rw_data.paired_adverse_scores
+
+    rho_base = float(spearmanr(baseline, adverse)[0])
+    rho_temp = float(spearmanr(temporal,  adverse)[0])
+
+    panels = [
+        (baseline, f"Pseudo-only baseline\nSpearman \u03c1={rho_base:.3f}", COLOR_MAIN),
+        (temporal,
+         f"Temporal-label augmented\nSpearman \u03c1={rho_temp:.3f}",
+         COLOR_ALT),
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6), sharey=True)
+    n = len(adverse)
+
+    for ax, (scores, title, color) in zip(axes, panels):
+        ax.scatter(scores, adverse, alpha=0.18, s=5, color=color, rasterized=True)
+
+        # Rolling-mean smooth
+        if n >= 20:
+            xs_sm, ys_sm = _rolling_smooth(
+                scores, adverse,
+                window_frac=0.10, min_window=max(10, n // 20),
+            )
+            ax.plot(xs_sm, ys_sm, color="#111111", linewidth=2.2,
+                    label="Rolling mean")
+            ax.legend(fontsize=FONT_LEGEND - 1)
+
+        ax.set_xlabel("Risk Score", fontsize=FONT_LABEL)
+        ax.set_title(title, fontsize=FONT_LABEL, fontweight="bold")
+        ax.set_xlim(0, 100)
+        ax.tick_params(labelsize=FONT_TICK)
+        ax.grid(True, linewidth=0.4)
+
+    axes[0].set_ylabel("Future Adverse Outcome Score", fontsize=FONT_LABEL)
+
+    delta = rho_temp - rho_base
+    direction = "improved" if delta >= 0 else "regressed"
+    fig.suptitle(
+        f"Model Comparison: Pseudo-only vs Temporal-label Augmented  "
+        f"(n={n:,}  \u0394\u03c1={delta:+.3f} {direction})",
+        fontsize=FONT_TITLE, fontweight="bold",
+    )
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "11_model_comparison.png")
+    fig.savefig(path, dpi=FIG_DPI)
+    plt.close(fig)
+    return path
+
+
+# ====================================================================== #
+#  Multi-target model plots (12 – 15)
+# ====================================================================== #
+
+_MT_CACHE_DIR = os.path.join(_PROJECT_ROOT, "ml_cache")
+
+_mt_val_cache = None   # module-level singleton so we load data only once
+
+
+def _load_mt_val_data() -> dict:
+    """Load multi-target model + validation data (cutoff=2021-01-01, outcome_end=2023-12-31).
+
+    Returns a populated dict or None if the model or CSV data is unavailable.
+    Results are cached at module level so multiple calls only build once.
+    """
+    global _mt_val_cache
+    if _mt_val_cache is not None:
+        return _mt_val_cache
+
+    try:
+        import math as _math
+        from datetime import date as _date
+        from scipy.stats import spearmanr as _spearmanr
+        from src.scoring.multi_target_scorer import (
+            MultiTargetRiskScorer,
+            _PENALTY_REF_USD,
+            _CITATION_REF,
+        )
+        from src.scoring.multi_target_labeler import build_multi_target_sample
+        from src.scoring.penalty_percentiles import load_percentiles, CACHE_FILENAME
+        from src.scoring.ml_risk_scorer import MLRiskScorer
+
+        model_path  = os.path.join(_MT_CACHE_DIR, "multi_target_model.pkl")
+        thresh_path = os.path.join(_MT_CACHE_DIR, CACHE_FILENAME)
+        insp_path   = os.path.join(_MT_CACHE_DIR, "inspections_bulk.csv")
+
+        if not all(os.path.exists(p) for p in [model_path, thresh_path, insp_path]):
+            return None
+
+        scorer = MLRiskScorer()
+        mt     = MultiTargetRiskScorer.load_if_exists(_MT_CACHE_DIR)
+        if mt is None or not mt.is_fitted:
+            return None
+
+        thresholds = load_percentiles(thresh_path)
+        rows = build_multi_target_sample(
+            scorer=scorer,
+            cutoff_date=_date(2021, 1, 1),
+            outcome_end_date=_date(2023, 12, 31),
+            inspections_path=insp_path,
+            violations_path=os.path.join(_MT_CACHE_DIR, "violations_bulk.csv"),
+            accidents_path=os.path.join(_MT_CACHE_DIR, "accidents_bulk.csv"),
+            injuries_path=os.path.join(_MT_CACHE_DIR, "accident_injuries_bulk.csv"),
+            naics_map=scorer._naics_map,
+            penalty_thresholds=thresholds,
+            sample_size=50_000,
+        )
+        if not rows:
+            return None
+
+        X_raw = np.array([r["features_46"] for r in rows], dtype=float)
+        X     = scorer._log_transform_features(np.nan_to_num(X_raw, nan=0.0))
+        preds = mt.predict_batch(X)
+
+        composites = np.array([mt.composite_score(p) for p in preds])
+        y          = np.array([r["real_label"]             for r in rows])
+        y_wr       = np.array([r["any_wr_serious"]         for r in rows], dtype=int)
+        y_lrg      = np.array([r["is_large_penalty"]       for r in rows], dtype=int)
+        y_ext      = np.array([r["is_extreme_penalty"]     for r in rows], dtype=int)
+        y_penalty  = np.array([r["future_total_penalty"]   for r in rows])
+        y_cit      = np.array([r["future_citation_count"]  for r in rows], dtype=float)
+        pseudo     = np.array([r["pseudo_label"]           for r in rows])
+
+        # Pre-computed component arrays (match composite_score formula exactly)
+        p_wr_100 = np.array([p["p_serious_wr_event"] * 100.0 for p in preds])
+        pen_n    = np.array([
+            min(_math.log1p(max(0.0, p["expected_penalty_usd"])) /
+                _math.log1p(_PENALTY_REF_USD) * 100.0, 100.0)
+            for p in preds
+        ])
+        cit_n = np.array([
+            min(max(0.0, p["expected_citations"]) / _CITATION_REF * 100.0, 100.0)
+            for p in preds
+        ])
+        tier_blend = np.array([
+            (0.5 * p["p_large_penalty"] + 0.5 * p["p_extreme_penalty"]) * 100.0
+            for p in preds
+        ])
+        p_lrg_raw = np.array([p["p_large_penalty"]    for p in preds])
+        p_ext_raw = np.array([p["p_extreme_penalty"]  for p in preds])
+
+        # Spearman rho for each component
+        def _rho(a, b):
+            return float(_spearmanr(a, b).statistic)
+
+        _mt_val_cache = {
+            "rows":        rows,
+            "mt":          mt,
+            "preds":       preds,
+            "composites":  composites,
+            "y":           y,
+            "y_wr":        y_wr,
+            "y_lrg":       y_lrg,
+            "y_ext":       y_ext,
+            "y_penalty":   y_penalty,
+            "y_cit":       y_cit,
+            "pseudo":      pseudo,
+            "p_wr_100":    p_wr_100,
+            "pen_n":       pen_n,
+            "cit_n":       cit_n,
+            "tier_blend":  tier_blend,
+            "p_lrg_raw":   p_lrg_raw,
+            "p_ext_raw":   p_ext_raw,
+            "rho_composite": _rho(composites, y),
+            "rho_wr":        _rho(p_wr_100,   y),
+            "rho_pen":       _rho(pen_n,       y),
+            "rho_cit":       _rho(cit_n,       y),
+            "rho_tier":      _rho(tier_blend,  y),
+            "rho_pseudo":    _rho(pseudo,      y),
+        }
+        return _mt_val_cache
+
+    except Exception as _exc:
+        print(f"  [MT data] Load error: {_exc}")
+        return None
+
+
+def _plot_mt_composite_scatter(
+    mt_data: dict,
+    plots_dir: str,
+) -> str:
+    """Plot 12 -- Multi-target composite score vs future adverse outcome (2 panels).
+
+    Left panel: composite vs real adverse label — shows the overall ranking quality.
+    Right panel: best individual head (p_wr probability) vs real adverse label.
+
+    Spearman ρ is annotated on each panel title so the composite improvement over
+    individual heads is immediately visible.
+    """
+    composites = mt_data["composites"]
+    p_wr_100   = mt_data["p_wr_100"]
+    y          = mt_data["y"]
+    rho_comp   = mt_data["rho_composite"]
+    rho_wr     = mt_data["rho_wr"]
+    n          = len(y)
+
+    panels = [
+        (composites, f"Composite Score\nSpearman ρ = {rho_comp:.4f}", COLOR_MAIN),
+        (p_wr_100,   f"p(WR/Serious) × 100  [best single head]\nSpearman ρ = {rho_wr:.4f}", COLOR_ALT),
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=True)
+
+    for ax, (scores, title, color) in zip(axes, panels):
+        ax.scatter(scores, y, alpha=0.18, s=5, color=color, rasterized=True)
+
+        if n >= 20:
+            xs_sm, ys_sm = _rolling_smooth(
+                scores, y,
+                window_frac=0.08, min_window=max(20, n // 30),
+            )
+            ax.plot(xs_sm, ys_sm, color="#111111", linewidth=2.4,
+                    label="Rolling mean")
+            ax.legend(fontsize=FONT_LEGEND - 1)
+
+        ax.set_xlabel("Score", fontsize=FONT_LABEL)
+        ax.set_title(title, fontsize=FONT_LABEL, fontweight="bold")
+        ax.set_xlim(0, 100)
+        ax.tick_params(labelsize=FONT_TICK)
+        ax.grid(True, linewidth=0.4)
+
+    axes[0].set_ylabel("Future Adverse Outcome Score  [real label]", fontsize=FONT_LABEL)
+
+    delta = rho_comp - rho_wr
+    fig.suptitle(
+        f"Multi-Target Composite vs Best Individual Head  (n={n:,}  Δρ={delta:+.4f})",
+        fontsize=FONT_TITLE, fontweight="bold",
+    )
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "12_mt_composite_scatter.png")
+    fig.savefig(path, dpi=FIG_DPI)
+    plt.close(fig)
+    return path
+
+
+def _plot_mt_head_comparison(
+    mt_data: dict,
+    plots_dir: str,
+) -> str:
+    """Plot 13 -- Per-head Spearman ρ with real adverse outcome (horizontal bar chart).
+
+    Each head / component is shown as one bar, ordered top-to-bottom by rho so the
+    strongest signals stand out.  The composite bar is highlighted in a darker blue;
+    the pseudo-label baseline is shown for reference in grey.
+    """
+    names = [
+        "Composite score",
+        "p_wr × 100  (WR/Serious binary head)",
+        "pen_norm (log-penalty regression)",
+        "cit_norm (citation-count regression)",
+        "tier_blend (large+extreme P90/P95)",
+        "Pseudo-label  (baseline)",
+    ]
+    rhos = [
+        mt_data["rho_composite"],
+        mt_data["rho_wr"],
+        mt_data["rho_pen"],
+        mt_data["rho_cit"],
+        mt_data["rho_tier"],
+        mt_data["rho_pseudo"],
+    ]
+    colors_raw = [
+        "#1d5fa5",   # darker blue for composite
+        COLOR_MAIN,
+        COLOR_MAIN,
+        COLOR_MAIN,
+        COLOR_MAIN,
+        COLOR_REF,   # grey for pseudo baseline
+    ]
+
+    # Sort by descending rho (skip composite which stays at the bottom for emphasis)
+    order     = [0] + sorted(range(1, len(rhos)), key=lambda i: -rhos[i])
+    names_s   = [names[i]  for i in order]
+    rhos_s    = [rhos[i]   for i in order]
+    colors_s  = [colors_raw[i] for i in order]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    y_pos = np.arange(len(names_s))
+    bars  = ax.barh(y_pos, rhos_s, color=colors_s, edgecolor="white", height=0.6)
+
+    # Annotate each bar with ρ value
+    for bar, rho in zip(bars, rhos_s):
+        bw = bar.get_width()
+        ax.text(
+            bw + 0.003, bar.get_y() + bar.get_height() / 2,
+            f"ρ={rho:.4f}",
+            va="center", ha="left",
+            fontsize=FONT_ANNOT + 1, color="#222222",
+        )
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(names_s, fontsize=FONT_TICK + 1)
+    ax.set_xlabel("Spearman ρ  vs  future real adverse outcome", fontsize=FONT_LABEL)
+    ax.set_title(
+        "Multi-Target Head Predictive Power  (Spearman ρ, validation set)",
+        fontsize=FONT_TITLE, fontweight="bold",
+    )
+    ax.set_xlim(0, max(rhos_s) * 1.18)
+    ax.tick_params(axis="x", labelsize=FONT_TICK)
+    ax.axvline(x=0, color="#888888", linewidth=0.8)
+    ax.grid(True, axis="x", linewidth=0.5)
+
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "13_mt_head_comparison.png")
+    fig.savefig(path, dpi=FIG_DPI)
+    plt.close(fig)
+    return path
+
+
+def _plot_mt_lift_and_capture(
+    mt_data: dict,
+    plots_dir: str,
+) -> str:
+    """Plot 14 -- Multi-target composite decile lift (left) + extreme-penalty capture (right).
+
+    Left panel mirrors plot 03 but uses the multi-target composite score ranked against
+    the real adverse label.
+
+    Right panel shows the cumulative extreme-penalty event capture curve:
+    establishments are sorted by composite_score (highest first) and the curve
+    traces what fraction of all extreme-penalty events (P95 tier) are captured as
+    you inspect successively more establishments.
+    """
+    composites = mt_data["composites"]
+    y          = mt_data["y"]
+    y_ext      = mt_data["y_ext"]
+    n          = len(composites)
+
+    # Decile lift (left panel)
+    df_lift = _decile_summary(composites, y, outcome_label="adverse_score")
+
+    # Cumulative capture (right panel)
+    order      = np.argsort(composites)[::-1]
+    sorted_ext = y_ext[order]
+    total_ext  = float(sorted_ext.sum())
+    if total_ext == 0.0:
+        total_ext = 1.0
+
+    pct_pop = np.concatenate([[0.0], np.arange(1, n + 1) / n * 100.0])
+    pct_cap = np.concatenate([[0.0], np.cumsum(sorted_ext) / total_ext * 100.0])
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    ax_lift, ax_cap = axes
+
+    # ── Left: decile lift ──────────────────────────────────────────────
+    bar_colors = [COLOR_MAIN if lft >= 1.0 else COLOR_ALT for lft in df_lift["lift"]]
+    bars = ax_lift.bar(
+        df_lift["decile"], df_lift["lift"],
+        color=bar_colors, edgecolor="white", width=0.7,
+    )
+    y_max = float(df_lift["lift"].max())
+    for bar, lft, cnt in zip(bars, df_lift["lift"], df_lift["n"]):
+        bx = bar.get_x() + bar.get_width() / 2
+        bh = bar.get_height()
+        ax_lift.text(bx, bh + y_max * 0.015, f"{lft:.2f}×",
+                     ha="center", va="bottom", fontsize=FONT_ANNOT, fontweight="bold")
+        if bh > y_max * 0.08:
+            ax_lift.text(bx, bh * 0.35, f"n={cnt:,}",
+                         ha="center", va="center", fontsize=FONT_ANNOT - 1,
+                         color="white", fontweight="bold")
+    ax_lift.axhline(y=1.0, color=COLOR_REF, linewidth=2, linestyle="--",
+                    label="Random baseline (1.0×)")
+    ax_lift.set_xlabel("Decile  (1=lowest → 10=highest score)", fontsize=FONT_LABEL)
+    ax_lift.set_ylabel("Lift  (decile mean / population mean)", fontsize=FONT_LABEL)
+    ax_lift.set_title(
+        f"Multi-Target Composite  —  Decile Lift\n(vs real adverse label, n={n:,})",
+        fontsize=FONT_LABEL, fontweight="bold",
+    )
+    ax_lift.set_xticks(df_lift["decile"])
+    ax_lift.tick_params(labelsize=FONT_TICK)
+    ax_lift.legend(fontsize=FONT_LEGEND)
+    ax_lift.grid(True, axis="y", linewidth=0.5)
+    ax_lift.set_ylim(0, y_max * 1.15)
+
+    # ── Right: extreme-penalty capture curve ───────────────────────────
+    ax_cap.plot(pct_pop, pct_cap, color=COLOR_MAIN, linewidth=2.5,
+                label="Multi-target composite")
+    ax_cap.plot([0, 100], [0, 100], color=COLOR_REF, linewidth=1.5, linestyle="--",
+                label="Random baseline")
+
+    # Annotate top-10% capture
+    idx_10  = int(round(n * 0.10))
+    cap_10  = float(sorted_ext[:max(idx_10, 1)].sum()) / total_ext * 100.0
+    base_rate = float(y_ext.mean()) * 100.0
+    ax_cap.annotate(
+        f"Top 10% captures\n{cap_10:.1f}% of P95 events\n(base rate {base_rate:.1f}%)",
+        xy=(10, cap_10),
+        xytext=(22, max(cap_10 - 12, 5)),
+        arrowprops=dict(arrowstyle="->", color="#444444", lw=1.3),
+        fontsize=FONT_ANNOT + 1, color="#222222",
+    )
+
+    ax_cap.set_xlim(0, 100)
+    ax_cap.set_ylim(0, 100)
+    ax_cap.set_xlabel("% of Establishments  (sorted by composite, highest first)",
+                      fontsize=FONT_LABEL)
+    ax_cap.set_ylabel("Cumulative % of Extreme-Penalty (P95) Events Captured",
+                      fontsize=FONT_LABEL)
+    ax_cap.set_title(
+        f"Extreme-Penalty (P95) Capture Curve\n(n_events={int(total_ext):,}  base rate={base_rate:.1f}%)",
+        fontsize=FONT_LABEL, fontweight="bold",
+    )
+    ax_cap.tick_params(labelsize=FONT_TICK)
+    ax_cap.legend(fontsize=FONT_LEGEND)
+    ax_cap.grid(True, linewidth=0.5)
+
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "14_mt_lift_capture.png")
+    fig.savefig(path, dpi=FIG_DPI)
+    plt.close(fig)
+    return path
+
+
+def _plot_mt_penalty_calibration(
+    mt_data: dict,
+    plots_dir: str,
+) -> str:
+    """Plot 15 -- Reliability curves for the three penalty-tier binary heads.
+
+    Each panel shows predicted probability (x-axis) vs actual event rate (y-axis)
+    across 8 equal-frequency bins.  Perfect calibration lies on the diagonal.
+    Points above the diagonal indicate under-prediction; points below indicate
+    over-prediction.  Bin counts are annotated.  AUROC is shown in the panel title.
+    """
+    from sklearn.metrics import roc_auc_score as _auroc
+
+    panels = [
+        ("p_wr × 100",   mt_data["p_wr_100"]  / 100.0, mt_data["y_wr"],  "P(WR/Serious event)"),
+        ("p_large",      mt_data["p_lrg_raw"],           mt_data["y_lrg"], "P(Large penalty ≥ P90)"),
+        ("p_extreme",    mt_data["p_ext_raw"],            mt_data["y_ext"], "P(Extreme penalty ≥ P95)"),
+    ]
+
+    n_bins = 8
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5), sharey=True)
+
+    rng = np.random.default_rng(42)
+
+    for ax, (head_name, p_pred, y_true, xlabel) in zip(axes, panels):
+        n_pos = int(y_true.sum())
+        if n_pos < 5 or len(p_pred) < n_bins * 2:
+            ax.text(0.5, 0.5, "Insufficient data",
+                    ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(head_name, fontsize=FONT_LABEL, fontweight="bold")
+            continue
+
+        # Equal-frequency binning
+        percentile_edges = np.percentile(p_pred, np.linspace(0, 100, n_bins + 1))
+        bin_pred_mean   = []
+        bin_actual_mean = []
+        bin_ns          = []
+
+        for i in range(n_bins):
+            lo   = percentile_edges[i]
+            hi   = percentile_edges[i + 1]
+            mask = (p_pred >= lo) & (p_pred <= hi) if i == n_bins - 1 \
+                   else (p_pred >= lo) & (p_pred < hi)
+            vals = y_true[mask]
+            ps   = p_pred[mask]
+            if len(vals) == 0:
+                continue
+            bin_pred_mean.append(float(ps.mean()))
+            bin_actual_mean.append(float(vals.mean()))
+            bin_ns.append(len(vals))
+
+        if not bin_pred_mean:
+            continue
+
+        bpm = np.array(bin_pred_mean)
+        bam = np.array(bin_actual_mean)
+        bns = np.array(bin_ns)
+
+        # Reliability markers
+        ax.scatter(bpm, bam, zorder=5, color=COLOR_MAIN, s=60, edgecolors="#1d5fa5",
+                   linewidths=1.2)
+        ax.plot(bpm, bam, color=COLOR_MAIN, linewidth=1.8, alpha=0.7)
+
+        # CI bars
+        hw = np.array([_bootstrap_mean_ci_95(
+            y_true[(p_pred >= percentile_edges[i]) &
+                   (p_pred < percentile_edges[i + 1] if i < n_bins - 1 else p_pred <= percentile_edges[i + 1])],
+            n_boot=300, rng=rng,
+        ) for i in range(n_bins)])
+        ax.errorbar(bpm, bam, yerr=hw[:len(bpm)],
+                    fmt="none", ecolor=COLOR_MAIN, elinewidth=1.2, capsize=3, alpha=0.7)
+
+        # Perfect calibration diagonal
+        lo_d = min(bpm.min(), 0.0)
+        hi_d = max(bpm.max(), 1.0)
+        ax.plot([lo_d, hi_d], [lo_d, hi_d],
+                color=COLOR_REF, linewidth=1.5, linestyle="--", label="Perfect calibration")
+
+        # Annotate n per bin
+        for mx, my, n_b in zip(bpm, bam, bns):
+            ax.text(mx, my + max(bam) * 0.04, f"n={n_b:,}",
+                    ha="center", va="bottom", fontsize=FONT_ANNOT - 1, color="#444444")
+
+        auroc_val = float(_auroc(y_true, p_pred)) if n_pos >= 5 else float("nan")
+        prevalence = float(y_true.mean())
+        ax.set_xlabel(xlabel, fontsize=FONT_LABEL)
+        ax.set_title(
+            f"{head_name}  (AUROC={auroc_val:.3f})\nPrevalence={prevalence:.1%}",
+            fontsize=FONT_LABEL, fontweight="bold",
+        )
+        ax.tick_params(labelsize=FONT_TICK)
+        ax.legend(fontsize=FONT_LEGEND - 2)
+        ax.grid(True, linewidth=0.4)
+
+    axes[0].set_ylabel("Actual event rate per bin", fontsize=FONT_LABEL)
+    fig.suptitle(
+        "Penalty-Tier Probability Calibration  (equal-frequency bins, 8 bins)",
+        fontsize=FONT_TITLE, fontweight="bold",
+    )
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "15_mt_penalty_calibration.png")
+    fig.savefig(path, dpi=FIG_DPI)
+    plt.close(fig)
+    return path
+
+
 # ====================================================================== #
 #  Console report
 # ====================================================================== #
@@ -923,11 +1571,17 @@ def generate_all_validation_plots(
     rw_data: RealWorldData,
     plots_dir: str = PLOTS_DIR,
 ) -> list:
-    """Generate all 9 validation plots and save them to plots_dir.
+    """Generate all validation plots and save them to plots_dir.
 
     Plots 01-06 validate rank correlation, decile lift, and score distribution.
     Plots 07-09 validate threshold performance, recommendation bands, and
     confidence-tier predictive breakdown.
+    Plots 10-11 compare pseudo-label vs real adverse label distributions and
+    contrast the baseline model against the temporal-label augmented model.
+    Plots 12-15 validate the multi-target probabilistic model: composite score
+    predictive power, per-head Spearman comparison, decile lift / P95 capture,
+    and penalty-tier probability calibration.  Plots 12-15 are skipped if the
+    multi_target_model.pkl is not present in ml_cache/.
 
     Also prints the cumulative gains table to stdout.
 
@@ -953,6 +1607,8 @@ def generate_all_validation_plots(
         ("07  Threshold precision/recall/F1  (2 targets)",  _plot_threshold_pr_f1),
         ("08  Recommendation-band outcome bars",            _plot_recommendation_band_outcomes),
         ("09  Confidence-tier scatter comparison",          _plot_confidence_subgroup),
+        ("10  Label distribution: pseudo vs real adverse",  _plot_label_distribution),
+        ("11  Model comparison: baseline vs temporal",      _plot_model_comparison),
     ]
 
     for label, plot_fn in steps:
@@ -962,6 +1618,28 @@ def generate_all_validation_plots(
             print(f"  [{label}]  saved -> {os.path.basename(path)}")
         except Exception as exc:  # pragma: no cover
             print(f"  [{label}]  ERROR: {exc}")
+
+    # ── Multi-target model plots (12–15) ──────────────────────────────
+    mt_model_path = os.path.join(_MT_CACHE_DIR, "multi_target_model.pkl")
+    if os.path.exists(mt_model_path):
+        print("\nLoading multi-target validation data (~30s) …")
+        mt_data = _load_mt_val_data()
+        if mt_data is not None:
+            mt_steps = [
+                ("12  MT composite score vs adverse (scatter+trend)",  _plot_mt_composite_scatter),
+                ("13  MT per-head Spearman ρ comparison (bar chart)",  _plot_mt_head_comparison),
+                ("14  MT composite decile lift + P95 capture curve",   _plot_mt_lift_and_capture),
+                ("15  Penalty-tier probability calibration curves",    _plot_mt_penalty_calibration),
+            ]
+            for label, plot_fn in mt_steps:
+                try:
+                    path = plot_fn(mt_data, plots_dir)
+                    saved.append(path)
+                    print(f"  [{label}]  saved -> {os.path.basename(path)}")
+                except Exception as exc:  # pragma: no cover
+                    print(f"  [{label}]  ERROR: {exc}")
+        else:
+            print("  Multi-target plots skipped (model/CSV data unavailable)")
 
     # Console gains table
     _print_cumulative_gains_table(rw_data)

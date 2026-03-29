@@ -78,6 +78,37 @@ export interface SiteScoreOut {
 
 export type Recommendation = 'Recommend' | 'Proceed with Caution' | 'Do Not Recommend'
 
+export interface ComplianceOutlook12M {
+  expected_inspections_12m: number
+  expected_violations_12m: number
+  expected_penalties_usd_12m: number
+  expected_serious_12m: number
+  expected_willful_repeat_12m: number
+  risk_band: 'low' | 'moderate' | 'high'
+  has_history: boolean
+  basis: string
+  summary_narrative: string
+}
+
+export interface ProbabilisticRiskTargetsOut {
+  /** Head 1: probability of any Serious/Willful/Repeat citation within 12 months */
+  p_serious_wr_event: number
+  /** Head 2: expected total OSHA penalty (USD) */
+  expected_penalty_usd_12m: number
+  /** Head 3: expected total violations/citations */
+  expected_citations_12m: number
+  /** Head 4: probability of exceeding NAICS-adjusted P75 penalty threshold */
+  p_moderate_penalty_event: number
+  /** Head 4: probability of exceeding NAICS-adjusted P90 penalty threshold */
+  p_large_penalty_event: number
+  /** Head 4: probability of exceeding NAICS-adjusted P95 penalty threshold */
+  p_extreme_penalty_event: number
+  /** Weighted composite of all four heads (0–100) */
+  composite_risk_score: number
+  /** NAICS-adjusted P90 dollar threshold used for large-penalty head */
+  large_penalty_threshold_usd: number
+}
+
 export interface AssessmentResponse {
   manufacturer_name: string
   risk_score: number
@@ -99,6 +130,8 @@ export interface AssessmentResponse {
   concentration_warning: string
   records: OSHARecordOut[]
   record_count: number
+  outlook: ComplianceOutlook12M | null
+  risk_targets: ProbabilisticRiskTargetsOut | null
 }
 
 // ── SSE event types ───────────────────────────────────────────────────────────

@@ -89,6 +89,32 @@ class SiteScoreOut(BaseModel):
     state: Optional[str]
 
 
+class ComplianceOutlook12M(BaseModel):
+    """12-month forward compliance projection derived from the risk score and
+    per-inspection-rate features."""
+    expected_inspections_12m: float
+    expected_violations_12m: float
+    expected_penalties_usd_12m: int
+    expected_serious_12m: float
+    expected_willful_repeat_12m: float
+    risk_band: Literal["low", "moderate", "high"]
+    has_history: bool
+    basis: str
+    summary_narrative: str
+
+
+class ProbabilisticRiskTargetsOut(BaseModel):
+    """Multi-target probabilistic predictions for the next 12 months."""
+    p_serious_wr_event: float
+    expected_penalty_usd_12m: float
+    expected_citations_12m: float
+    p_moderate_penalty_event: float
+    p_large_penalty_event: float
+    p_extreme_penalty_event: float
+    composite_risk_score: float
+    large_penalty_threshold_usd: float
+
+
 class AssessmentResponse(BaseModel):
     manufacturer_name: str
     risk_score: float
@@ -110,6 +136,8 @@ class AssessmentResponse(BaseModel):
     concentration_warning: str
     records: List[OSHARecordOut]
     record_count: int
+    outlook: Optional[ComplianceOutlook12M] = None
+    risk_targets: Optional[ProbabilisticRiskTargetsOut] = None
 
 
 # ── SSE event bodies ─────────────────────────────────────────────────────────

@@ -1,7 +1,36 @@
 from pydantic import BaseModel
-from typing import List, Literal, Dict, Any
+from typing import List, Literal, Dict, Any, Optional
 from src.models.manufacturer import Manufacturer
 from src.models.osha_record import OSHARecord
+
+
+class ProbabilisticRiskTargets(BaseModel):
+    """Multi-target probabilistic predictions for the next 12 months.
+
+    All probabilities are in [0, 1]; monetary values are in USD.
+    Threshold values are NAICS-adjusted so "large" means the same
+    thing within each industry sector.
+    """
+    # Head 1: probability of any Serious / Willful / Repeat event
+    p_serious_wr_event: float = 0.0
+
+    # Head 2: expected total OSHA penalty (dollars)
+    expected_penalty_usd_12m: float = 0.0
+
+    # Head 3: expected total violations (citations)
+    expected_citations_12m: float = 0.0
+
+    # Head 4: probability of exceeding NAICS-adjusted penalty thresholds
+    p_moderate_penalty_event: float = 0.0   # ≥ NAICS P75
+    p_large_penalty_event: float = 0.0      # ≥ NAICS P90
+    p_extreme_penalty_event: float = 0.0    # ≥ NAICS P95
+
+    # Composite score derived from the above (0-100)
+    composite_risk_score: float = 0.0
+
+    # NAICS-adjusted P90 threshold used for p_large_penalty_event
+    large_penalty_threshold_usd: float = 15_000.0
+
 
 class RiskAssessment(BaseModel):
     manufacturer: Manufacturer
@@ -25,3 +54,7 @@ class RiskAssessment(BaseModel):
     systemic_risk_flag: bool = False
     aggregation_warning: str = ""
     concentration_warning: str = ""
+    # 12-month forward compliance outlook (None when not computable)
+    outlook: Optional[Dict[str, Any]] = None
+    # Multi-target probabilistic predictions (None when model not loaded)
+    risk_targets: Optional[ProbabilisticRiskTargets] = None

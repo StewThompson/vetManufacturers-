@@ -37,9 +37,11 @@ from src.search.grouped_search import (
 )
 from api.schemas import (
     AssessmentResponse,
+    ComplianceOutlook12M,
     FacilityOut,
     GroupedCompanyOut,
     OSHARecordOut,
+    ProbabilisticRiskTargetsOut,
     SearchResponse,
     SiteScoreOut,
     SSEError,
@@ -134,6 +136,8 @@ def _assessment_response(assessment) -> AssessmentResponse:
             state=s.get("state"),
         )
         for s in assessment.site_scores
+        # site_scores may contain a private _log_feats array used internally;
+        # SiteScoreOut only picks named fields so it never reaches the wire.
     ]
 
     return AssessmentResponse(
@@ -157,6 +161,25 @@ def _assessment_response(assessment) -> AssessmentResponse:
         concentration_warning=assessment.concentration_warning,
         records=records_out,
         record_count=len(records_out),
+        outlook=(
+            ComplianceOutlook12M(**assessment.outlook)
+            if assessment.outlook is not None
+            else None
+        ),
+        risk_targets=(
+            ProbabilisticRiskTargetsOut(
+                p_serious_wr_event=assessment.risk_targets.p_serious_wr_event,
+                expected_penalty_usd_12m=assessment.risk_targets.expected_penalty_usd_12m,
+                expected_citations_12m=assessment.risk_targets.expected_citations_12m,
+                p_moderate_penalty_event=assessment.risk_targets.p_moderate_penalty_event,
+                p_large_penalty_event=assessment.risk_targets.p_large_penalty_event,
+                p_extreme_penalty_event=assessment.risk_targets.p_extreme_penalty_event,
+                composite_risk_score=assessment.risk_targets.composite_risk_score,
+                large_penalty_threshold_usd=assessment.risk_targets.large_penalty_threshold_usd,
+            )
+            if assessment.risk_targets is not None
+            else None
+        ),
     )
 
 

@@ -107,12 +107,9 @@ class ProbabilisticRiskTargetsOut(BaseModel):
     """Multi-target probabilistic predictions for the next 12 months."""
     p_serious_wr_event: float
     expected_penalty_usd_12m: float
-    expected_citations_12m: float
-    p_moderate_penalty_event: float
-    p_large_penalty_event: float
-    p_extreme_penalty_event: float
+    p_injury_event: float
+    gravity_score: float
     composite_risk_score: float
-    large_penalty_threshold_usd: float
 
 
 class AssessmentResponse(BaseModel):

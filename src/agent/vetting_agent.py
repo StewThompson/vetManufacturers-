@@ -1,8 +1,10 @@
 import os
+import json
 import re
 from typing import Callable
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types as genai_types
 
 from src.models.manufacturer import Manufacturer
 from src.models.assessment import RiskAssessment
@@ -37,6 +39,10 @@ class VettingAgent:
         """Expose the underlying OSHAClient so UI helpers can access raw indexes."""
         self.osha_client.ensure_cache()
         return self.osha_client
+
+    def reassess(self, manufacturer: Manufacturer, records: list) -> "RiskAssessment":
+        """Re-run scoring on a pre-filtered record set without fetching new data."""
+        return self.risk_assessor.assess(manufacturer, records)
 
     def vet_by_raw_estab_names(
         self,
@@ -141,6 +147,20 @@ class VettingAgent:
         and translate technical OSHA standards into plain English.
         """
         try:
+            rt = assessment.risk_targets
+            targets_block = ""
+            if rt:
+                targets_block = f"""
+            Multi-Target ML Predictions (12-month forward outlook):
+              Composite Risk Score: {rt.composite_risk_score}/100
+              P(Serious/Willful/Repeat event): {rt.p_serious_wr_event:.1%}
+              Expected Penalty: ${rt.expected_penalty_usd_12m:,.0f}
+              Expected Citations: {rt.expected_citations_12m:.1f}
+              P(Penalty ≥ NAICS P75): {rt.p_moderate_penalty_event:.1%}
+              P(Penalty ≥ NAICS P90 / ${rt.large_penalty_threshold_usd:,.0f}): {rt.p_large_penalty_event:.1%}
+              P(Penalty ≥ NAICS P95): {rt.p_extreme_penalty_event:.1%}
+"""
+
             prompt = f"""
             You are a manufacturing compliance expert. Review the following risk assessment data.
             The user is a procurement officer with NO legal background. They need to understand the practical implications.
@@ -148,10 +168,10 @@ class VettingAgent:
             Manufacturer: {assessment.manufacturer.name}
             Risk Score: {assessment.risk_score}/100
             Recommendation: {assessment.recommendation}
-            
+            {targets_block}
             Current Technical Findings (Raw Data):
             {assessment.explanation}
-            
+
             TASK: EXECUTIVE SUMMARY
             Write a 2-3 sentence executive summary explaining the primary drivers of this risk score.
 
@@ -159,15 +179,15 @@ class VettingAgent:
             ### Executive Summary
             ...
             """
-            
+
             response = self.client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=prompt
             )
-            
+
             if response.text:
                 assessment.explanation = response.text
-                
+
         except Exception as e:
             print(f"Error generating LLM summary: {e}")
 
@@ -362,10 +382,169 @@ class VettingAgent:
 
         return "\n".join(out)
 
+    # ------------------------------------------------------------------ #
+    #  Gemini tool definitions
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _make_osha_tools() -> "genai_types.Tool":
+        """Return a Gemini Tool with OSHA data-retrieval function declarations."""
+        return genai_types.Tool(function_declarations=[
+            genai_types.FunctionDeclaration(
+                name="fetch_gen_duty_narratives",
+                description=(
+                    "Retrieve the full OSHA inspector narrative text for one or more "
+                    "General Duty clause citations. Use this when the user asks about "
+                    "what an inspector actually found, specific hazards described, or the "
+                    "full text of a citation. Correct any typos in inspection IDs by "
+                    "matching against the known inspection list."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "description": (
+                                "List of objects, each with 'inspection_id' and 'citation_id'. "
+                                "Example: [{\"inspection_id\": \"315477917\", \"citation_id\": \"01001A\"}]"
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "inspection_id": {"type": "string"},
+                                    "citation_id": {"type": "string"},
+                                },
+                                "required": ["inspection_id", "citation_id"],
+                            },
+                        }
+                    },
+                    "required": ["items"],
+                },
+            ),
+            genai_types.FunctionDeclaration(
+                name="fetch_accident_abstracts",
+                description=(
+                    "Retrieve the full OSHA accident abstract (detailed fatality/injury "
+                    "investigation narrative) for one or more accident summary numbers. "
+                    "Use this when the user asks for full details of a workplace accident, "
+                    "fatality description, or investigation findings. Correct typos by "
+                    "matching against the known accident summary list."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "summary_nrs": {
+                            "type": "array",
+                            "description": "List of accident summary_nr strings.",
+                            "items": {"type": "string"},
+                        }
+                    },
+                    "required": ["summary_nrs"],
+                },
+            ),
+            genai_types.FunctionDeclaration(
+                name="fetch_inspection_violations",
+                description=(
+                    "Retrieve all violation records for one or more inspection IDs "
+                    "(activity_nr). Use this to get the complete list of violations, "
+                    "standards cited, and penalty amounts for a specific inspection. "
+                    "Correct typos by matching against the known inspection ID list."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "activity_nrs": {
+                            "type": "array",
+                            "description": "List of inspection activity_nr strings.",
+                            "items": {"type": "string"},
+                        }
+                    },
+                    "required": ["activity_nrs"],
+                },
+            ),
+        ])
+
+    def _dispatch_tool_call(
+        self, fn_name: str, fn_args: dict, assessment: "RiskAssessment"
+    ) -> str:
+        """Execute a Gemini function call and return the result as a string."""
+        # Collect known IDs from assessment for typo-correction (fuzzy match)
+        known_insp_ids = [r.inspection_id for r in assessment.records if r.inspection_id]
+        known_summary_nrs = [
+            acc.summary_nr
+            for r in assessment.records
+            for acc in r.accidents
+            if acc.summary_nr
+        ]
+
+        def _best_match(query: str, candidates: list[str]) -> str:
+            """Return closest candidate by prefix/substring, or original."""
+            q = query.strip()
+            # Exact first
+            if q in candidates:
+                return q
+            # Prefix match
+            for c in candidates:
+                if c.startswith(q) or q.startswith(c):
+                    return c
+            # Substring
+            for c in candidates:
+                if q in c or c in q:
+                    return c
+            return q  # fallback: use as-is
+
+        if fn_name == "fetch_gen_duty_narratives":
+            items = fn_args.get("items", [])
+            results = []
+            for item in items:
+                insp_id = _best_match(str(item.get("inspection_id", "")), known_insp_ids)
+                cit_id = str(item.get("citation_id", ""))
+                narrative = self.osha_client.get_gen_duty_narrative(insp_id, cit_id)
+                results.append(
+                    f"Inspection {insp_id} / Citation {cit_id}:\n"
+                    + (narrative if narrative else "(No narrative found)")
+                )
+            return "\n\n".join(results) if results else "No items requested."
+
+        elif fn_name == "fetch_accident_abstracts":
+            summary_nrs = fn_args.get("summary_nrs", [])
+            results = []
+            for snr in summary_nrs:
+                matched = _best_match(str(snr), known_summary_nrs)
+                abstract = self.osha_client.get_accident_abstract(matched)
+                results.append(
+                    f"Accident {matched}:\n"
+                    + (abstract if abstract else "(No abstract found)")
+                )
+            return "\n\n".join(results) if results else "No summary numbers requested."
+
+        elif fn_name == "fetch_inspection_violations":
+            activity_nrs = fn_args.get("activity_nrs", [])
+            results = []
+            for act_nr in activity_nrs:
+                matched = _best_match(str(act_nr), known_insp_ids)
+                viols = self.osha_client.get_violations_for_activity(matched)
+                if not viols:
+                    results.append(f"Inspection {matched}: No violations found.")
+                    continue
+                lines = [f"Inspection {matched} — {len(viols)} violation(s):"]
+                for v in viols[:30]:
+                    std = v.get("standard", v.get("citation_id", "?"))
+                    vtype = v.get("viol_type", "")
+                    pen = v.get("current_penalty", v.get("initial_penalty", "0"))
+                    lines.append(f"  • Std {std} | Type {vtype} | Penalty ${pen}")
+                if len(viols) > 30:
+                    lines.append(f"  ... {len(viols) - 30} more violations omitted.")
+                results.append("\n".join(lines))
+            return "\n\n".join(results) if results else "No activity numbers requested."
+
+        return f"Unknown function: {fn_name}"
+
     def discuss_assessment(self, assessment: RiskAssessment, question: str) -> str:
         """
-        Interactive Q&A layer using Gemini.
-        Includes accident/injury context so users can drill into specific incidents.
+        Interactive Q&A layer using Gemini with function-calling tools for
+        on-demand OSHA data retrieval (gen-duty narratives, accident abstracts,
+        inspection violations).
         """
         if not self.client:
             return "LLM features are not available. Please set GOOGLE_API_KEY."
@@ -375,35 +554,32 @@ class VettingAgent:
         try:
             code_evidence_context = self.get_code_evidence_report(assessment, question)
 
-            # Build accident detail context
+            # ── Build static context ──────────────────────────────────
             accident_context = ""
             for r in assessment.records:
-                if r.accidents:
-                    for acc in r.accidents:
-                        fat_tag = " [FATALITY]" if acc.fatality else ""
-                        accident_context += f"\nAccident {acc.summary_nr}{fat_tag} ({acc.event_date or 'unknown'}):\n"
-                        accident_context += f"  Description: {acc.event_desc}\n"
-                        for inj in acc.injuries:
-                            nature = inj.get('nature', 'Not reported')
-                            body = inj.get('body_part', 'Not reported')
-                            degree = inj.get('degree', 'Not reported')
-                            event_type = inj.get('event_type', '')
-                            et_suffix = f" [{event_type}]" if event_type and event_type not in ('Not reported', '') else ""
-                            accident_context += f"  Injury: {nature} to {body} — {degree}{et_suffix}"
-                            if inj.get("age"):
-                                accident_context += f", age {inj['age']}"
-                            accident_context += "\n"
-                        # Load abstract on demand if user asks about an accident
-                        if acc.summary_nr and not acc.abstract:
-                            abstract = self.osha_client.get_accident_abstract(acc.summary_nr)
-                            if abstract:
-                                accident_context += f"  Full Abstract: {abstract[:1000]}\n"
-
+                for acc in r.accidents:
+                    fat_tag = " [FATALITY]" if acc.fatality else ""
+                    accident_context += (
+                        f"\nAccident {acc.summary_nr}{fat_tag} ({acc.event_date or 'unknown'}):\n"
+                        f"  Description: {acc.event_desc}\n"
+                    )
+                    for inj in acc.injuries:
+                        nature = inj.get('nature', 'Not reported')
+                        body = inj.get('body_part', 'Not reported')
+                        degree = inj.get('degree', 'Not reported')
+                        event_type = inj.get('event_type', '')
+                        et_suffix = f" [{event_type}]" if event_type and event_type not in ('Not reported', '') else ""
+                        accident_context += f"  Injury: {nature} to {body} — {degree}{et_suffix}"
+                        if inj.get("age"):
+                            accident_context += f", age {inj['age']}"
+                        accident_context += "\n"
+                    if acc.summary_nr and not acc.abstract:
+                        abstract = self.osha_client.get_accident_abstract(acc.summary_nr)
+                        if abstract:
+                            accident_context += f"  Full Abstract: {abstract[:1000]}\n"
             if not accident_context:
-                accident_context = "\nNo accident/injury records linked to this manufacturer's inspections.\n"
+                accident_context = "No accident/injury records linked to this manufacturer."
 
-            # Build gen_duty narrative context for on-demand Q&A
-            # (auto-summary only shows high-priority ones; LLM gets all attached narratives)
             gen_duty_context = ""
             for r in assessment.records:
                 for v in r.violations:
@@ -411,49 +587,118 @@ class VettingAgent:
                         pen = f"${v.penalty_amount:,.0f}" if v.penalty_amount else "N/A"
                         gen_duty_context += (
                             f"\nInspection {r.inspection_id} / Citation {v.citation_id or 'N/A'}"
-                            f" (Penalty {pen}, {v.severity}):\n"
-                            f"  {v.gen_duty_narrative}\n"
+                            f" (Penalty {pen}, {v.severity}):\n  {v.gen_duty_narrative}\n"
                         )
             if not gen_duty_context:
-                gen_duty_context = "None available for this manufacturer."
+                gen_duty_context = "None attached; use fetch_gen_duty_narratives tool if needed."
 
-            prompt = f"""
-            You are a helpful AI assistant for a manufacturing vetting platform. 
-            User is asking about the following manufacturer assessment:
-            
-            Manufacturer: {assessment.manufacturer.name}
-            Risk Score: {assessment.risk_score}/100
-            Recommendation: {assessment.recommendation}
-            
-            Violation History & Details:
-            {assessment.explanation}
+            # ── Multi-target predictions block ────────────────────────
+            rt = assessment.risk_targets
+            targets_block = ""
+            if rt:
+                targets_block = f"""
+Multi-Target ML Predictions (12-month forward outlook):
+  Composite Risk Score : {rt.composite_risk_score}/100
+  P(S/WR event)        : {rt.p_serious_wr_event:.1%}
+  Expected Penalty     : ${rt.expected_penalty_usd_12m:,.0f}
+  Expected Citations   : {rt.expected_citations_12m:.1f}
+  P(≥ NAICS P75)       : {rt.p_moderate_penalty_event:.1%}
+  P(≥ NAICS P90 / ${rt.large_penalty_threshold_usd:,.0f}): {rt.p_large_penalty_event:.1%}
+  P(≥ NAICS P95)       : {rt.p_extreme_penalty_event:.1%}
+"""
 
-            Accident & Injury Details:
-            {accident_context}
+            # ── Known IDs index for Gemini reference ──────────────────
+            known_inspection_ids = list({r.inspection_id for r in assessment.records if r.inspection_id})
+            known_summary_nrs = list({
+                acc.summary_nr
+                for r in assessment.records
+                for acc in r.accidents
+                if acc.summary_nr
+            })
 
-            General Duty Clause Inspector Notes (plain-language hazard descriptions written by OSHA inspectors):
-            {gen_duty_context}
+            system_prompt = f"""You are a helpful AI assistant for a manufacturing procurement vetting platform.
 
-            Code/Citation Evidence Retrieval (normalized standard + citation matching):
-            {code_evidence_context}
-            
-            User Question: {question}
-            
-            Answer the user's question based on the provided assessment data and accident details.
-            Detailed Instructions:
-            - If the user asks about a specific citation or code, prioritize the 'Code/Citation Evidence Retrieval' section and cite matched inspection IDs, standard, citation ID, and penalties.
-            - If the user asks about a specific standard (e.g., '1910.1200'), explain what it is in plain English and why it's a safety risk.
-            - If the user asks about accidents or injuries, use the 'Accident & Injury Details' section. Describe the incident, injuries, and any fatalities clearly.
-            - If the user asks about General Duty violations or specific hazards/safety problems, use the 'General Duty Clause Inspector Notes' section to give specific, plain-language answers about what the inspector actually found.
-            - If the answer isn't in the data, say so. 
-            - Be professional and concise.
-            """
-            
-            response = self.client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt
-            )
-            return response.text
-            
+Manufacturer: {assessment.manufacturer.name}
+Risk Score: {assessment.risk_score}/100
+Recommendation: {assessment.recommendation}
+{targets_block}
+Violation History & Summary:
+{assessment.explanation}
+
+Accident & Injury Details (summary):
+{accident_context}
+
+General Duty Clause Inspector Notes (pre-loaded subset):
+{gen_duty_context}
+
+Code/Citation Evidence Retrieval:
+{code_evidence_context}
+
+KNOWN DATA INDEXES (use these to resolve typos or approximate references from the user):
+  Inspection IDs (activity_nr): {json.dumps(known_inspection_ids[:100])}
+  Accident summary numbers: {json.dumps(known_summary_nrs)}
+
+TOOL USE INSTRUCTIONS:
+You have three retrieval tools available:
+  1. fetch_gen_duty_narratives — call with a list of {{inspection_id, citation_id}} objects to retrieve
+     the full plain-language inspector narrative for any General Duty citation.
+  2. fetch_accident_abstracts — call with a list of summary_nr strings to retrieve the complete OSHA
+     accident investigation abstract (fatality descriptions, sequence of events, root cause).
+  3. fetch_inspection_violations — call with a list of activity_nr strings to retrieve all violations
+     for that inspection with standard codes, types, and penalties.
+
+If the user mentions an inspection ID, citation, or accident number with a possible typo, match it
+against the KNOWN DATA INDEXES above and use the closest match when calling tools.
+
+Answer the user's question thoroughly. Use tools proactively when full narrative/abstract detail
+would improve the answer. Be professional and concise.
+"""
+
+            contents = [system_prompt, f"User Question: {question}"]
+
+            tool = self._make_osha_tools()
+            config = genai_types.GenerateContentConfig(tools=[tool])
+
+            # ── Agentic loop: run until no more function calls ─────────
+            MAX_ROUNDS = 4
+            for _round in range(MAX_ROUNDS):
+                response = self.client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=contents,
+                    config=config,
+                )
+
+                # Collect any function calls in this response
+                fn_calls = []
+                text_parts = []
+                candidate = response.candidates[0] if response.candidates else None
+                if candidate:
+                    for part in candidate.content.parts:
+                        if hasattr(part, "function_call") and part.function_call:
+                            fn_calls.append(part.function_call)
+                        elif hasattr(part, "text") and part.text:
+                            text_parts.append(part.text)
+
+                if not fn_calls:
+                    # No tool calls — return the final text
+                    return response.text or "".join(text_parts) or "(No response)"
+
+                # Execute each function call and build the function response
+                contents.append(candidate.content)
+                fn_response_parts = []
+                for fc in fn_calls:
+                    print(f"  [Gemini tool] {fc.name}({dict(fc.args)})")
+                    result_text = self._dispatch_tool_call(fc.name, dict(fc.args), assessment)
+                    fn_response_parts.append(
+                        genai_types.Part.from_function_response(
+                            name=fc.name,
+                            response={"result": result_text},
+                        )
+                    )
+                contents.append(genai_types.Content(parts=fn_response_parts, role="tool"))
+
+            # Safety fallback: return whatever we have after MAX_ROUNDS
+            return response.text or "(No response after tool loop)"
+
         except Exception as e:
             return f"Error communicating with AI agent: {e}"

@@ -34,7 +34,7 @@ Usage (standalone)
 Usage (from code)
 -----------------
     from tests.validation_plots import generate_all_validation_plots
-    from tests.test_real_world_validation import RealWorldData
+    from tests.validation.shared import RealWorldData
     generate_all_validation_plots(RealWorldData.get())
 """
 
@@ -59,8 +59,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
-# Import helpers from the validation test module.
-from test_real_world_validation import (  # noqa: E402
+# Import helpers from the validation shared module.
+from tests.validation.shared import (  # noqa: E402
     RealWorldData,
     _decile_summary,
     _compute_threshold_metrics,

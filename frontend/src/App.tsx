@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from 'react'
-import { openAssessStream } from './api/client'
+import { openAssessStream, recalculateDroppingHighRisk } from './api/client'
 import type { AssessmentResponse, SSEEvent } from './types/assessment'
 import SearchCard from './components/SearchCard'
 import ProgressStream, {
@@ -23,6 +23,8 @@ export default function App() {
   const [result, setResult] = useState<AssessmentResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<Tab>('overview')
+  const [isRecalculating, setIsRecalculating] = useState(false)
+  const [dropError, setDropError] = useState<string | null>(null)
   const cleanupRef = useRef<(() => void) | null>(null)
 
   const handleSelectionChange = useCallback(
@@ -62,6 +64,20 @@ export default function App() {
       handleEvent,
     )
   }, [selectedRawNames, displayName])
+
+  const handleDropHighRisk = useCallback(async (threshold: 30 | 60) => {
+    if (!result) return
+    setIsRecalculating(true)
+    setDropError(null)
+    try {
+      const updated = await recalculateDroppingHighRisk(result, threshold)
+      setResult(updated)
+    } catch (err) {
+      setDropError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setIsRecalculating(false)
+    }
+  }, [result])
 
   const tabs: { id: Tab; label: string }[] = [
     { id: 'overview', label: 'Overview' },
@@ -160,9 +176,38 @@ export default function App() {
 
               {tab === 'sites' && (
                 <div className="card" style={{ padding: 0 }}>
-                  <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
+                  <div
+                    style={{
+                      padding: '12px 16px',
+                      borderBottom: '1px solid var(--border)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      flexWrap: 'wrap',
+                      gap: 8,
+                    }}
+                  >
                     <div className="card-title" style={{ marginBottom: 0 }}>
                       Site-Level Risk Scores
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                        Drop high-risk &amp; recalculate:
+                      </span>
+                      {([30, 60] as const).map((t) => (
+                        <button
+                          key={t}
+                          className="tab-btn"
+                          onClick={() => handleDropHighRisk(t)}
+                          disabled={isRecalculating}
+                          style={{ padding: '3px 10px', fontSize: 12 }}
+                        >
+                          {isRecalculating ? '…' : `Score > ${t}`}
+                        </button>
+                      ))}
+                      {dropError && (
+                        <span style={{ fontSize: 11, color: 'var(--danger)' }}>{dropError}</span>
+                      )}
                     </div>
                   </div>
                   <div style={{ padding: 16 }}>

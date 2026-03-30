@@ -82,9 +82,12 @@ class RiskAssessor:
                 naics_2d    = str(top_naics)[:2] if top_naics else None
                 p90_thresh  = lookup_threshold(thresholds, naics_2d, "p90")
 
-                per_site_features = ml_result.get("per_site_features", [])
+                # _log_feats is stored inside each site_scores entry by
+                # score_establishments() but is not a top-level key in the
+                # score() return dict, so reconstruct it here.
+                per_site_features = [s.get("_log_feats") for s in site_scores]
                 has_per_site = (
-                    len(per_site_features) == len(site_scores)
+                    len(per_site_features) == len(site_scores) > 0
                     and all(f is not None for f in per_site_features)
                 )
 
@@ -148,10 +151,8 @@ class RiskAssessor:
                     mt_predictions = {
                         "p_serious_wr_event":  _wavg("p_serious_wr_event"),
                         "expected_penalty_usd": _wavg("expected_penalty_usd"),
-                        "expected_citations":   _wavg("expected_citations"),
-                        "p_moderate_penalty":  _wavg("p_moderate_penalty"),
-                        "p_large_penalty":     _wavg("p_large_penalty"),
-                        "p_extreme_penalty":   _wavg("p_extreme_penalty"),
+                        "p_injury_event":      _wavg("p_injury_event"),
+                        "gravity_score":       _wavg("gravity_score"),
                     }
 
                 else:
@@ -174,12 +175,9 @@ class RiskAssessor:
                 risk_targets_obj = ProbabilisticRiskTargets(
                     p_serious_wr_event=round(mt_predictions["p_serious_wr_event"], 4),
                     expected_penalty_usd_12m=round(mt_predictions["expected_penalty_usd"], 2),
-                    expected_citations_12m=round(mt_predictions["expected_citations"], 2),
-                    p_moderate_penalty_event=round(mt_predictions["p_moderate_penalty"], 4),
-                    p_large_penalty_event=round(mt_predictions["p_large_penalty"], 4),
-                    p_extreme_penalty_event=round(mt_predictions["p_extreme_penalty"], 4),
+                    p_injury_event=round(mt_predictions["p_injury_event"], 4),
+                    gravity_score=round(mt_predictions["gravity_score"], 2),
                     composite_risk_score=round(composite, 1),
-                    large_penalty_threshold_usd=round(p90_thresh, 0),
                 )
 
                 # Promote composite to canonical risk_score so score, recommendation,

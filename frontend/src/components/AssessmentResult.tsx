@@ -71,50 +71,134 @@ export default function ProgressStream({
   )
 }
 
+// ── Score ring ────────────────────────────────────────────────────────────────
+
+const SCORE_COLORS: Record<'green' | 'yellow' | 'red', { stroke: string; trackStroke: string }> = {
+  green:  { stroke: '#059669', trackStroke: '#d1fae5' },
+  yellow: { stroke: '#d97706', trackStroke: '#fef3c7' },
+  red:    { stroke: '#dc2626', trackStroke: '#fee2e2' },
+}
+
+function ScoreRing({
+  score,
+  color,
+  isMLComposite,
+}: {
+  score: number
+  color: 'green' | 'yellow' | 'red'
+  isMLComposite: boolean
+}) {
+  const R = 48
+  const SW = 9
+  const CX = 60
+  const CY = 60
+  const SIZE = 120
+  const circumference = 2 * Math.PI * R
+  const fillArc = Math.min(score / 100, 1) * circumference
+  const gap = circumference - fillArc
+  const { stroke, trackStroke } = SCORE_COLORS[color]
+
+  return (
+    <div style={{ position: 'relative', width: SIZE, height: SIZE, flexShrink: 0 }}>
+      <svg width={SIZE} height={SIZE} viewBox={`0 0 ${SIZE} ${SIZE}`} style={{ display: 'block' }}>
+        <defs>
+          <filter id={`glow-${color}`} x="-30%" y="-30%" width="160%" height="160%">
+            <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur" />
+            <feMerge>
+              <feMergeNode in="blur" />
+              <feMergeNode in="SourceGraphic" />
+            </feMerge>
+          </filter>
+        </defs>
+        {/* Track */}
+        <circle cx={CX} cy={CY} r={R} fill="none" stroke={trackStroke} strokeWidth={SW} />
+        {/* Progress arc */}
+        {score > 0 && (
+          <circle
+            cx={CX}
+            cy={CY}
+            r={R}
+            fill="none"
+            stroke={stroke}
+            strokeWidth={SW}
+            strokeDasharray={`${fillArc} ${gap}`}
+            strokeLinecap="round"
+            transform={`rotate(-90 ${CX} ${CY})`}
+            filter={`url(#glow-${color})`}
+          />
+        )}
+        {/* Score number */}
+        <text
+          x={CX}
+          y={CY - 5}
+          textAnchor="middle"
+          dominantBaseline="middle"
+          style={{ fontSize: 22, fontWeight: 800, fill: stroke, fontFamily: 'inherit' }}
+        >
+          {score.toFixed(0)}
+        </text>
+        <text
+          x={CX}
+          y={CY + 13}
+          textAnchor="middle"
+          style={{ fontSize: 10, fill: '#94a3b8', fontFamily: 'inherit' }}
+        >
+          / 100
+        </text>
+      </svg>
+      {isMLComposite && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: 4,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            fontSize: 8,
+            fontWeight: 700,
+            background: 'var(--accent-dim)',
+            color: 'var(--accent)',
+            border: '1px solid var(--accent)',
+            borderRadius: 3,
+            padding: '1px 5px',
+            letterSpacing: '0.4px',
+            textTransform: 'uppercase',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          ML Composite
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Risk banner ───────────────────────────────────────────────────────────────
 
 export function RiskBanner({ result }: { result: AssessmentResponse }) {
-  const color = REC_COLORS[result.recommendation]
+  const color = REC_COLORS[result.recommendation] as 'green' | 'yellow' | 'red'
+  const percentile = result.missing_naics ? result.percentile_rank : result.industry_percentile
+
   return (
     <div className={`risk-banner risk-banner-${color}`}>
-      <div>
-        <div className="risk-score-label">{result.manufacturer_name}</div>
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 16, marginTop: 4 }}>
+      {/* Left: ring + percentile */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
+        <ScoreRing score={result.risk_score} color={color} isMLComposite={!!result.risk_targets} />
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <div>
-            <div className="risk-score-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              Risk Score
-              {result.risk_targets && (
-                <span
-                  style={{
-                    fontSize: 9,
-                    fontWeight: 600,
-                    background: 'var(--accent-dim)',
-                    color: 'var(--accent)',
-                    border: '1px solid var(--accent)',
-                    borderRadius: 3,
-                    padding: '1px 5px',
-                    letterSpacing: '0.3px',
-                    textTransform: 'uppercase',
-                  }}
-                >
-                  ML Composite
-                </span>
-              )}
-            </div>
-            <div className={`risk-score-value risk-score-${color}`}>
-              {result.risk_score.toFixed(1)}
-              <span style={{ fontSize: 16, fontWeight: 400, opacity: 0.7 }}>&thinsp;/ 100</span>
+            <div className="risk-score-label">{result.manufacturer_name}</div>
+            <div className="risk-score-label" style={{ marginTop: 2 }}>
+              {result.industry_label}
             </div>
           </div>
           <div>
             <div className="risk-score-label">{result.missing_naics ? 'Pop. Percentile' : 'Industry Percentile'}</div>
-            <div className={`risk-score-value risk-score-${color}`} style={{ fontSize: 28 }}>
-              {(result.missing_naics ? result.percentile_rank : result.industry_percentile).toFixed(0)}
-              <sup style={{ fontSize: 14 }}>th</sup>
+            <div className={`risk-score-value risk-score-${color}`} style={{ fontSize: 28, lineHeight: 1.1 }}>
+              {percentile.toFixed(0)}<sup style={{ fontSize: 14 }}>th</sup>
             </div>
           </div>
         </div>
       </div>
+      {/* Right: recommendation badge + sites */}
       <div style={{ textAlign: 'right' }}>
         <div
           className={`badge badge-${color === 'green' ? 'green' : color === 'yellow' ? 'yellow' : 'red'}`}
@@ -123,7 +207,7 @@ export function RiskBanner({ result }: { result: AssessmentResponse }) {
           {result.recommendation}
         </div>
         <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8 }}>
-          {result.industry_label} · {result.establishment_count} sites
+          {result.establishment_count} {result.establishment_count === 1 ? 'site' : 'sites'}
         </div>
       </div>
     </div>
@@ -379,30 +463,36 @@ export function RiskTargetsPanel({ targets }: { targets: ProbabilisticRiskTarget
             sub="Head 1 · probability of any S/WR citation within 12 mo"
           />
           <ProbabilityBar
-            label="Moderate Penalty (P75)"
-            prob={targets.p_moderate_penalty_event}
-            thresholds={[0.3, 0.5]}
-            sub="Head 4 · industry-adjusted ≥ NAICS P75 threshold"
+            label="Hospitalization / Fatality"
+            prob={targets.p_injury_event}
+            thresholds={[0.05, 0.15]}
+            sub="Head 3 · probability of hospitalized or fatal injury"
           />
         </div>
         <div>
           <ProbabilityBar
-            label="Large Penalty (P90)"
-            prob={targets.p_large_penalty_event}
-            thresholds={[0.2, 0.4]}
-            sub={`Head 4 · threshold ≥ $${targets.large_penalty_threshold_usd.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
-          />
-          <ProbabilityBar
-            label="Extreme Penalty (P95)"
-            prob={targets.p_extreme_penalty_event}
-            thresholds={[0.1, 0.25]}
-            sub="Head 4 · industry-adjusted ≥ NAICS P95 threshold"
+            label="Expected Penalty"
+            prob={Math.min(targets.expected_penalty_usd_12m / 200_000, 1)}
+            thresholds={[0.05, 0.15]}
+            sub={`Head 2 · est. $${targets.expected_penalty_usd_12m.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
           />
         </div>
       </div>
 
-      {/* Regression head stats */}
+      {/* Gravity + composite stats */}
       <div className="stat-grid" style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
+        <OutlookStat
+          label="Gravity Score"
+          value={targets.gravity_score.toFixed(1)}
+          sub="Head 4 · Σ(gravity × violation weight)"
+          color={
+            targets.gravity_score >= 50
+              ? 'var(--danger)'
+              : targets.gravity_score >= 20
+              ? 'var(--warning)'
+              : undefined
+          }
+        />
         <OutlookStat
           label="Expected Penalty"
           value={`$${targets.expected_penalty_usd_12m.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
@@ -411,18 +501,6 @@ export function RiskTargetsPanel({ targets }: { targets: ProbabilisticRiskTarget
             targets.expected_penalty_usd_12m >= 10_000
               ? 'var(--danger)'
               : targets.expected_penalty_usd_12m >= 2_000
-              ? 'var(--warning)'
-              : undefined
-          }
-        />
-        <OutlookStat
-          label="Expected Citations"
-          value={targets.expected_citations_12m.toFixed(1)}
-          sub="Head 3 · 12-month total"
-          color={
-            targets.expected_citations_12m >= 5
-              ? 'var(--danger)'
-              : targets.expected_citations_12m >= 2
               ? 'var(--warning)'
               : undefined
           }

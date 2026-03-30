@@ -170,12 +170,9 @@ def _assessment_response(assessment) -> AssessmentResponse:
             ProbabilisticRiskTargetsOut(
                 p_serious_wr_event=assessment.risk_targets.p_serious_wr_event,
                 expected_penalty_usd_12m=assessment.risk_targets.expected_penalty_usd_12m,
-                expected_citations_12m=assessment.risk_targets.expected_citations_12m,
-                p_moderate_penalty_event=assessment.risk_targets.p_moderate_penalty_event,
-                p_large_penalty_event=assessment.risk_targets.p_large_penalty_event,
-                p_extreme_penalty_event=assessment.risk_targets.p_extreme_penalty_event,
+                p_injury_event=assessment.risk_targets.p_injury_event,
+                gravity_score=assessment.risk_targets.gravity_score,
                 composite_risk_score=assessment.risk_targets.composite_risk_score,
-                large_penalty_threshold_usd=assessment.risk_targets.large_penalty_threshold_usd,
             )
             if assessment.risk_targets is not None
             else None
@@ -219,11 +216,6 @@ async def locations(company: str = Query(...)):
     """Return address list for a given company name."""
     agent = _get_agent()
     return agent.get_locations_for_company(company)
-
-
-class AssessRequest:
-    """Body model for /api/assess parsed from query params for SSE compatibility."""
-    pass
 
 
 @app.get("/api/assess")
@@ -315,6 +307,115 @@ async def assess(
     )
 
 
+# ── Recalculate (drop high-risk sites) ──────────────────────────────────────
+
+class RecalculateRequest(BaseModel):
+    assessment: dict
+    threshold: int  # drop sites with risk_score > this value (30 or 60)
+
+
+@app.post("/api/recalculate")
+async def recalculate(body: RecalculateRequest):
+    """
+    Drop all sites whose legacy risk score exceeds `threshold`, then re-run
+    the full scoring pipeline on the trimmed record set.
+    """
+    agent = _get_agent()
+    threshold = body.threshold
+    data = body.assessment
+
+    # Identify site names to KEEP (score <= threshold)
+    kept_names = {
+        s["name"].upper().strip()
+        for s in data.get("site_scores", [])
+        if s.get("score", 0.0) <= threshold
+    }
+    if not kept_names:
+        raise HTTPException(
+            status_code=400,
+            detail=f"All sites score above {threshold}; nothing would remain after dropping.",
+        )
+
+    from src.models.manufacturer import Manufacturer
+    from src.models.osha_record import OSHARecord, Violation, AccidentSummary
+    import datetime
+
+    def _violations(raw: list) -> list:
+        return [
+            Violation(
+                category=v.get("category", ""),
+                severity=v.get("severity", ""),
+                penalty_amount=v.get("penalty_amount", 0.0),
+                is_repeat=v.get("is_repeat", False),
+                is_willful=v.get("is_willful", False),
+                description=v.get("description"),
+                gravity=v.get("gravity"),
+                nr_exposed=v.get("nr_exposed"),
+                citation_id=v.get("citation_id"),
+                gen_duty_narrative=v.get("gen_duty_narrative"),
+            )
+            for v in raw
+        ]
+
+    def _accidents(raw: list) -> list:
+        return [
+            AccidentSummary(
+                summary_nr=a.get("summary_nr", ""),
+                event_date=a.get("event_date"),
+                event_desc=a.get("event_desc", ""),
+                fatality=a.get("fatality", False),
+                injuries=a.get("injuries", []),
+                abstract=a.get("abstract", ""),
+            )
+            for a in raw
+        ]
+
+    def _parse_date(s: str) -> "datetime.date":
+        try:
+            return datetime.date.fromisoformat(s)
+        except Exception:
+            return datetime.date.today()
+
+    all_records = [
+        OSHARecord(
+            inspection_id=r.get("inspection_id", ""),
+            date_opened=_parse_date(r.get("date_opened", "")),
+            violations=_violations(r.get("violations", [])),
+            total_penalties=r.get("total_penalties", 0.0),
+            severe_injury_or_fatality=r.get("severe_injury_or_fatality", False),
+            accidents=_accidents(r.get("accidents", [])),
+            naics_code=r.get("naics_code"),
+            nr_in_estab=r.get("nr_in_estab"),
+            estab_name=r.get("estab_name"),
+            site_city=r.get("site_city"),
+            site_state=r.get("site_state"),
+        )
+        for r in data.get("records", [])
+    ]
+
+    filtered = [
+        r for r in all_records
+        if (r.estab_name or "UNKNOWN").upper().strip() in kept_names
+    ]
+    if not filtered:
+        raise HTTPException(
+            status_code=400,
+            detail="No records remain after filtering to kept sites.",
+        )
+
+    manufacturer = Manufacturer(name=data.get("manufacturer_name", ""))
+
+    import asyncio
+    import concurrent.futures
+    loop = asyncio.get_event_loop()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    assessment = await loop.run_in_executor(
+        executor,
+        lambda: agent.reassess(manufacturer, filtered),
+    )
+    return _assessment_response(assessment)
+
+
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
@@ -334,11 +435,25 @@ async def chat(body: ChatRequest):
 
     # Rebuild a lightweight assessment stub the agent can use for Q&A
     from src.models.manufacturer import Manufacturer
-    from src.models.assessment import RiskAssessment
+    from src.models.assessment import RiskAssessment, ProbabilisticRiskTargets
     from src.models.osha_record import OSHARecord, Violation, AccidentSummary
     import datetime
 
     data = body.assessment
+
+    def _rebuild_risk_targets(rt_data: dict | None):
+        if not rt_data:
+            return None
+        try:
+            return ProbabilisticRiskTargets(
+                p_serious_wr_event=rt_data.get("p_serious_wr_event", 0.0),
+                expected_penalty_usd_12m=rt_data.get("expected_penalty_usd_12m", 0.0),
+                p_injury_event=rt_data.get("p_injury_event", 0.0),
+                gravity_score=rt_data.get("gravity_score", 0.0),
+                composite_risk_score=rt_data.get("composite_risk_score", 0.0),
+            )
+        except Exception:
+            return None
 
     def _rebuild_violations(raw: list) -> list:
         out = []
@@ -410,6 +525,7 @@ async def chat(body: ChatRequest):
         systemic_risk_flag=data.get("systemic_risk_flag", False),
         aggregation_warning=data.get("aggregation_warning", ""),
         concentration_warning=data.get("concentration_warning", ""),
+        risk_targets=_rebuild_risk_targets(data.get("risk_targets")),
     )
 
     import asyncio
@@ -421,4 +537,3 @@ async def chat(body: ChatRequest):
         lambda: agent.discuss_assessment(assessment, body.question),
     )
     return {"answer": answer}
-

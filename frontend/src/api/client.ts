@@ -92,11 +92,6 @@ export function openAssessStream(
   }
 }
 
-/** Retrieve detailed assessment result as a one-shot REST call (no SSE). */
-export const getAssessment = (_p: AssessParams): Promise<AssessmentResponse> => {
-  throw new Error('Use openAssessStream for streaming results')
-}
-
 /** Ask a question about a completed assessment. */
 export async function askQuestion(
   question: string,
@@ -113,4 +108,21 @@ export async function askQuestion(
   }
   const data = await res.json() as { answer: string }
   return data.answer
+}
+
+/** Drop sites scoring above `threshold` and re-run the scoring pipeline. */
+export async function recalculateDroppingHighRisk(
+  assessment: AssessmentResponse,
+  threshold: 30 | 60,
+): Promise<AssessmentResponse> {
+  const res = await fetch(`${BASE}/recalculate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ assessment, threshold }),
+  })
+  if (!res.ok) {
+    const body = await res.text().catch(() => res.statusText)
+    throw new Error(`Recalculate → ${res.status}: ${body}`)
+  }
+  return res.json() as Promise<AssessmentResponse>
 }

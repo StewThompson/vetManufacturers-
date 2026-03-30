@@ -163,9 +163,9 @@ def build_multi_target_model(scorer, *, sample_size: int, force: bool = False):
 
     # Target distributions
     wr_rate  = sum(r["any_wr_serious"]   for r in rows) / len(rows)
-    lrg_rate = sum(r["is_large_penalty"] for r in rows) / len(rows)
-    print(f"  WR/Serious positive rate: {wr_rate:.1%}")
-    print(f"  Large-penalty positive rate: {lrg_rate:.1%}")
+    inj_rate = sum(r["any_injury_fatal"] for r in rows) / len(rows)
+    print(f"  WR/Serious positive rate:    {wr_rate:.1%}")
+    print(f"  Injury/Fatal positive rate:  {inj_rate:.1%}")
 
     X_raw = np.array([r["features_46"] for r in rows], dtype=float)
     X     = scorer._log_transform_features(np.nan_to_num(X_raw, nan=0.0))

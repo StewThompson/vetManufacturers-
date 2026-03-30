@@ -16,7 +16,6 @@ from sklearn.pipeline import Pipeline
 from src.models.osha_record import OSHARecord
 from src.data_retrieval.naics_lookup import get_industry_name, load_naics_map
 from src.scoring.industry_stats import compute_industry_stats, compute_relative_features
-from src.scoring.pseudo_labeler import pseudo_label
 from src.scoring.tail_calibrator import TailCalibrator
 
 
@@ -365,9 +364,92 @@ class MLRiskScorer:
         return self._log_transform_features(raw)
 
     # ------------------------------------------------------------------ #
-    #  Pseudo-label generation (domain knowledge) — delegated
+    #  Heuristic label generation (domain knowledge) — internal only
     # ------------------------------------------------------------------ #
-    _pseudo_label = staticmethod(pseudo_label)
+    @staticmethod
+    def _heuristic_label(row: np.ndarray) -> float:
+        """Map 46 raw OSHA features → 0-100 heuristic risk score used as
+        GBR training target (rescaled to match temporal adverse distribution
+        during training when real labels are available)."""
+        (n_insp, n_viols, serious, willful, repeat,
+         total_pen, avg_pen, max_pen, recent_ratio, severe, vpi,
+         accident_count, fatality_count, injury_count, avg_gravity,
+         pen_per_insp, clean_ratio,
+         time_adj_pen) = row[:18]
+
+        naics_unknown = float(row[-1])
+
+        score = 0.0
+        dormant_scale = 0.5 if recent_ratio < 0.01 else 1.0
+        fat_dormant_scale = 0.5 if recent_ratio < 0.01 else 1.0
+        insp_confidence = min(0.5 + n_insp / 10.0, 1.0)
+
+        if fatality_count > 0:
+            eff_fatalities = min(fatality_count * 5.0, 5.0)
+            rate_contrib = min(12.0 + max(eff_fatalities - 1.0, 0.0) * 3.0, 24.0)
+            abs_proxy = n_insp * fatality_count
+            pattern_boost = min(np.log1p(abs_proxy) * 2.0, 8.0)
+            score += (rate_contrib + pattern_boost) * fat_dormant_scale * insp_confidence
+        score += min(severe * 25.0, 6)
+        score += min(injury_count * 6.0, 4)
+        score += min(accident_count * 10.0, 4)
+        score = min(score, 34)
+
+        score += min(willful * 60.0, 20) * dormant_scale
+        score += min(repeat  * 50.0, 15) * dormant_scale
+        score += min(serious * 25.0, 15)
+        if avg_gravity > 0:
+            score += min(avg_gravity * 0.6, 6)
+
+        if recent_ratio > 0 and (willful + repeat) > 0:
+            active_wr = recent_ratio * (willful * 3.0 + repeat * 2.0) * 25.0
+            score += min(active_wr, 20.0)
+
+        score += recent_ratio * 12.0
+        score += min(vpi * 2.5, 10)
+
+        if recent_ratio > 0.5 and vpi >= 1.5:
+            trajectory_premium = min((recent_ratio - 0.5) * 2.0 * (vpi - 1.0), 8.0)
+            score += trajectory_premium
+        elif recent_ratio < 0.2 and vpi < 0.5 and n_insp >= 3:
+            score -= min((0.2 - recent_ratio) * 10.0, 5.0)
+
+        if time_adj_pen > 0:
+            score += min(time_adj_pen / 40_000, 10.0)
+        if pen_per_insp > 0:
+            score += min(pen_per_insp / 20_000, 6.0)
+
+        if naics_unknown > 0.5:
+            score += 4.0
+
+        is_dormant = recent_ratio < 0.01
+        fat_blocks_clean = (
+            (fatality_count > 0 or accident_count > 0 or severe > 0)
+            and not is_dormant
+        )
+        if clean_ratio > 0 and not fat_blocks_clean:
+            if n_insp >= 3:
+                score -= clean_ratio * 10.0
+            elif n_insp == 2:
+                score -= clean_ratio * 4.0
+
+        if n_insp <= 1:
+            score += 2.5
+        elif n_insp <= 3:
+            score += 1.5
+        elif n_insp <= 5:
+            score += 0.5
+
+        if fatality_count > 0 and (willful + repeat) > 0:
+            score += 8.0 * insp_confidence * dormant_scale
+        if willful > 0 and repeat > 0:
+            score += 5.0 * insp_confidence * dormant_scale
+        if recent_ratio > 0.5 and serious >= 0.25:
+            score += 4.0
+
+        return float(np.clip(score, 0, 100))
+
+    _pseudo_label = _heuristic_label
 
     # ------------------------------------------------------------------ #
     #  Population data from bulk cache

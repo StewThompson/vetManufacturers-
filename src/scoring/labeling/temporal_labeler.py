@@ -512,7 +512,8 @@ def build_temporal_training_labels(
         real_label      : float — normalised to [0, 100]
         cutoff_date     : str   — ISO cutoff used to build this row
     """
-    from src.scoring.pseudo_labeler import pseudo_label as _pseudo_label
+    from src.scoring.ml_risk_scorer import MLRiskScorer as _MLRiskScorer
+    _pseudo_label = _MLRiskScorer._heuristic_label
     from src.scoring.industry_stats import (
         compute_industry_stats,
         compute_relative_features,

@@ -95,18 +95,12 @@ export interface ProbabilisticRiskTargetsOut {
   p_serious_wr_event: number
   /** Head 2: expected total OSHA penalty (USD) */
   expected_penalty_usd_12m: number
-  /** Head 3: expected total violations/citations */
-  expected_citations_12m: number
-  /** Head 4: probability of exceeding NAICS-adjusted P75 penalty threshold */
-  p_moderate_penalty_event: number
-  /** Head 4: probability of exceeding NAICS-adjusted P90 penalty threshold */
-  p_large_penalty_event: number
-  /** Head 4: probability of exceeding NAICS-adjusted P95 penalty threshold */
-  p_extreme_penalty_event: number
+  /** Head 3: probability of any hospitalization or fatality event */
+  p_injury_event: number
+  /** Head 4: gravity-weighted violation severity score (raw) */
+  gravity_score: number
   /** Weighted composite of all four heads (0–100) */
   composite_risk_score: number
-  /** NAICS-adjusted P90 dollar threshold used for large-penalty head */
-  large_penalty_threshold_usd: number
 }
 
 export interface AssessmentResponse {

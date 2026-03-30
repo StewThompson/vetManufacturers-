@@ -2,16 +2,15 @@
 probabilistic risk model.
 
 Unlike the single-target ``temporal_labeler`` (which returns one composite
-adverse-outcome score), this module produces **7 target columns** per
+adverse-outcome score), this module produces **6 target columns** per
 establishment that directly correspond to the 4 prediction heads:
 
     1. any_wr_serious       — 0/1, any Willful/Repeat/Serious violation post-cutoff
     2. future_total_penalty — float ($), total OSHA penalties in the outcome window
     3. log_penalty          — log1p(future_total_penalty)
-    4. future_citation_count — int, total violations (citations) post-cutoff
-    5. is_moderate_penalty  — 0/1, total penalty ≥ NAICS P75 threshold
-    6. is_large_penalty     — 0/1, total penalty ≥ NAICS P90 threshold
-    7. is_extreme_penalty   — 0/1, total penalty ≥ NAICS P95 threshold
+    4. any_injury_fatal     — 0/1, any hospitalization OR fatality event post-cutoff
+    5. gravity_weighted_score — float, Σ(gravity × viol_weight) for future violations
+    6. real_label           — 0-100 composite adverse outcome (for calibration/weight opt)
 
 Design notes
 ------------
@@ -47,7 +46,6 @@ from src.scoring.labeling.temporal_labeler import (
     _parse_date,
     _stream_inspections,
     _build_violation_index,
-    _build_accident_stats,
     _aggregate_hist_features,
     _compute_adverse,
     _normalize_adverse,
@@ -62,21 +60,72 @@ CACHE_FILENAME = "multi_target_labels.pkl"
 
 # ── Per-establishment multi-target computation ──────────────────────────────
 
+
+def _build_hosp_fatal_stats(
+    accidents_path: str,
+    injuries_path: str,
+    activity_nrs: set,
+) -> Dict[str, bool]:
+    """Return {activity_nr: True} if any hospitalization or fatality was
+    recorded in the injuries table for the given OSHA inspection activity numbers.
+
+    OSHA degree_of_inj codes used:
+        '1.0' or '1' → Fatality
+        '2.0' or '2' → Hospitalized injury
+    Both are treated as positive for the p_injury target.
+    """
+    # Build summary_nr sets per inspection
+    summaries_by_act: Dict[str, set] = defaultdict(set)
+    serious_inj_by_key: Dict[str, bool] = {}
+
+    csv.field_size_limit(10 * 1024 * 1024)
+    try:
+        with open(
+            injuries_path, "r", newline="", encoding="utf-8", errors="replace"
+        ) as f:
+            for row in csv.DictReader(f):
+                act = str(row.get("rel_insp_nr", ""))
+                if act not in activity_nrs:
+                    continue
+                snr = str(row.get("summary_nr", ""))
+                if not snr:
+                    continue
+                summaries_by_act[act].add(snr)
+                doi_raw = str(row.get("degree_of_inj", "")).strip()
+                try:
+                    doi = float(doi_raw)
+                except ValueError:
+                    doi = -1.0
+                if doi in (1.0, 2.0):  # fatality or hospitalized
+                    serious_inj_by_key[f"{act}|{snr}"] = True
+    except FileNotFoundError:
+        pass
+
+    result: Dict[str, bool] = {}
+    for act in activity_nrs:
+        hit = False
+        for snr in summaries_by_act.get(act, set()):
+            if serious_inj_by_key.get(f"{act}|{snr}", False):
+                hit = True
+                break
+        result[act] = hit
+    return result
+
+
 def _compute_multi_targets(
     future_viols: List[dict],
-    future_fatalities: int,
+    any_injury_fatal: bool,
     n_future_insp: int,
-    penalty_thresholds: Dict[str, Dict[str, float]],
-    naics_2digit: Optional[str],
 ) -> Dict[str, float]:
-    """Compute all 7 target variables from post-cutoff violations.
+    """Compute all 6 target variables from post-cutoff violations and injuries.
 
     Parameters
     ----------
     future_viols : list of dicts with keys ``viol_type``, ``current_penalty``,
-        ``initial_penalty`` from the violations CSV.
-    future_fatalities : int
-        Number of post-cutoff fatality events linked to this establishment.
+        ``initial_penalty``, ``gravity`` from the violations CSV.
+    any_injury_fatal : bool
+        True if any future inspection linked to this establishment had a
+        hospitalized or fatal injury (from ``_build_hosp_fatal_stats``).
     n_future_insp : int
         Number of post-cutoff inspections.
     penalty_thresholds : dict
@@ -88,36 +137,42 @@ def _compute_multi_targets(
     -------
     dict with keys:
         any_wr_serious, future_total_penalty, log_penalty,
-        future_citation_count, is_moderate_penalty, is_large_penalty,
-        is_extreme_penalty, real_label_raw, real_label
+        any_injury_fatal, gravity_weighted_score, real_label_raw, real_label
     """
     total_penalty = sum(
         float(v.get("current_penalty") or v.get("initial_penalty") or 0)
         for v in future_viols
     )
-    n_citations  = len(future_viols)
-    wr_serious   = sum(
+    wr_serious = sum(
         1 for v in future_viols
         if v.get("viol_type") in ("W", "R", "S")
     )
 
-    p75 = lookup_threshold(penalty_thresholds, naics_2digit, "p75")
-    p90 = lookup_threshold(penalty_thresholds, naics_2digit, "p90")
-    p95 = lookup_threshold(penalty_thresholds, naics_2digit, "p95")
+    # Gravity-weighted severity: Σ(gravity × viol_weight)
+    # viol_weight: W/R→3, S→2, all others→1
+    grav_total = 0.0
+    for v in future_viols:
+        raw_g = v.get("gravity", "")
+        try:
+            g = float(str(raw_g).strip()) if raw_g else 0.0
+        except ValueError:
+            g = 0.0
+        vt = v.get("viol_type", "")
+        weight = 3.0 if vt in ("W", "R") else (2.0 if vt == "S" else 1.0)
+        grav_total += g * weight
 
     # Composite adverse (for calibration / backward compat)
-    raw_adv   = _compute_adverse(future_viols, future_fatalities, n_future_insp)
+    # Pass 0 fatalities for the composite calc — injury data now drives p_injury
+    raw_adv   = _compute_adverse(future_viols, 0, n_future_insp)
     real_label = _normalize_adverse(raw_adv)
 
     return {
-        "any_wr_serious":       int(wr_serious > 0),
-        "future_total_penalty": total_penalty,
-        "log_penalty":          math.log1p(total_penalty),
-        "future_citation_count": n_citations,
-        "is_moderate_penalty":  int(total_penalty >= p75),
-        "is_large_penalty":     int(total_penalty >= p90),
-        "is_extreme_penalty":   int(total_penalty >= p95),
-        # Kept for diagnostics / backward compat with existing calibrator
+        "any_wr_serious":        int(wr_serious > 0),
+        "future_total_penalty":  total_penalty,
+        "log_penalty":           math.log1p(total_penalty),
+        "any_injury_fatal":      int(any_injury_fatal),
+        "gravity_weighted_score": grav_total,
+        # Kept for diagnostics / weight optimization
         "real_label_raw":  raw_adv,
         "real_label":      real_label,
     }
@@ -144,7 +199,7 @@ def _build_fingerprint(
         "sample_size": sample_size,
         "insp_mtime":  _mtime(inspections_path),
         "viol_mtime":  _mtime(violations_path),
-        "schema":      "multi_target_v1",
+        "schema":      "multi_target_v2",  # bumped: p_injury + p_gravity heads
     }
 
 
@@ -214,7 +269,8 @@ def build_multi_target_sample(
         naics_2digit       : str
         cutoff_date        : str (ISO)
     """
-    from src.scoring.pseudo_labeler import pseudo_label as _pseudo_label
+    from src.scoring.ml_risk_scorer import MLRiskScorer as _MLRiskScorer
+    _pseudo_label = _MLRiskScorer._heuristic_label
     from src.scoring.industry_stats import (
         compute_industry_stats,
         compute_relative_features,
@@ -271,9 +327,9 @@ def build_multi_target_sample(
     hist_viol_index   = _build_violation_index(violations_path, all_hist_acts)
     future_viol_index = _build_violation_index(violations_path, all_future_acts)
 
-    print("  [MultiTargetLabeler] Building accident/fatality stats …")
-    hist_fatals   = _build_accident_stats(accidents_path, injuries_path, all_hist_acts)
-    future_fatals = _build_accident_stats(accidents_path, injuries_path, all_future_acts)
+    print("  [MultiTargetLabeler] Building injury/fatality stats …")
+    hist_fatals   = _build_hosp_fatal_stats(accidents_path, injuries_path, all_hist_acts)
+    future_hosp_fatal = _build_hosp_fatal_stats(accidents_path, injuries_path, all_future_acts)
 
     # ── PASS 3: aggregate features and targets ─────────────────────────────
     print(f"  [MultiTargetLabeler] Computing features + targets for {len(paired_names):,} establishments …")
@@ -293,14 +349,13 @@ def build_multi_target_sample(
         features_17, naics_group, raw_vpi, raw_avg_pen, raw_sr, raw_wr = agg
 
         # LEAKAGE GUARD: outcomes from future_insp only
-        fut_acts  = [r["activity_nr"] for r in future_insp]
-        fut_viols = [v for act in fut_acts for v in future_viol_index.get(act, [])]
-        fut_fats  = sum(future_fatals.get(act, 0) for act in fut_acts)
+        fut_acts       = [r["activity_nr"] for r in future_insp]
+        fut_viols      = [v for act in fut_acts for v in future_viol_index.get(act, [])]
+        fut_any_injury = any(future_hosp_fatal.get(act, False) for act in fut_acts)
 
         naics_2d = naics_group[:2] if naics_group else None
         targets = _compute_multi_targets(
-            fut_viols, fut_fats, len(future_insp),
-            penalty_thresholds, naics_2d,
+            fut_viols, fut_any_injury, len(future_insp),
         )
 
         rows_raw.append({
@@ -399,10 +454,11 @@ def build_multi_target_sample(
 
     pos   = sum(1 for r in sampled if r["any_wr_serious"])
     neg   = len(sampled) - pos
+    inj   = sum(1 for r in sampled if r["any_injury_fatal"])
     print(
         f"  [MultiTargetLabeler] Sample: {len(sampled):,} rows, "
         f"WR/Serious: {pos:,} pos / {neg:,} neg ({pos/max(1,len(sampled)):.1%} rate), "
-        f"Large-penalty: {sum(1 for r in sampled if r['is_large_penalty']):,}"
+        f"Injury/Fatal: {inj:,} ({inj/max(1,len(sampled)):.1%} rate)"
     )
     return sampled
 

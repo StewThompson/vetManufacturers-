@@ -123,11 +123,11 @@ def build_multi_target_model(scorer, *, sample_size: int, force: bool = False):
 
     penalty_thresholds = load_percentiles(thresh_path)
     cutoff_date        = scorer.TEMPORAL_LABEL_CUTOFF
-    # Use 2023-12-31 as outcome_end to match the test evaluation window.
-    # The test uses cutoff=2021-01-01, outcome_end=2023-12-31 (3-year window).
-    # Aligning training outcomes to the same absolute end date reduces
-    # train/test distribution mismatch significantly.
-    outcome_end        = date(2023, 12, 31)
+    # Outcome window runs from the training cutoff (2022-01-01) through the
+    # most recent available data (2025-03-31), giving a 3+ year post-COVID
+    # window.  Pre-COVID suppression (2020-2021) is entirely excluded from
+    # training labels by the 2022 cutoff.
+    outcome_end        = date(2025, 3, 31)
 
     # --force: delete label cache so load_or_build rebuilds from scratch
     if force:
@@ -154,6 +154,7 @@ def build_multi_target_model(scorer, *, sample_size: int, force: bool = False):
         naics_map=scorer._naics_map,
         penalty_thresholds=penalty_thresholds,
         sample_size=sample_size,
+        min_hist_insp=2,
     )
     print(f"  Labels built: {len(rows):,} rows  ({time.time()-t0:.1f}s)")
 

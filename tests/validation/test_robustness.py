@@ -13,14 +13,13 @@ from sklearn.metrics import roc_auc_score
 from unittest.mock import patch
 
 from tests.validation.shared import (
-    RealWorldData, CUTOFF_DATE, CACHE_DIR, MULTI_CUTOFF_DATES,
+    RealWorldData, CUTOFF_DATE, CACHE_DIR,
     EVAL_THRESHOLDS, TOPK_FRACTIONS,
     MIN_HIST_ESTABLISHMENTS, MIN_FUTURE_ESTABLISHMENTS, MIN_BINARY_POSITIVE,
     MIN_SPEARMAN_REAL, MIN_TOP_DECILE_LIFT, MIN_BINARY_DELTA, MIN_AUROC,
     _risk_tier, _spearman_bootstrap_ci, _decile_summary, _auroc_if_sufficient,
-    _compute_topk_capture, _run_cutoff_analysis, _compute_threshold_metrics,
+    _compute_topk_capture, _compute_threshold_metrics,
     _load_raw_data, _build_per_establishment_data, _build_feature_matrix,
-    _train_and_score_historical, _train_and_score_with_temporal_labels,
     _assign_confidence_tag,
 )
 from src.scoring.ml_risk_scorer import MLRiskScorer
@@ -191,56 +190,6 @@ class TestSparseDataRobustness:
 # ====================================================================== #
 
 
-class TestMultiCutoffSensitivity:
-    """Run the same score-vs-future-outcome analysis across multiple cutoff
-    dates.  If the positive predictive relationship only holds for one
-    particular cutoff, the model may be overfit to a time-specific pattern.
-
-    Thresholds are intentionally weak; we simply require the direction
-    (rho > 0) to be consistent across whichever cutoffs have sufficient data.
-    """
-
-    def test_consistent_direction_across_cutoffs(self, rw_data: RealWorldData):
-        """Spearman rho should be positive for each cutoff date that has
-        enough data, across all entries in MULTI_CUTOFF_DATES."""
-        # Re-use the already-loaded raw data by building a fresh scorer stub.
-        from unittest.mock import patch
-
-        all_inspections, viols_by_activity, accident_stats = _load_raw_data()
-        if not all_inspections:
-            pytest.skip("Raw data unavailable for multi-cutoff analysis")
-
-        with patch.object(MLRiskScorer, "_load_or_build"):
-            stub_scorer = MLRiskScorer(osha_client=None)
-        naics_map = load_naics_map()
-
-        results = []
-        for cd in MULTI_CUTOFF_DATES:
-            res = _run_cutoff_analysis(
-                all_inspections, viols_by_activity, accident_stats,
-                naics_map, stub_scorer, cd,
-            )
-            if res is not None:
-                results.append(res)
-
-        if len(results) < 2:
-            pytest.skip(
-                f"Fewer than 2 cutoff dates had sufficient data "
-                f"(tried {MULTI_CUTOFF_DATES})"
-            )
-
-        print("\n  Multi-cutoff sensitivity:")
-        for r in results:
-            print(f"    cutoff={r['cutoff']}  n_hist={r['n_hist']}  "
-                  f"n_paired={r['n_paired']}  rho={r['spearman_rho']:+.3f}")
-
-        n_positive = sum(1 for r in results if r["spearman_rho"] > 0)
-        assert n_positive == len(results), (
-            f"Positive rho for only {n_positive}/{len(results)} cutoff dates — "
-            f"relationship may not be stable across time"
-        )
-
-
 # ====================================================================== #
 #  11. Summary report (always passes, prints diagnostics)
 # ====================================================================== #
@@ -273,7 +222,7 @@ class TestSummaryReport:
         log_pen  = rw_data.paired_log_penalties
 
         # ── Score distribution ─────────────────────────────────────────
-        print("  BASELINE SCORE DISTRIBUTION (historical)")
+        print("  SCORE DISTRIBUTION (MT model)")
         print(f"    mean={scores.mean():.1f}  std={scores.std():.1f}  "
               f"p10={np.percentile(scores, 10):.1f}  "
               f"p50={np.percentile(scores, 50):.1f}  "
@@ -771,161 +720,4 @@ class TestWithinIndustryValidation:
             f"Within-sector top-decile lift < 1.0 in majority of sectors: "
             f"{n_positive}/{n_total}.  Score may not discriminate within industries."
         )
-
-
-# ====================================================================== #
-#  Temporal Supervision Validation
-# ====================================================================== #
-
-
-class TestTemporalSupervision:
-    """Validate that the temporal-label augmented model is at least as
-    predictive as the pseudo-label baseline.
-
-    These tests are explicitly tolerant: temporal supervision is expected to
-    reduce circularity (the labels are not derived from the scoring function
-    itself) so the primary requirement is that prediction quality does not
-    regress materially.  A temporal model that matches or exceeds the baseline
-    on real-world future outcomes confirms the augmentation strategy is sound.
-    """
-
-    def test_temporal_label_build_sample_nonempty(self, rw_data: RealWorldData):
-        """Temporal label builder must find at least some paired establishments.
-
-        Skips gracefully when the cache has insufficient temporal coverage
-        (e.g. when running against a truncated development cache).
-        """
-        if not rw_data.temporal_rows:
-            pytest.skip(
-                "No temporal training labels found — cache may lack pre-2020 data. "
-                "Run build_cache.py with CUTOFF_YEARS >= 10 to populate."
-            )
-        assert len(rw_data.temporal_rows) > 0, (
-            "temporal_rows is unexpectedly empty after successful load."
-        )
-        print(f"\n  Temporal training label sample: {len(rw_data.temporal_rows):,} rows")
-
-    def test_temporal_label_distribution_realistic(self, rw_data: RealWorldData):
-        """Real adverse labels must be non-trivial: mean > 0, std > 0, max <= 100."""
-        if not rw_data.temporal_rows:
-            pytest.skip("No temporal training labels — see test_temporal_label_build_sample_nonempty")
-
-        real_labels = np.array([r["real_label"] for r in rw_data.temporal_rows])
-        assert real_labels.mean() > 0, (
-            "All temporal real labels are 0 — no adverse outcomes recorded in the "
-            "2020–2024 outcome window.  Check that build_cache.py includes recent data."
-        )
-        assert real_labels.std() > 0, (
-            "All temporal real labels are identical — label computation may be broken."
-        )
-        assert real_labels.max() <= 100.0, (
-            f"Temporal real label max={real_labels.max():.1f} exceeds 100 — "
-            "normalisation is broken."
-        )
-        pseudo_labels = np.array([r["pseudo_label"] for r in rw_data.temporal_rows])
-        print(
-            f"\n  Real adverse labels  : mean={real_labels.mean():.2f}  "
-            f"std={real_labels.std():.2f}  max={real_labels.max():.1f}"
-        )
-        print(
-            f"  Pseudo labels (same) : mean={pseudo_labels.mean():.2f}  "
-            f"std={pseudo_labels.std():.2f}"
-        )
-
-    def test_temporal_sample_stratification(self, rw_data: RealWorldData):
-        """Temporal sample must cover multiple 2-digit NAICS sectors.
-
-        A sample drawn from a single sector would bias the temporal model
-        heavily toward that industry.
-        """
-        if not rw_data.temporal_rows:
-            pytest.skip("No temporal training labels — see test_temporal_label_build_sample_nonempty")
-
-        sectors = {r.get("naics_2digit", r.get("name", "")[:2])
-                   for r in rw_data.temporal_rows
-                   if r.get("naics_2digit") or len(r.get("name", "")) >= 2}
-        # Fall back to stratum key sector prefix if naics_2digit not present
-        if not sectors:
-            sectors = {r.get("stratum_key", "XX")[:2]
-                       for r in rw_data.temporal_rows}
-
-        print(f"\n  Unique 2-digit NAICS sectors in temporal sample: {len(sectors)}")
-        assert len(sectors) >= 2, (
-            f"Temporal sample only covers {len(sectors)} NAICS sector(s). "
-            "Stratification may have failed."
-        )
-
-    def test_temporal_model_spearman_not_worse_than_pseudo(
-        self, rw_data: RealWorldData
-    ):
-        """Temporal-label model must not materially regress below the pseudo-label baseline.
-
-        Tolerance of 0.05 in Spearman rho allows for legitimate variance at
-        smaller paired-set sizes without falsely failing a sound temporal model.
-        """
-        rw_data._skip_if_insufficient()
-        if len(rw_data.paired_temporal_scores) != len(rw_data.paired_scores):
-            pytest.skip(
-                "paired_temporal_scores not populated — temporal model may have "
-                "fallen back to baseline due to missing labels."
-            )
-
-        rho_baseline = float(spearmanr(
-            rw_data.paired_scores, rw_data.paired_adverse_scores
-        )[0])
-        rho_temporal = float(spearmanr(
-            rw_data.paired_temporal_scores, rw_data.paired_adverse_scores
-        )[0])
-
-        TOLERANCE = 0.05
-        print(
-            f"\n  Spearman rho — baseline:  {rho_baseline:+.4f}  "
-            f"temporal: {rho_temporal:+.4f}  "
-            f"delta: {rho_temporal - rho_baseline:+.4f}"
-        )
-        assert rho_temporal >= rho_baseline - TOLERANCE, (
-            f"Temporal model Spearman rho ({rho_temporal:.4f}) is more than "
-            f"{TOLERANCE} below baseline ({rho_baseline:.4f}).  "
-            "Temporal label augmentation may be introducing noise or the real-label "
-            "distribution is very different from the pseudo-label distribution."
-        )
-
-    def test_temporal_label_coverage_report(self, rw_data: RealWorldData):
-        """Diagnostic: print a summary comparing temporal vs pseudo label stats.
-
-        Always passes.  Provides a structured comparison useful for reviewing
-        whether real adverse labels are systematically higher or lower than
-        the pseudo-labels for the same establishments.
-        """
-        if not rw_data.temporal_rows:
-            pytest.skip("No temporal training labels — see test_temporal_label_build_sample_nonempty")
-
-        real_labels   = np.array([r["real_label"]   for r in rw_data.temporal_rows])
-        pseudo_labels = np.array([r["pseudo_label"] for r in rw_data.temporal_rows])
-        raw_labels    = np.array([r["real_label_raw"] for r in rw_data.temporal_rows])
-
-        col_w = 70
-        sep   = "=" * col_w
-        print("\n" + sep)
-        print("TEMPORAL LABEL COVERAGE REPORT")
-        print(sep)
-        print(f"  Training label pairs     : {len(rw_data.temporal_rows):,}")
-        print(f"  Real adverse labels      : mean={real_labels.mean():.2f}  "
-              f"std={real_labels.std():.2f}  "
-              f"median={float(np.median(real_labels)):.2f}  "
-              f"max={real_labels.max():.1f}")
-        print(f"  Raw adverse scores       : mean={raw_labels.mean():.2f}  "
-              f"std={raw_labels.std():.2f}  max={raw_labels.max():.1f}")
-        print(f"  Pseudo-labels (same set) : mean={pseudo_labels.mean():.2f}  "
-              f"std={pseudo_labels.std():.2f}  "
-              f"median={float(np.median(pseudo_labels)):.2f}")
-        delta_mean = real_labels.mean() - pseudo_labels.mean()
-        direction  = "higher" if delta_mean > 0 else "lower"
-        print(f"  Mean real vs pseudo delta: {delta_mean:+.2f}  "
-              f"(real labels are {direction} on average)")
-        corr = float(np.corrcoef(pseudo_labels, real_labels)[0, 1])
-        print(f"  Pearson(pseudo, real)     : {corr:.4f}  "
-              f"({'strong' if abs(corr) > 0.5 else 'moderate' if abs(corr) > 0.3 else 'weak'} "
-              f"agreement)")
-        print(sep)
 

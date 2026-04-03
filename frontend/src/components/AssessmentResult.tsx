@@ -82,11 +82,9 @@ const SCORE_COLORS: Record<'green' | 'yellow' | 'red', { stroke: string; trackSt
 function ScoreRing({
   score,
   color,
-  isMLComposite,
 }: {
   score: number
   color: 'green' | 'yellow' | 'red'
-  isMLComposite: boolean
 }) {
   const R = 48
   const SW = 9
@@ -146,8 +144,7 @@ function ScoreRing({
           / 100
         </text>
       </svg>
-      {isMLComposite && (
-        <div
+      <div
           style={{
             position: 'absolute',
             bottom: 4,
@@ -167,7 +164,6 @@ function ScoreRing({
         >
           ML Composite
         </div>
-      )}
     </div>
   )
 }
@@ -182,7 +178,7 @@ export function RiskBanner({ result }: { result: AssessmentResponse }) {
     <div className={`risk-banner risk-banner-${color}`}>
       {/* Left: ring + percentile */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
-        <ScoreRing score={result.risk_score} color={color} isMLComposite={!!result.risk_targets} />
+        <ScoreRing score={result.risk_score} color={color} />
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <div>
             <div className="risk-score-label">{result.manufacturer_name}</div>

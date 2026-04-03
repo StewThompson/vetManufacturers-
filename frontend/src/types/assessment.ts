@@ -91,15 +91,21 @@ export interface ComplianceOutlook12M {
 }
 
 export interface ProbabilisticRiskTargetsOut {
-  /** Head 1: probability of any Serious/Willful/Repeat citation within 12 months */
+  /** Primary: probability of any Serious/Willful/Repeat citation within 12 months */
   p_serious_wr_event: number
-  /** Head 2: expected total OSHA penalty (USD) */
-  expected_penalty_usd_12m: number
-  /** Head 3: probability of any hospitalization or fatality event */
+  /** Primary: probability of any hospitalization or fatality event */
   p_injury_event: number
-  /** Head 4: gravity-weighted violation severity score (raw) */
+  /** Primary: probability of penalty >= industry P95 threshold */
+  p_penalty_ge_p95: number
+  /** Auxiliary: probability of penalty >= industry P75 */
+  p_penalty_ge_p75: number
+  /** Auxiliary: probability of penalty >= industry P90 */
+  p_penalty_ge_p90: number
+  /** Legacy: expected total OSHA penalty (USD) */
+  expected_penalty_usd_12m: number
+  /** Legacy: gravity-weighted violation severity score (raw) */
   gravity_score: number
-  /** Weighted composite of all four heads (0–100) */
+  /** Weighted composite of primary heads (0–100) */
   composite_risk_score: number
 }
 
@@ -109,6 +115,8 @@ export interface AssessmentResponse {
   recommendation: Recommendation
   explanation: string
   confidence_score: number
+  risk_confidence: 'high' | 'medium' | 'low'
+  confidence_detail: Record<string, unknown>
   feature_weights: Record<string, number>
   percentile_rank: number
   industry_label: string

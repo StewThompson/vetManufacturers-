@@ -12,8 +12,10 @@ import ProgressStream, {
 import ViolationsGrid from './components/ViolationsGrid'
 import SiteBreakdown from './components/SiteBreakdown'
 import ChatBox from './components/ChatBox'
+import ReportPage from './components/ReportPage'
 
 type Tab = 'overview' | 'violations' | 'sites' | 'details'
+type Page = 'assessment' | 'report'
 
 export default function App() {
   const [selectedRawNames, setSelectedRawNames] = useState<string[]>([])
@@ -25,6 +27,7 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('overview')
   const [isRecalculating, setIsRecalculating] = useState(false)
   const [dropError, setDropError] = useState<string | null>(null)
+  const [page, setPage] = useState<Page>('assessment')
   const cleanupRef = useRef<(() => void) | null>(null)
 
   const handleSelectionChange = useCallback(
@@ -93,12 +96,40 @@ export default function App() {
         <div className="topbar-logo">
           Manufacturer <span>Compliance</span> Intelligence
         </div>
-        <div style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--text-muted)' }}>
-          OSHA Risk Assessment Platform
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <button
+            className={`tab-btn${page === 'assessment' ? ' active' : ''}`}
+            style={{ padding: '3px 12px', fontSize: 12 }}
+            onClick={() => setPage('assessment')}
+          >
+            Assessment
+          </button>
+          <button
+            className={`tab-btn${page === 'report' ? ' active' : ''}`}
+            style={{ padding: '3px 12px', fontSize: 12 }}
+            onClick={() => setPage('report')}
+          >
+            Model Report
+          </button>
         </div>
       </header>
 
-      <div className="main">
+      {page === 'report' && (
+        <div style={{ overflowY: 'auto', height: 'calc(100vh - 56px)', background: '#f0f4f8', padding: '16px 0' }}>
+          <ReportPage />
+          <div style={{ textAlign: 'center', marginTop: 8 }}>
+            <button
+              className="tab-btn"
+              style={{ fontSize: 11, padding: '4px 14px' }}
+              onClick={() => window.print()}
+            >
+              Export PDF
+            </button>
+          </div>
+        </div>
+      )}
+
+      {page === 'assessment' && <div className="main">
         {/* Left sidebar — search */}
         <aside className="sidebar">
           <SearchCard
@@ -222,7 +253,7 @@ export default function App() {
             </>
           )}
         </main>
-      </div>
+      </div>}
     </div>
   )
 }

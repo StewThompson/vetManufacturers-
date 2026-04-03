@@ -105,9 +105,15 @@ class ComplianceOutlook12M(BaseModel):
 
 class ProbabilisticRiskTargetsOut(BaseModel):
     """Multi-target probabilistic predictions for the next 12 months."""
+    # Primary heads (drive composite score)
     p_serious_wr_event: float
-    expected_penalty_usd_12m: float
     p_injury_event: float
+    p_penalty_ge_p95: float = 0.0
+    # Auxiliary penalty tier heads
+    p_penalty_ge_p75: float = 0.0
+    p_penalty_ge_p90: float = 0.0
+    # Legacy regression heads
+    expected_penalty_usd_12m: float
     gravity_score: float
     composite_risk_score: float
 
@@ -118,6 +124,8 @@ class AssessmentResponse(BaseModel):
     recommendation: Literal["Recommend", "Proceed with Caution", "Do Not Recommend"]
     explanation: str
     confidence_score: float
+    risk_confidence: str  # "high" / "medium" / "low"
+    confidence_detail: Dict[str, Any] = {}
     feature_weights: Dict[str, float]
     percentile_rank: float
     industry_label: str

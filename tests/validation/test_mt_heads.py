@@ -76,6 +76,27 @@ def test_target_distributions():
     assert inj_rate > 0.0, f"Injury/fatal rate is exactly 0 — label generation may be broken"
 
 
+def test_pos_label_rate_not_suppressed():
+    """Guard against COVID-like inspection suppression silently degrading labels.
+
+    During the 2020-2021 COVID period OSHA inspection volume collapsed, causing
+    the any_wr_serious positive rate to drop well below 35%.  The 2022 training
+    cutoff should keep the rate above this floor.  If it drops below 35% again,
+    the training-cutoff or outcome-window configuration needs review.
+    """
+    _, rows, _ = _get_val_data()
+    if not rows:
+        pytest.skip("No validation data available")
+
+    wr_rate = np.mean([r["any_wr_serious"] for r in rows])
+    print(f"\n  WR/Serious positive rate (suppression guard): {wr_rate:.1%}")
+    assert wr_rate >= 0.35, (
+        f"any_wr_serious positive rate {wr_rate:.1%} is below the 35% floor. "
+        f"This may indicate COVID-era inspection suppression in the label window. "
+        f"Check TEMPORAL_LABEL_CUTOFF and outcome_end date."
+    )
+
+
 def test_penalty_percentile_thresholds_exist():
     """Penalty percentile file must exist and have a global fallback entry."""
     thresh_path = os.path.join(CACHE_DIR, PERCENTILE_CACHE)

@@ -2,7 +2,7 @@
 reoptimize_weights.py — Re-optimize composite weights on an existing trained
 MultiTargetRiskScorer using the improved Nelder-Mead optimizer.
 
-This is much faster than full retraining because it only changes the 4 weights
+This is much faster than full retraining because it only changes the 3 weights
 in the composite formula.  The GBT heads are left untouched.
 
 Usage:

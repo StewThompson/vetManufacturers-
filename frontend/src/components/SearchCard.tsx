@@ -39,17 +39,7 @@ export default function SearchCard({
   const [selectedGroups, setSelectedGroups] = useState<GroupedCompanyOut[]>([])
   const [excludedNaics, setExcludedNaics] = useState<Set<string>>(new Set())
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const searchCardRef = useRef<HTMLDivElement>(null)
-  const [panelTop, setPanelTop] = useState(0)
 
-  // Compute floating panel Y position whenever results change
-  useEffect(() => {
-    if (!searchResults || !searchCardRef.current) return
-    const rect = searchCardRef.current.getBoundingClientRect()
-    setPanelTop(rect.top)
-  }, [searchResults])
-
-  // All facilities from all selected groups
   const allFacilities = useMemo<FacilityOut[]>(() => {
     const out: FacilityOut[] = []
     for (const g of selectedGroups) {
@@ -58,7 +48,6 @@ export default function SearchCard({
     return out
   }, [selectedGroups])
 
-  // Unique NAICS sectors present in selected facilities
   const naicsSectors = useMemo(() => {
     const seen = new Map<string, number>() // label -> count
     for (const f of allFacilities) {
@@ -70,7 +59,6 @@ export default function SearchCard({
     return Array.from(seen.entries()).map(([label, count]) => ({ label, count }))
   }, [allFacilities])
 
-  // Facilities after exclusion filter
   const filteredRawNames = useMemo<string[]>(() => {
     return allFacilities
       .filter((f) => {
@@ -80,13 +68,11 @@ export default function SearchCard({
       .map((f) => f.raw_name)
   }, [allFacilities, excludedNaics])
 
-  // Notify parent whenever filtered selection changes
   useEffect(() => {
     const name = selectedGroups.map((g) => g.parent_name).join(' + ')
     onSelectionChange(filteredRawNames, name)
   }, [filteredRawNames]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Debounced search
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current)
     if (query.trim().length < 2) {
@@ -161,7 +147,7 @@ export default function SearchCard({
   return (
     <>
       {/* Search input */}
-      <div className="card" ref={searchCardRef}>
+      <div className="card">
         <div className="card-title">Manufacturer Lookup</div>
         <input
           className="search-input"
@@ -236,9 +222,9 @@ export default function SearchCard({
           className="search-results-panel"
           style={{
             left: 368,
-            top: panelTop,
+            top: 0,
             width: 420,
-            maxHeight: `calc(100vh - ${panelTop}px - 16px)`,
+            maxHeight: 'calc(100vh - 16px)',
           }}
         >
           <div style={{

@@ -19,9 +19,8 @@ Design notes
   centrally maintained.
 * Penalty tier thresholds come from ``penalty_percentiles.py`` and MUST be
   pre-computed on training-fold data before calling this module.
-* The stratified sampling strategy mirrors ``temporal_labeler`` — NAICS sector
-  × pseudo-label quartile — so the multi-target sample is drawn from the same
-  distribution as the real-label sample used by the existing GBR head.
+* The stratified sampling strategy is NAICS sector × binary WR/Serious outcome
+  quartile — ensuring broad coverage across industries and risk levels.
 * Returns dict rows that include both ``features_46`` (pre-log-transform) and
   all 7 target scalars, plus the ``real_label`` composite score for backward
   compatibility with diagnostics.
@@ -52,6 +51,7 @@ from src.scoring.labeling.temporal_labeler import (
     _stratified_sample,
     ADV_MAX,
 )
+from src.scoring.labeling.inspection_propensity import InspectionPropensityModel
 from src.scoring.penalty_percentiles import lookup_threshold
 
 
@@ -116,8 +116,10 @@ def _compute_multi_targets(
     future_viols: List[dict],
     any_injury_fatal: bool,
     n_future_insp: int,
+    penalty_thresholds: Optional[Dict[str, Dict[str, float]]] = None,
+    naics_2digit: Optional[str] = None,
 ) -> Dict[str, float]:
-    """Compute all 6 target variables from post-cutoff violations and injuries.
+    """Compute all target variables from post-cutoff violations and injuries.
 
     Parameters
     ----------
@@ -128,8 +130,9 @@ def _compute_multi_targets(
         hospitalized or fatal injury (from ``_build_hosp_fatal_stats``).
     n_future_insp : int
         Number of post-cutoff inspections.
-    penalty_thresholds : dict
+    penalty_thresholds : dict, optional
         Output of ``penalty_percentiles.compute_penalty_percentiles()``.
+        When provided, penalty tier binary targets are computed.
     naics_2digit : str or None
         2-digit NAICS sector for per-industry threshold lookup.
 
@@ -137,7 +140,9 @@ def _compute_multi_targets(
     -------
     dict with keys:
         any_wr_serious, future_total_penalty, log_penalty,
-        any_injury_fatal, gravity_weighted_score, real_label_raw, real_label
+        any_injury_fatal, gravity_weighted_score,
+        is_moderate_penalty, is_large_penalty, is_extreme_penalty,
+        real_label_raw, real_label
     """
     total_penalty = sum(
         float(v.get("current_penalty") or v.get("initial_penalty") or 0)
@@ -166,12 +171,30 @@ def _compute_multi_targets(
     raw_adv   = _compute_adverse(future_viols, 0, n_future_insp)
     real_label = _normalize_adverse(raw_adv)
 
+    # Penalty tier binary targets (NAICS-normalized thresholds)
+    is_moderate = 0
+    is_large = 0
+    is_extreme = 0
+    if penalty_thresholds is not None:
+        p75 = lookup_threshold(penalty_thresholds, naics_2digit, "p75")
+        p90 = lookup_threshold(penalty_thresholds, naics_2digit, "p90")
+        p95 = lookup_threshold(penalty_thresholds, naics_2digit, "p95")
+        if total_penalty >= p75:
+            is_moderate = 1
+        if total_penalty >= p90:
+            is_large = 1
+        if total_penalty >= p95:
+            is_extreme = 1
+
     return {
         "any_wr_serious":        int(wr_serious > 0),
         "future_total_penalty":  total_penalty,
         "log_penalty":           math.log1p(total_penalty),
         "any_injury_fatal":      int(any_injury_fatal),
         "gravity_weighted_score": grav_total,
+        "is_moderate_penalty":   is_moderate,
+        "is_large_penalty":      is_large,
+        "is_extreme_penalty":    is_extreme,
         # Kept for diagnostics / weight optimization
         "real_label_raw":  raw_adv,
         "real_label":      real_label,
@@ -199,7 +222,7 @@ def _build_fingerprint(
         "sample_size": sample_size,
         "insp_mtime":  _mtime(inspections_path),
         "viol_mtime":  _mtime(violations_path),
-        "schema":      "multi_target_v2",  # bumped: p_injury + p_gravity heads
+        "schema":      "multi_target_v10",  # bumped: +penalty tier targets (is_moderate/large/extreme_penalty)
     }
 
 
@@ -217,7 +240,7 @@ def build_multi_target_sample(
     penalty_thresholds: Dict[str, Dict[str, float]],
     sample_size: int = 50_000,
     rng_seed: int = 42,
-    min_hist_insp: int = 1,
+    min_hist_insp: int = 2,
 ) -> List[Dict]:
     """Build a stratified sample of (features, multi-targets) training rows.
 
@@ -230,7 +253,7 @@ def build_multi_target_sample(
     ----------
     scorer : MLRiskScorer
         Required for ``_encode_naics()``, ``_industry_stats``,
-        ``_naics_map``, and ``_pseudo_label()``.
+        `_naics_map``.
     cutoff_date : date
         History / future split.  All inspections before this date feed into
         features; all inspections after (up to ``outcome_end_date``) define
@@ -256,7 +279,6 @@ def build_multi_target_sample(
     List of row dicts:
         name               : str
         features_46        : list[float]  — pre-log-transform, len 47
-        pseudo_label       : float
         any_wr_serious     : int (0/1)
         future_total_penalty : float
         log_penalty        : float
@@ -269,8 +291,6 @@ def build_multi_target_sample(
         naics_2digit       : str
         cutoff_date        : str (ISO)
     """
-    from src.scoring.ml_risk_scorer import MLRiskScorer as _MLRiskScorer
-    _pseudo_label = _MLRiskScorer._heuristic_label
     from src.scoring.industry_stats import (
         compute_industry_stats,
         compute_relative_features,
@@ -311,6 +331,30 @@ def build_multi_target_sample(
 
     if not paired_names:
         return []
+
+    # ── IPW: fit industry-stratified inspection propensity model ──────────
+    # Unpaired: ≥ min_hist_insp pre-cutoff inspections but 0 future.
+    # We deliberately include them only in propensity estimation (not training)
+    # so the IPW weights correct for inspection-selection bias without leaking
+    # future outcome information.
+    unpaired_names = [
+        n for n in estab_hist
+        if len(estab_hist[n]) >= min_hist_insp and len(estab_future.get(n, [])) == 0
+    ]
+    print(
+        f"  [MultiTargetLabeler] {len(unpaired_names):,} unpaired establishments "
+        f"(used for IPW propensity estimation only)."
+    )
+    ipw_model = InspectionPropensityModel(naics_sectors=scorer.NAICS_SECTORS)
+    ipw_model.fit(
+        paired_hist=[estab_hist[n] for n in paired_names],
+        unpaired_hist=[estab_hist[n] for n in unpaired_names],
+    )
+    ipw_weights: np.ndarray = ipw_model.ipw_weights(
+        [estab_hist[n] for n in paired_names]
+    )
+    # Map name → weight for O(1) lookup in PASS 3
+    ipw_by_name: dict = dict(zip(paired_names, ipw_weights.tolist()))
 
     # ── PASS 2: build violation/accident indices ───────────────────────────
     all_hist_acts: set = {
@@ -356,6 +400,8 @@ def build_multi_target_sample(
         naics_2d = naics_group[:2] if naics_group else None
         targets = _compute_multi_targets(
             fut_viols, fut_any_injury, len(future_insp),
+            penalty_thresholds=penalty_thresholds,
+            naics_2digit=naics_2d,
         )
 
         rows_raw.append({
@@ -367,6 +413,7 @@ def build_multi_target_sample(
             "_raw_avg_pen": raw_avg_pen,
             "_raw_sr":      raw_sr,
             "_raw_wr":      raw_wr,
+            "ipw_weight":   ipw_by_name.get(name, 1.0),
             **targets,
         })
         scratch_industry.append({
@@ -417,31 +464,22 @@ def build_multi_target_sample(
             _safe(rel["relative_willful_repeat"]),
         ] + naics_vec
 
-        f46_arr       = np.array(features_46)
-        pseudo        = float(_pseudo_label(f46_arr))
+        f46_arr = np.array(features_46)
 
         row["features_46"] = features_46
-        row["pseudo_label"] = pseudo
         row.pop("features_17")
         row.pop("naics_group")
 
     # ── Stratified sampling ────────────────────────────────────────────────
-    pseudo_arr = np.array([r["pseudo_label"] for r in rows_raw])
-    quartiles  = pd.qcut(
-        pd.Series(pseudo_arr).clip(0, 100),
-        q=4, labels=[0, 1, 2, 3], duplicates="drop",
-    )
-
     strata_keys = []
-    for i, row in enumerate(rows_raw):
+    for row in rows_raw:
         f46 = row["features_46"]
         naics_prefix = "??"
         for j, sector in enumerate(_NAICS_SECTORS):
             if f46[22 + j] == 1:
                 naics_prefix = sector
                 break
-        q_val   = quartiles.iloc[i]
-        q_label = int(q_val) if not pd.isna(q_val) else 0
+        q_label = int(row.get("any_wr_serious", 0))
         strata_keys.append(f"{naics_prefix}_Q{q_label}")
 
     indices   = list(range(len(rows_raw)))
@@ -475,6 +513,7 @@ def load_or_build(
     naics_map: dict,
     penalty_thresholds: Dict[str, Dict[str, float]],
     sample_size: int = 50_000,
+    min_hist_insp: int = 2,
 ) -> List[Dict]:
     """Load from cache or build anew, with fingerprint-based invalidation."""
     cache_path  = os.path.join(cache_dir, CACHE_FILENAME)
@@ -507,6 +546,7 @@ def load_or_build(
         naics_map=naics_map,
         penalty_thresholds=penalty_thresholds,
         sample_size=sample_size,
+        min_hist_insp=min_hist_insp,
     )
 
     try:

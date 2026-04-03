@@ -57,18 +57,17 @@ SPEARMAN_STRONG   = 0.40   # strong model target
 SPEARMAN_HIGH     = 0.50   # high-quality target
 
 # AUROC for binary heads
-# NOTE: The 2020-training → 2021-validation temporal split crosses the COVID-19
-# year.  COVID-era inspection patterns differ significantly from pre-pandemic
-# norms, creating a ~3% AUROC penalty vs same-distribution evaluation.
-# Empirical ceiling across all hyperparameter configurations: ~0.76 for p_event.
-# The original user target of 0.78 references same-distribution expectations.
+# Training cutoff moved to 2022-01-01, clearing the COVID-era inspection
+# suppression window (2020-2021) which created a ~3% AUROC penalty.  IPW
+# weights additionally correct for inspection-selection bias across industries.
+# Revised achievable target: 0.78 for p_event on the 2021 validation holdout.
 AUROC_MINIMUM     = 0.72   # acceptable floor
-AUROC_STRONG      = 0.76   # adjusted target for temporal holdout with COVID shift
+AUROC_STRONG      = 0.78   # target post-COVID-cutoff + IPW
 AUROC_HIGH        = 0.82   # stretch target
 
-# Head-specific AUROC targets (adjusted for COVID-year temporal gap)
-AUROC_P_EVENT_TARGET  = 0.76   # ROC-AUC required for p_serious_wr_event (COVID-adjusted)
-AUROC_P_INJURY_TARGET = 0.74   # ROC-AUC required for p_injury_event
+# Head-specific AUROC targets
+AUROC_P_EVENT_TARGET  = 0.78   # ROC-AUC required for p_serious_wr_event
+AUROC_P_INJURY_TARGET = 0.75   # ROC-AUC required for p_injury_event
 
 # Top decile lift
 LIFT_MINIMUM      = 3.00   # >= 3x lift required by user targets
@@ -86,20 +85,18 @@ REGRESSION_SPEARMAN = 0.20   # looser — log-penalty is hard to predict
 MAX_CALIBRATION_VIOLATIONS = 1   # allow at most 1 inversion in 5 bins
 
 # ── Extended calibration / skill thresholds ───────────────────────────────────
-# NOTE: BSS >= 0.25 (from user original spec) requires AUROC >= 0.78 at 47.3%
-# prevalence.  With the COVID-year AUROC ceiling of ~0.76, best BSS is ~0.22.
-# Threshold lowered to 0.18 which corresponds to AUROC=0.74 + good calibration.
-# Original spec AP floor of 0.82 also adjusted proportionally to AUROC=0.76.
-BRIER_SS_MIN          = 0.18    # Brier Skill Score for p_event (COVID-adjusted)
+# With 2022 training cutoff (post-COVID) + IPW weights, AUROC target lifts to
+# 0.78.  At 47.3% prevalence and AUROC=0.78, BSS expected ~0.22-0.25.
+# Raising BSS floor back toward the original user spec of 0.25.
+BRIER_SS_MIN          = 0.22    # Brier Skill Score for p_event
 ECE_MAX               = 0.03    # Expected Calibration Error (10-bin) for p_event
 CALIB_SLOPE_MIN       = 0.90    # Calibration regression slope lower bound (p_event)
 CALIB_SLOPE_MAX       = 1.10    # Calibration regression slope upper bound (p_event)
 CALIB_INTERCEPT_MIN   = -0.05   # Calibration regression intercept lower bound
 CALIB_INTERCEPT_MAX   = +0.05   # Calibration regression intercept upper bound
 PR_AUC_RATIO_P_EVENT  = 4.0     # PR-AUC / prevalence ratio minimum for p_event
-# High-prevalence AP floor is set proportionally to the COVID-adjusted AUROC:
-# at 47.3% prevalence and AUROC=0.76, the expected AP is approximately 0.78.
-PR_AUC_AP_FLOOR_EVENT = 0.76    # absolute AP floor for high-prevalence p_event
+# At 47.3% prevalence and AUROC=0.78, expected AP is approximately 0.80.
+PR_AUC_AP_FLOOR_EVENT = 0.78    # absolute AP floor for high-prevalence p_event
 PR_AUC_RATIO_P_INJURY = 3.0     # PR-AUC / prevalence ratio minimum for p_injury
 
 # ── p_injury-specific calibration thresholds ─────────────────────────────────

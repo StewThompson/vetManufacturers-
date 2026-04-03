@@ -453,3 +453,59 @@ body {
   display: flex;
   flex-direction: column;
 }
+
+/* ── Report page polish ─────────────────────────────────────────────────── */
+
+.report-page {
+  border: 1px solid #dde3ec;
+  border-radius: 8px;
+  box-shadow: 0 6px 22px rgba(15, 34, 64, 0.07);
+}
+
+@media (max-width: 1100px) {
+  .report-grid-two {
+    grid-template-columns: 1fr !important;
+    gap: 0 !important;
+  }
+
+  .report-page {
+    padding: 14px 16px 10px !important;
+  }
+}
+
+/* ── Print / PDF export (report page) ───────────────────────────────────── */
+
+@media print {
+  /* Hide everything except the report */
+  body > * { display: none !important; }
+  .report-page-print { display: block !important; }
+
+  .app-shell { display: block !important; }
+
+  /* Remove screen chrome */
+  .topbar,
+  .sidebar,
+  [class*="tab-btn"],
+  [class*="export"] { display: none !important; }
+
+  @page {
+    size: Letter landscape;
+    margin: 10mm 12mm;
+  }
+
+  .report-page-print {
+    display: block;
+    width: 100%;
+    max-width: 100% !important;
+    padding: 0 !important;
+    font-size: 9pt;
+    color: #000 !important;
+    background: #fff !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+
+  /* Prevent page breaks inside tables and charts */
+  table, svg, pre, code { page-break-inside: avoid; }
+}

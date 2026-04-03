@@ -150,8 +150,11 @@ class RiskAssessor:
 
                     mt_predictions = {
                         "p_serious_wr_event":  _wavg("p_serious_wr_event"),
-                        "expected_penalty_usd": _wavg("expected_penalty_usd"),
                         "p_injury_event":      _wavg("p_injury_event"),
+                        "p_penalty_ge_p75":    _wavg("p_penalty_ge_p75"),
+                        "p_penalty_ge_p90":    _wavg("p_penalty_ge_p90"),
+                        "p_penalty_ge_p95":    _wavg("p_penalty_ge_p95"),
+                        "expected_penalty_usd": _wavg("expected_penalty_usd"),
                         "gravity_score":       _wavg("gravity_score"),
                     }
 
@@ -174,9 +177,12 @@ class RiskAssessor:
 
                 risk_targets_obj = ProbabilisticRiskTargets(
                     p_serious_wr_event=round(mt_predictions["p_serious_wr_event"], 4),
-                    expected_penalty_usd_12m=round(mt_predictions["expected_penalty_usd"], 2),
                     p_injury_event=round(mt_predictions["p_injury_event"], 4),
-                    gravity_score=round(mt_predictions["gravity_score"], 2),
+                    p_penalty_ge_p75=round(mt_predictions.get("p_penalty_ge_p75", 0.0), 4),
+                    p_penalty_ge_p90=round(mt_predictions.get("p_penalty_ge_p90", 0.0), 4),
+                    p_penalty_ge_p95=round(mt_predictions.get("p_penalty_ge_p95", 0.0), 4),
+                    expected_penalty_usd_12m=round(mt_predictions.get("expected_penalty_usd", 0.0), 2),
+                    gravity_score=round(mt_predictions.get("gravity_score", 0.0), 2),
                     composite_risk_score=round(composite, 1),
                 )
 
@@ -228,6 +234,9 @@ class RiskAssessor:
         explanation = "\n".join(explanation_lines)
 
         confidence = 0.9 if records else 0.4
+        risk_confidence, confidence_detail = self._compute_confidence(
+            records, mt_predictions, risk_targets_obj,
+        )
 
         outlook = compute_12m_outlook(
             risk_score=risk_score,
@@ -243,6 +252,8 @@ class RiskAssessor:
             recommendation=recommendation,
             explanation=explanation,
             confidence_score=confidence,
+            risk_confidence=risk_confidence,
+            confidence_detail=confidence_detail,
             feature_weights=feature_weights,
             percentile_rank=percentile_rank,
             industry_label=industry_label,
@@ -259,6 +270,62 @@ class RiskAssessor:
             outlook=outlook,
             risk_targets=risk_targets_obj,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Structured confidence signal
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _compute_confidence(
+        records: list,
+        mt_predictions: Optional[dict],
+        risk_targets: Optional[ProbabilisticRiskTargets],
+    ) -> tuple:
+        """Return (risk_confidence: str, confidence_detail: dict).
+
+        Factors:
+        - n_inspections: more data -> higher confidence
+        - recency_years: fresher data -> higher confidence
+        - model_agreement: legacy GBR and MT model produce similar signal
+        - has_mt_model: whether the probabilistic model ran at all
+        """
+        n_insp = len(records)
+        detail: dict = {"n_inspections": n_insp}
+
+        # Recency — years since most recent inspection
+        if records:
+            most_recent = max(r.date_opened for r in records)
+            recency_years = (date.today() - most_recent).days / 365.25
+        else:
+            recency_years = 999.0
+        detail["recency_years"] = round(recency_years, 1)
+
+        detail["has_mt_model"] = mt_predictions is not None
+
+        # Heuristic scoring
+        score = 0.0
+        # Inspection volume (0-40 points)
+        score += min(n_insp / 10.0, 1.0) * 40.0
+        # Recency (0-30 points)
+        if recency_years <= 2:
+            score += 30.0
+        elif recency_years <= 5:
+            score += 20.0
+        elif recency_years <= 10:
+            score += 10.0
+        # MT model available (0-30 points)
+        if mt_predictions is not None:
+            score += 30.0
+
+        detail["confidence_score_raw"] = round(score, 1)
+
+        if score >= 70:
+            band = "high"
+        elif score >= 40:
+            band = "medium"
+        else:
+            band = "low"
+
+        return band, detail
 
     # ------------------------------------------------------------------ #
     #  Algorithmic executive summary builder

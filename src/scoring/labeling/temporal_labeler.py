@@ -2,35 +2,18 @@
 temporal_labeler.py — Build a stratified (features, real_outcome) training sample
 from historical OSHA data.
 
-Problem solved
---------------
-The default GBR model is trained on pseudo-labels, which creates a circular
-dependency: the model learns the heuristic function rather than actual compliance
-outcomes.  By shifting the training cutoff back (e.g. to 2020-01-01), we can
-identify establishments where we have:
+For each establishment that has inspections both before and after the cutoff date,
+this module pairs:
 
   * Historical features — aggregated from all inspections BEFORE the cutoff.
   * Real outcome labels — the future_adverse_outcome_score computed from
-    inspections AFTER the cutoff (up to outcome_end_date, or today).
-
-These paired establishments become the "real-label" training set.
-Establishments without post-cutoff inspections keep their pseudo-labels.
-
-The combined (real + pseudo) training set breaks the circular dependency for the
-labeled fraction and simultaneously trains the model to agree with validated
-domain knowledge (pseudo-labels) for the unlabeled majority.
+    inspections AFTER the cutoff (up to outcome_end_date).
 
 Sampling strategy
 -----------------
-The paired pool is stratified by:
-  1. 2-digit NAICS sector — ensures all industries are represented even when
-     some sectors have very few paired establishments.
-  2. Pseudo-label quartile — ensures the sample spans the full risk range,
-     preventing the model from only learning from heavily-inspected, high-risk
-     establishments (which are over-represented in the paired pool).
-
-The stratified sample is drawn WITHOUT replacement.  Each stratum contributes
-proportionally, floored at min_per_stratum samples when sufficient.
+The paired pool is stratified by 2-digit NAICS sector, ensuring all industries
+are represented.  The sample is drawn WITHOUT replacement; each stratum
+contributes proportionally, floored at min_per_stratum samples.
 
 Caching
 -------
@@ -38,12 +21,6 @@ A build fingerprint (cutoff_date, outcome_end_date, sample_size, CSV paths)
 is stored alongside the pkl file.  If the fingerprint matches on load, the
 cached file is returned immediately without re-scanning the CSVs.  Delete
 ml_cache/temporal_labels.pkl to force a rebuild.
-
-Label normalisation
--------------------
-The raw future_adverse_outcome_score runs on a different scale than pseudo-
-labels (max ~88 vs 0–100).  To avoid scale mismatch during training, real
-labels are linearly rescaled: real_norm = (raw_adverse / ADV_MAX) * 100.
 
 Leakage safeguards
 ------------------
@@ -160,7 +137,7 @@ def _stream_inspections(
     To keep memory bounded, only the required fields are retained.
     """
     required_fields = {
-        "activity_nr", "estab_name", "open_date", "naics_code",
+        "activity_nr", "estab_name", "open_date", "naics_code", "nr_in_estab",
     }
     result: list = []
     csv.field_size_limit(10 * 1024 * 1024)
@@ -277,26 +254,35 @@ def _aggregate_hist_features(
     # one_year_ago + 3 years), matching the anchor used in production scoring.
     decay_anchor = one_year_ago + timedelta(days=1095)
 
-    recent       = 0
-    severe       = 0
-    clean        = 0
-    viols:    list = []
-    acc_count = 0
-    fat_count = 0
-    inj_count = 0
-    time_adj_pen = 0.0
+    recent             = 0
+    severe             = 0
+    clean              = 0
+    viols:    list     = []
+    acc_count          = 0
+    fat_count          = 0
+    inj_count          = 0
+    time_adj_pen       = 0.0
+    max_insp_pen       = 0.0
+    recent_viol_count  = 0
+    recent_wr_raw      = 0
+    estab_sizes: list  = []
     naics_votes: Dict[str, int] = defaultdict(int)
 
     for insp in hist_inspections:
         act = str(insp.get("activity_nr", ""))
         d   = _parse_date(insp.get("open_date", ""))
-        if d and d >= one_year_ago:
-            recent += 1
 
         insp_viols = viol_index.get(act, [])
         viols.extend(insp_viols)
         if not insp_viols:
             clean += 1
+
+        if d and d >= one_year_ago:
+            recent += 1
+            recent_viol_count += len(insp_viols)
+            recent_wr_raw += sum(
+                1 for v in insp_viols if v.get("viol_type") in {"W", "R"}
+            )
 
         # Time-adjusted penalty: sum per-inspection penalties weighted by
         # exponential decay from cutoff date (τ = 3 years).
@@ -305,6 +291,8 @@ def _aggregate_hist_features(
                 float(v.get("current_penalty") or v.get("initial_penalty") or 0)
                 for v in insp_viols
             )
+            if insp_pen_sum > max_insp_pen:
+                max_insp_pen = insp_pen_sum
             if insp_pen_sum > 0 and d:
                 age_years = max(0.0, (decay_anchor - d).days / 365.25)
                 time_adj_pen += insp_pen_sum * math.exp(-age_years / 3.0)
@@ -319,6 +307,13 @@ def _aggregate_hist_features(
         nc = str(insp.get("naics_code") or "").strip()
         if nc and nc.isdigit() and len(nc) >= 4:
             naics_votes[nc[:4]] += 1
+
+        nr_raw = str(insp.get("nr_in_estab") or "").strip()
+        if nr_raw:
+            try:
+                estab_sizes.append(float(nr_raw))
+            except ValueError:
+                pass
 
     naics_group = max(naics_votes, key=naics_votes.get) if naics_votes else None
 
@@ -355,6 +350,16 @@ def _aggregate_hist_features(
     fat_rate     = fat_count   / n_insp
     inj_rate     = inj_count   / n_insp
 
+    total_wr       = willful_raw + repeat_raw
+    recent_wr_rate = recent_wr_raw / max(total_wr, 1)
+    vpi_recent     = recent_viol_count / max(recent, 1)
+    trend_delta    = vpi - vpi_recent
+
+    # Median establishment size — proxy for OSHA penalty multiplier scale.
+    # Use median (not mean) to be robust against one-off large-site inspections.
+    estab_sizes_clean = [s for s in estab_sizes if s > 0]
+    median_estab_size = float(np.median(estab_sizes_clean)) if estab_sizes_clean else 0.0
+
     features_17 = [
         n_insp, n_viols,
         serious_rate, willful_rate, repeat_rate,
@@ -363,6 +368,14 @@ def _aggregate_hist_features(
         acc_rate, fat_rate, inj_rate, avg_gravity,
         pen_per_insp, clean_ratio,
         time_adj_pen,
+        recent_wr_rate,
+        trend_delta,
+        # High-signal penalty discriminators (Option B expansion)
+        math.log1p(willful_raw),
+        math.log1p(repeat_raw),
+        1.0 if fat_count > 0 else 0.0,
+        math.log1p(max_insp_pen),
+        math.log1p(median_estab_size),
     ]
 
     # Also return scratch fields for industry relative features
@@ -421,9 +434,9 @@ def _stratified_sample(
     return result
 
 
-def _make_stratum_key(naics_group: Optional[str], pseudo_label_quartile: int) -> str:
+def _make_stratum_key(naics_group: Optional[str], real_label_quartile: int) -> str:
     sector = (naics_group or "??")[:2]
-    return f"{sector}_Q{pseudo_label_quartile}"
+    return f"{sector}_Q{real_label_quartile}"
 
 
 # ====================================================================== #
@@ -469,7 +482,7 @@ def build_temporal_training_labels(
     naics_map: dict,
     sample_size: int = 20_000,
     rng_seed: int    = 42,
-    min_hist_insp: int = 1,
+    min_hist_insp: int = 2,
 ) -> List[Dict]:
     """Build a stratified sample of (pre-cutoff features, real-outcome label) pairs.
 
@@ -487,7 +500,7 @@ def build_temporal_training_labels(
     Parameters
     ----------
     scorer          : MLRiskScorer stub (needs _encode_naics, _industry_stats,
-                      _naics_map, _pseudo_label).
+                      _naics_map).
     cutoff_date     : History/future split boundary.  All inspections before this
                       date contribute to features; all after contribute to labels.
     outcome_end_date: Latest date to include in the future outcome window.
@@ -507,13 +520,10 @@ def build_temporal_training_labels(
     List of dicts, one per sampled establishment:
         name            : str   — establishment name (uppercase)
         features_46     : list  — 47-element pre-cutoff feature vector (pre-log)
-        pseudo_label    : float — heuristic label from 17 absolute features
         real_label_raw  : float — unnormalised future adverse score (0–ADV_MAX)
         real_label      : float — normalised to [0, 100]
         cutoff_date     : str   — ISO cutoff used to build this row
     """
-    from src.scoring.ml_risk_scorer import MLRiskScorer as _MLRiskScorer
-    _pseudo_label = _MLRiskScorer._heuristic_label
     from src.scoring.industry_stats import (
         compute_industry_stats,
         compute_relative_features,
@@ -663,22 +673,22 @@ def build_temporal_training_labels(
             _safe(rel["relative_willful_repeat"]),
         ] + naics_vec
 
-        # Pseudo-label from raw 17+relative features (same as training data)
+        # Compute 46-dim feature vector (no pseudo-label)
         f46_arr = np.array(features_46)
-        pseudo  = float(_pseudo_label(f46_arr))
 
         row["features_46"] = features_46
-        row["pseudo_label"] = pseudo
         row.pop("features_17")
         row.pop("naics_group")
 
     # ── Stratified sampling ────────────────────────────────────────────────
-    pseudo_arr = np.array([r["pseudo_label"] for r in rows_raw])
-    # Wrap in Series so pd.qcut returns a Series (supports .iloc); using a
-    # plain numpy array returns a Categorical which lacks .iloc.
+    real_arr  = np.array([r["real_label"] for r in rows_raw])
+    # Wrap in Series so pd.qcut returns a Series (supports .iloc).
+    # labels=False returns integer bin indices (0..N-1) regardless of how many
+    # bins survive after duplicates="drop" — avoids "labels must be one fewer
+    # than bin edges" when the 2022 cutoff yields a zero-heavy distribution.
     quartiles = pd.qcut(
-        pd.Series(pseudo_arr).clip(0, 100),
-        q=4, labels=[0, 1, 2, 3], duplicates="drop",
+        pd.Series(real_arr).clip(0, 100),
+        q=4, labels=False, duplicates="drop",
     )
 
     _NAICS_SECTORS = [
@@ -709,7 +719,6 @@ def build_temporal_training_labels(
         {
             "name":           rows_raw[i]["name"],
             "features_46":    rows_raw[i]["features_46"],
-            "pseudo_label":   rows_raw[i]["pseudo_label"],
             "real_label_raw": rows_raw[i]["real_label_raw"],
             "real_label":     rows_raw[i]["real_label"],
             "cutoff_date":    cutoff_date.isoformat(),
@@ -738,7 +747,7 @@ def load_or_build_temporal_labels(
     naics_map: dict,
     sample_size: int = 50_000,
     rng_seed: int    = 42,
-    min_hist_insp: int = 1,
+    min_hist_insp: int = 2,
 ) -> List[Dict]:
     """Load cached temporal labels from pkl, or build and cache them.
 
@@ -806,14 +815,11 @@ def summarise_temporal_labels(rows: List[Dict]) -> None:
     if not rows:
         print("  [TemporalLabeler] No rows to summarise.")
         return
-    real_labels  = np.array([r["real_label"]  for r in rows])
-    pseudo_labels = np.array([r["pseudo_label"] for r in rows])
+    real_labels = np.array([r["real_label"] for r in rows])
     n_nonzero   = int((real_labels > 0).sum())
     print("\n" + "=" * 60)
     print(f"TEMPORAL LABEL SUMMARY  ({len(rows):,} rows)")
     print(f"  Real label  range: [{real_labels.min():.1f}, {real_labels.max():.1f}]  "
           f"mean={real_labels.mean():.1f}  std={real_labels.std():.1f}")
-    print(f"  Pseudo label range: [{pseudo_labels.min():.1f}, {pseudo_labels.max():.1f}]  "
-          f"mean={pseudo_labels.mean():.1f}  std={pseudo_labels.std():.1f}")
     print(f"  Non-zero real label: {n_nonzero:,} ({n_nonzero/len(rows):.1%})")
     print("=" * 60 + "\n")

@@ -12,14 +12,13 @@ from sklearn.metrics import roc_auc_score
 from unittest.mock import patch
 
 from tests.validation.shared import (
-    RealWorldData, CUTOFF_DATE, CACHE_DIR, MULTI_CUTOFF_DATES,
+    RealWorldData, CUTOFF_DATE, CACHE_DIR,
     EVAL_THRESHOLDS, TOPK_FRACTIONS,
     MIN_HIST_ESTABLISHMENTS, MIN_FUTURE_ESTABLISHMENTS, MIN_BINARY_POSITIVE,
     MIN_SPEARMAN_REAL, MIN_TOP_DECILE_LIFT, MIN_BINARY_DELTA, MIN_AUROC,
     _risk_tier, _spearman_bootstrap_ci, _decile_summary, _auroc_if_sufficient,
-    _compute_topk_capture, _run_cutoff_analysis, _compute_threshold_metrics,
+    _compute_topk_capture, _compute_threshold_metrics,
     _load_raw_data, _build_per_establishment_data, _build_feature_matrix,
-    _train_and_score_historical, _train_and_score_with_temporal_labels,
     _assign_confidence_tag,
 )
 from src.scoring.ml_risk_scorer import MLRiskScorer

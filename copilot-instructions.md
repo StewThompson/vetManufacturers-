@@ -2,13 +2,13 @@
 
 **Project Summary**
 
-This project aims to build an AI-assisted manufacturer vetting system that evaluates the safety, compliance, and reliability of individual manufacturing suppliers using publicly available enforcement, incident, and certification data. The long-term vision is to evolve this system into a procurement intelligence platform that helps companies source parts (e.g., bolts for automotive manufacturing) while simultaneously assessing supplier risk and recommending whether to proceed with engagement.
+This project aims to build an AI-assisted manufacturer risk prediction and vetting system that evaluates the future compliance and safety risk of individual manufacturers using publicly available enforcement, incident, and certification data. The system is intended to move beyond static summaries of past violations and toward a more predictive, explainable assessment of which manufacturers are more likely to experience serious compliance issues going forward.
 
-The initial scope of the project is intentionally narrow and focused: **vetting individual manufacturers**. The system will accept a manufacturer name (with optional location metadata), retrieve relevant public safety and compliance history, generate a structured risk profile, and produce an explainable recommendation. Once this foundation is reliable, the platform will expand upward into supplier discovery, pricing comparison, and automated sourcing workflows.
+The initial scope of the project is intentionally narrow and focused: **predicting and explaining risk for individual manufacturers**. The system will accept a manufacturer name (with optional location metadata), retrieve relevant public safety and compliance history, construct structured temporal features, and generate an explainable predictive risk profile. Rather than focusing on sourcing parts or procurement workflows, the current program is centered on identifying patterns that signal elevated future compliance risk and helping users understand the evidence behind those predictions.
 
 ---
 
-**Phase 1 Goal — Individual Manufacturer Vetting**
+**Phase 1 Goal — Individual Manufacturer Risk Prediction**
 
 The system should:
 
@@ -27,28 +27,32 @@ The system should:
    * recency of inspections
    * penalty magnitude trends
    * recurring hazard themes
+   * inspection frequency and violation density
 5. Generate:
 
-   * a risk score
-   * a recommendation (Proceed / Proceed with Caution / Do Not Recommend)
-   * a concise explanation highlighting the primary drivers of the recommendation
+   * a predictive risk score
+   * a recommendation or risk tier based on expected future compliance risk
+   * a concise explanation highlighting the primary drivers of the prediction
 6. Provide an interactive question-answer layer allowing users to ask:
 
    * what caused the risk score
    * whether violations are recent or systemic
    * whether repeat hazards exist
    * how risk has changed over time
+   * whether the score reflects future risk or past history
 
-The system must emphasize **explainability and evidence-backed reasoning**. Absence of enforcement records must not be interpreted as proof of safety; uncertainty should be surfaced clearly.
+The system must emphasize **explainability, temporal correctness, and evidence-backed reasoning**. Absence of enforcement records must not be interpreted as proof of safety, and sparse data should be surfaced as uncertainty rather than treated as low risk.
 
 ---
 
 **Architecture Principles**
 
-* Deterministic data retrieval and structured scoring form the foundation.
+* Deterministic data retrieval and temporal feature construction form the foundation.
 * The AI agent operates as an analysis and interaction layer, not as the primary data collector.
 * Entity resolution confidence must be tracked and surfaced when ambiguity exists.
-* All recommendations must cite supporting evidence (dates, inspection identifiers, violation categories).
+* Predictive models must be trained on real future outcomes rather than heuristic pseudo-labels.
+* All recommendations and risk outputs must cite supporting evidence (dates, inspection identifiers, violation categories).
+* Never change file content with console commands; just edit them with copilot tools or report to user if theres an issue with current tools. 
 
 ---
 
@@ -60,17 +64,17 @@ The system must emphasize **explainability and evidence-backed reasoning**. Abse
 * Incorporate certification signals (quality and process standards)
 * Improve parent/subsidiary and multi-facility resolution
 
-**Phase 3 — Supplier Discovery Integration**
+**Phase 3 — Comparative Risk Intelligence**
 
-* Accept part specifications
-* Surface candidate manufacturers and distributors
-* Overlay compliance intelligence onto supplier search results
+* Benchmark manufacturers against industry peers
+* Add percentile-based and cohort-based risk comparisons
+* Surface trends in risk over time across manufacturers and industries
 
-**Phase 4 — Procurement Workflow Automation**
+**Phase 4 — Monitoring and Decision Support**
 
-* RFQ orchestration
-* quote comparison enriched with compliance scoring
 * supplier monitoring and alerting over time
+* historical versus predicted risk tracking
+* integration into broader operational or sourcing decisions if needed
 
 ---
 
@@ -79,9 +83,10 @@ The system must emphasize **explainability and evidence-backed reasoning**. Abse
 The AI agent should be able to:
 
 * interpret ambiguous manufacturer inputs
-* summarize enforcement history into actionable insight
+* summarize enforcement history into predictive and actionable insight
 * answer follow-up questions using structured evidence
 * highlight uncertainty, missing data, and potential false confidence
+* distinguish between historical severity and future predicted risk
 * avoid unsupported conclusions when records are sparse
 
 The agent must behave as a compliance analyst and risk advisor rather than a generic conversational assistant.
@@ -92,12 +97,12 @@ The agent must behave as a compliance analyst and risk advisor rather than a gen
 
 * Reliable manufacturer identity resolution
 * Accurate retrieval and structuring of enforcement history
-* Transparent, explainable risk scoring
-* Useful conversational exploration of incident history
-* Clear communication of limitations and uncertainty
+* Transparent, explainable predictive risk scoring
+* Useful conversational exploration of incident history and future risk
+* Clear communication of limitations, uncertainty, and temporal assumptions
 
 ---
 
 **Long-Term Vision**
 
-The project evolves into a “supplier trust layer” for manufacturing procurement — analogous to carrier safety vetting in logistics — enabling organizations to make sourcing decisions informed not only by cost and availability but also by safety, compliance, and operational risk.
+The project evolves into a manufacturer compliance intelligence layer that helps users understand, compare, and monitor safety and enforcement risk across industrial suppliers. The long-term goal is to provide a structured and explainable way to forecast compliance risk before it materializes, enabling better decisions grounded in public enforcement history, predictive modeling, and transparent evidence.

@@ -1,54 +1,43 @@
-"""multi_target_scorer.py — Probabilistic multi-target risk model.
+"""multi_target_scorer.py — Probability-driven, calibrated risk model.
 
-Replaces the single-head GBR pseudo-label model with four prediction heads
-that each target a distinct, directly-observable future OSHA outcome.
+Primary outputs are **calibrated probabilities** for binary adverse events;
+regression heads are retained for backward compatibility but no longer drive
+the composite score.
 
-Architecture
-------------
-All four heads share the same 47-feature input vector (identical to the
-existing ``MLRiskScorer`` feature space, log-transformed).
+Architecture (v2 — probability-first)
+-------------------------------------
+All heads share the same 46-feature input vector (log-transformed).
 
-Head 1 — Binary: serious/willful/repeat event
-    GradientBoostingClassifier (balanced) → CalibratedClassifierCV (cv=5)
-    Output: ``p_serious_wr_event`` ∈ [0, 1]
-    Why: Best single-variable predictor of future OSHA enforcement action.
+Primary binary heads (drive composite score):
+  Head 1 — p_serious_wr_event:  P(≥1 Serious/Willful/Repeat violation in 12mo)
+  Head 3 — p_injury_event:      P(hospitalization or fatality event)
+  Head 5 — p_penalty_ge_p95:    P(penalty ≥ industry P95 threshold)
 
-Head 2 — Regression: log-penalty
-    GradientBoostingRegressor (Huber) → predict log1p(total_penalty) → expm1
-    Output: ``expected_penalty_usd_12m`` (dollars, ≥ 0)
-    Why: Directly predicts the dollar magnitude of future non-compliance costs.
+Auxiliary binary heads (available in output, not in composite):
+  Head 5a — p_penalty_ge_p75:   P(penalty ≥ industry P75)
+  Head 5b — p_penalty_ge_p90:   P(penalty ≥ industry P90)
 
-Head 3 — Regression: citation count
-    GradientBoostingRegressor (Huber)
-    Output: ``expected_citations_12m`` (count, ≥ 0)
-    Why: Total violations expose the breadth of non-compliance risk.
+Legacy regression heads (retained for backward compat / outlook):
+  Head 2  — expected_penalty_usd (hurdle: binary × conditional log-penalty GBR)
+  Head 4  — gravity_score (GBR + isotonic)
 
-Head 4 — Binary: large-penalty event (three thresholds)
-    3 × GradientBoostingClassifier (balanced) → CalibratedClassifierCV (cv=5)
-    Outputs: ``p_moderate_penalty`` (P75), ``p_large_penalty`` (P90),
-             ``p_extreme_penalty`` (P95)
-    Why: Separate probability predictions for tiered severity, with industry-
-         normalized thresholds so "large" means the same thing across sectors.
+Composite risk score formula (v2)
+---------------------------------
+    risk_score_raw = w1 * p_serious_wr_event
+                   + w2 * p_injury_event
+                   + w3 * p_extreme_penalty
 
-Composite risk score formula
-----------------------------
+Default weights: w1=0.60, w2=0.30, w3=0.10.  All inputs are calibrated
+probabilities in [0, 1].  The raw score is then:
+  1. Evidence-shrunk toward population mean (smooth exponential)
+  2. Transformed via monotonic percentile stretching (expands top-end separation)
+  3. Rescaled to 0–100
 
-    composite = w1 * p_wr * 100
-              + w2 * min(log1p(η̂$) / log1p(P_ref), 1) * 100
-              + w3 * min(Ĉ / C_ref, 1) * 100
-              + w4 * p_large * 100
-
-where weights (w1=0.40, w2=0.25, w3=0.20, w4=0.15) and reference values
-(P_ref=$200k, C_ref=20 citations) are configurable.  Weights are chosen so
-that the binary WR head (empirically the strongest ranker) dominates the
-composite.  Optional weight optimization is available via ``fit_weights()``.
-
-Evidence ceiling
-----------------
-Consistent with ``MLRiskScorer``, the composite score is capped at 50 when
-n_inspections ≤ 2 and at 58 when n_inspections ≤ 4 (except when confirmed
-fatality + willful, which caps at 70).  This prevents single-event noise
-from dominating sparse-data establishments.
+Calibration
+-----------
+All binary heads use isotonic regression calibration fitted on a held-out
+validation fold (no leakage).  Calibration quality is logged during training
+via Brier score, BSS, and ECE.
 """
 from __future__ import annotations
 
@@ -69,18 +58,28 @@ from sklearn.preprocessing import StandardScaler
 
 MODEL_FILE = "multi_target_model.pkl"
 
-# ── Default composite weights ──────────────────────────────────────────────
-_DEFAULT_W1 = 0.35   # p_wr_serious
-_DEFAULT_W2 = 0.30   # normalized expected penalty
-_DEFAULT_W3 = 0.20   # p_injury_event
-_DEFAULT_W4 = 0.15   # normalized gravity score
+# ── Default composite weights (v2: probability-first, 3 components) ────────
+_DEFAULT_W1 = 0.60   # p_serious_wr_event
+_DEFAULT_W2 = 0.30   # p_injury_event
+_DEFAULT_W3 = 0.10   # p_extreme_penalty (P95 tier)
 
-# Reference values for normalizing regression outputs into 0-100 components
-_PENALTY_REF_USD = 200_000.0   # typical large-employer penalties in DON'T-REC range
-_GRAVITY_REF     = 100.0        # benchmark gravity total (see composite_score)
+# Legacy 4-component weights (kept for backward compat with old pickles)
+_LEGACY_W1 = 0.35
+_LEGACY_W2 = 0.30
+_LEGACY_W3 = 0.20
+_LEGACY_W4 = 0.15
+
+# Reference values for normalizing regression outputs (legacy heads only)
+_PENALTY_REF_USD = 200_000.0
+_GRAVITY_REF     = 100.0
 
 # Population-mean prior for evidence shrinkage (replaces hard ceilings)
-_SCORE_PRIOR = 15.0   # approximate unconditional mean composite score
+_SCORE_PRIOR = 15.0
+
+# Convex power-stretch parameter for top-end separation.
+# score = pctile^alpha * 100.  alpha=2 maps median->25, P90->81, P95->90,
+# concentrating most companies in the lower half and spreading high-risk ones.
+_STRETCH_ALPHA = 2.0
 
 # ── GBC / GBR hyper-parameters ─────────────────────────────────────────────
 # Binary heads use HistGradientBoostingClassifier with early stopping.
@@ -116,12 +115,12 @@ _HGBC_INJURY_PARAMS = dict(
     random_state=42,
 )
 _GBR_PARAMS = dict(
-    n_estimators=500,
+    n_estimators=600,
     max_depth=5,
     learning_rate=0.04,
     subsample=0.75,
-    loss="huber",
-    alpha=0.9,
+    loss="quantile",  # 80th-percentile quantile — targets upper tail for aggressive prediction
+    alpha=0.80,
     min_samples_leaf=2,
     random_state=42,
 )
@@ -189,27 +188,55 @@ class MultiTargetRiskScorer:
     """
 
     def __init__(self) -> None:
-        # Binary head 1: WR/serious event
+        # ── Primary binary heads (drive composite score) ──────────────
+        # Head 1: WR/serious event
         self._head_wr: Optional[Pipeline] = None
-        # Regression head 2: log penalty
-        self._head_log_pen: Optional[Pipeline] = None
-        # Binary head 3: hospitalization/fatality event  [NEW]
+        # Head 3: hospitalization/fatality event
         self._head_injury: Optional[Pipeline] = None
-        # Regression head 4: gravity-weighted severity  [NEW]
+        # Head 5: penalty tier classifiers (P75, P90, P95)
+        self._head_pen_p75: Optional[object] = None
+        self._head_pen_p90: Optional[object] = None
+        self._head_pen_p95: Optional[object] = None
+
+        # ── Legacy regression heads (kept for backward compat / outlook) ──
+        # Hurdle head 2a: binary "any positive penalty?" classifier
+        self._head_pen_nonzero: Optional[object] = None
+        # Hurdle head 2b: conditional log-penalty GBR (trained on positive rows only)
+        self._head_log_pen: Optional[Pipeline] = None
+        # Regression head 4: gravity-weighted severity
         self._head_gravity: Optional[Pipeline] = None
 
-        # Composite weight vector [w1, w2, w3, w4]
-        self._weights: List[float] = [_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3, _DEFAULT_W4]
+        # ── Composite weight vector [w1, w2, w3] (3 probability components) ──
+        self._weights: List[float] = [_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3]
 
         # Post-training temperature slots are kept for backward-compatibility
         # with old pickled models; Platt calibration replaces them.
         self._temp_wr: float = 1.0
         self._temp_inj: float = 1.0
-        # Platt calibration parameters [[a_wr, b_wr], [a_inj, b_inj]].
-        # Defaults = identity (no calibration).  Set by fit().
+
+        # ── Calibration ────────────────────────────────────────────────
+        # Isotonic calibration for all binary heads (fitted on val fold).
+        self._iso_wr:     Optional[object] = None
+        self._iso_inj:    Optional[object] = None
+        self._iso_pen_p75: Optional[object] = None
+        self._iso_pen_p90: Optional[object] = None
+        self._iso_pen_p95: Optional[object] = None
+
+        # Legacy Platt calibration (backward compat with old pickles)
         _identity = np.array([1.0, 0.0])
         self._platt_wr:  np.ndarray = _identity.copy()
         self._platt_inj: np.ndarray = _identity.copy()
+        self._platt_pen: np.ndarray = _identity.copy()
+
+        # Isotonic calibration for regression heads
+        self._iso_pen: Optional[object] = None      # kept for compat; unused by hurdle path
+        self._iso_log_pen: Optional[object] = None  # calibrates conditional log-penalty GBR
+        self._iso_grav: Optional[object] = None
+
+        # ── Score transformation ───────────────────────────────────────
+        # Empirical CDF of raw scores from validation set, for percentile stretching.
+        # Stored as sorted array of raw scores; at inference, percentile = searchsorted.
+        self._score_cdf: Optional[np.ndarray] = None
 
         self._is_fitted: bool = False
 
@@ -251,6 +278,17 @@ class MultiTargetRiskScorer:
         y_inj   = np.array([r["any_injury_fatal"]        for r in rows], dtype=int)
         y_grav  = np.array([r["gravity_weighted_score"]  for r in rows], dtype=float)
 
+        # Extract IPW weights (default 1.0 for rows without the key).
+        # Normalize to mean=1 so fitted regularisation scale stays constant.
+        weights_raw = np.array([r.get("ipw_weight", 1.0) for r in rows], dtype=float)
+        weights_norm = weights_raw / weights_raw.mean()
+        print(
+            f"  [MultiTargetScorer] IPW weight stats — "
+            f"min={weights_norm.min():.2f}  mean=1.00  "
+            f"P95={float(np.percentile(weights_norm, 95)):.2f}  "
+            f"max={weights_norm.max():.2f}"
+        )
+
         rng = np.random.default_rng(rng_seed)
         # Train/val split for weight optimization
         idx = rng.permutation(n)
@@ -264,8 +302,9 @@ class MultiTargetRiskScorer:
             train_idx = idx[split:]
 
         X_tr = X[train_idx];  X_val = X[val_idx]
+        sw_tr = weights_norm[train_idx]  # sample weights for training fold
 
-        def _train_hgbc_raw(X_fit, y_fit, hgbc_params=None):
+        def _train_hgbc_raw(X_fit, y_fit, hgbc_params=None, sample_weight=None):
             """Train raw (un-calibrated) HistGBT; calibration is added later."""
             n_pos = y_fit.sum()
             n_neg = len(y_fit) - n_pos
@@ -274,75 +313,173 @@ class MultiTargetRiskScorer:
             if hgbc_params is None:
                 hgbc_params = _HGBC_PARAMS
             hgbc = HistGradientBoostingClassifier(**hgbc_params)
-            hgbc.fit(X_fit, y_fit)
+            hgbc.fit(X_fit, y_fit, sample_weight=sample_weight)
             return hgbc
 
-        def _train_gbr_pipe(X_fit, y_fit):
+        def _train_gbr_pipe(X_fit, y_fit, sample_weight=None):
             pipe = Pipeline([
                 ("scaler", StandardScaler()),
                 ("model", GradientBoostingRegressor(**_GBR_PARAMS)),
             ])
-            pipe.fit(X_fit, y_fit)
+            if sample_weight is not None:
+                pipe.fit(X_fit, y_fit, model__sample_weight=sample_weight)
+            else:
+                pipe.fit(X_fit, y_fit)
             return pipe
 
         print("  [MultiTargetScorer] Training Head 1: WR/Serious event (binary) …")
-        self._head_wr = _train_hgbc_raw(X_tr, y_wr[train_idx], hgbc_params=_HGBC_PARAMS)
-
-        print("  [MultiTargetScorer] Training Head 2: log-penalty regression \u2026")
-        self._head_log_pen = _train_gbr_pipe(X_tr, y_logp[train_idx])
-
-        print("  [MultiTargetScorer] Training Head 3: hospitalization/fatality (binary) \u2026")
-        # Separate lighter params; no class imbalance correction so that
-        # calibration tracks the natural training prevalence.
-        self._head_injury = _train_hgbc_raw(
-            X_tr, y_inj[train_idx], hgbc_params=_HGBC_INJURY_PARAMS
+        self._head_wr = _train_hgbc_raw(
+            X_tr, y_wr[train_idx], hgbc_params=_HGBC_PARAMS, sample_weight=sw_tr
         )
 
-        print("  [MultiTargetScorer] Training Head 4: gravity-weighted severity (regression) \u2026")
-        self._head_gravity = _train_gbr_pipe(X_tr, y_grav[train_idx])
+        # ── Hurdle model for Head 2 ────────────────────────────────────────
+        # 2a: binary classifier — does any future penalty exist?
+        y_any_pen = (y_logp > 0).astype(int)
+        print("  [MultiTargetScorer] Training Head 2a: any-penalty binary (hurdle) …")
+        self._head_pen_nonzero = _train_hgbc_raw(
+            X_tr, y_any_pen[train_idx],
+            hgbc_params=_HGBC_PARAMS,
+            sample_weight=sw_tr,
+        )
+
+        # 2b: conditional log-penalty GBR — trained on positive-penalty rows only.
+        # Eliminates the zero-inflation anchor that causes scale compression.
+        pos_mask_tr = y_logp[train_idx] > 0
+        n_pos_pen = int(pos_mask_tr.sum())
+        print(
+            f"  [MultiTargetScorer] Training Head 2b: conditional log-penalty GBR "
+            f"({n_pos_pen:,} positive-penalty rows) …"
+        )
+        if n_pos_pen >= 20:
+            self._head_log_pen = _train_gbr_pipe(
+                X_tr[pos_mask_tr],
+                y_logp[train_idx][pos_mask_tr],
+                sample_weight=sw_tr[pos_mask_tr],
+            )
+        else:
+            # Fallback: train on all rows (too few positives for conditional GBR)
+            print("  [MultiTargetScorer] WARNING: fewer than 20 positive-penalty rows; "
+                  "falling back to unconditional GBR.")
+            self._head_log_pen = _train_gbr_pipe(X_tr, y_logp[train_idx], sample_weight=sw_tr)
+
+        print("  [MultiTargetScorer] Training Head 3: hospitalization/fatality (binary) …")
+        self._head_injury = _train_hgbc_raw(
+            X_tr, y_inj[train_idx], hgbc_params=_HGBC_INJURY_PARAMS, sample_weight=sw_tr
+        )
+
+        # ── Penalty tier classifiers (P75, P90, P95) ──────────────────
+        y_pen_p75 = np.array([r.get("is_moderate_penalty", 0) for r in rows], dtype=int)
+        y_pen_p90 = np.array([r.get("is_large_penalty",    0) for r in rows], dtype=int)
+        y_pen_p95 = np.array([r.get("is_extreme_penalty",  0) for r in rows], dtype=int)
+
+        for tier_name, y_tier, attr_name in [
+            ("P75 (moderate)", y_pen_p75, "_head_pen_p75"),
+            ("P90 (large)",    y_pen_p90, "_head_pen_p90"),
+            ("P95 (extreme)",  y_pen_p95, "_head_pen_p95"),
+        ]:
+            pos_rate = y_tier[train_idx].mean()
+            print(f"  [MultiTargetScorer] Training penalty tier {tier_name} "
+                  f"(pos rate={pos_rate:.1%}) …")
+            head = _train_hgbc_raw(
+                X_tr, y_tier[train_idx],
+                hgbc_params=_HGBC_PARAMS,
+                sample_weight=sw_tr,
+            )
+            setattr(self, attr_name, head)
+
+        print("  [MultiTargetScorer] Training Head 4: gravity-weighted severity (regression) …")
+        self._head_gravity = _train_gbr_pipe(X_tr, y_grav[train_idx], sample_weight=sw_tr)
 
         self._is_fitted = True
 
-        # \u2500\u2500 Post-hoc Platt calibration on training holdout \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-        # Calibrate the *actual* trained models (100% of X_tr) using a sigmoid
-        # Platt layer fitted on the held-out 20% training fold.  Unlike 5-fold
-        # CalibratedClassifierCV, this avoids the 80%-vs-100%-training mismatch
-        # that causes calibration slope to remain above 1.0 on held-out data.
-        # For p_event (prevalences 48.6% train vs 47.3% val): calibration
-        # transfers near-perfectly.  For p_injury (12.8% train vs 9.5% val):
-        # the 'a' (slope) parameter transfers; 'b' only partially compensates
-        # the 3.3pp prevalence shift.
+        # ── Post-hoc isotonic calibration on training holdout ────────────────
+        # Isotonic regression is nonparametric and handles non-sigmoid
+        # calibration curves better than Platt scaling.  Fitted on the
+        # held-out 20% validation fold to avoid leakage.
         if len(val_idx) >= 200:
-            print("  [MultiTargetScorer] Post-hoc Platt calibration on training holdout ...")
+            from sklearn.isotonic import IsotonicRegression
+            from scipy.stats import spearmanr, pearsonr
+            from src.scoring.calibration import brier_score, brier_skill_score, expected_calibration_error
+
+            print("  [MultiTargetScorer] Post-hoc isotonic calibration on training holdout ...")
+
+            # ── Calibrate primary binary heads with isotonic regression ──
             p_wr_val  = _clf_proba_batch(self._head_wr,     X_val)
             p_inj_val = _clf_proba_batch(self._head_injury, X_val)
-            self._platt_wr  = _fit_platt(y_wr[val_idx].astype(float),  p_wr_val)
-            self._platt_inj = _fit_platt(y_inj[val_idx].astype(float), p_inj_val)
+
+            iso_wr = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+            iso_wr.fit(p_wr_val, y_wr[val_idx].astype(float))
+            self._iso_wr = iso_wr
+
+            iso_inj = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+            iso_inj.fit(p_inj_val, y_inj[val_idx].astype(float))
+            self._iso_inj = iso_inj
+
+            # Calibration metrics for primary heads
+            p_wr_cal  = iso_wr.predict(p_wr_val)
+            p_inj_cal = iso_inj.predict(p_inj_val)
+            for head_name, y_val_h, p_cal_h in [
+                ("WR/Serious", y_wr[val_idx], p_wr_cal),
+                ("Injury/Fatal", y_inj[val_idx], p_inj_cal),
+            ]:
+                bs  = brier_score(y_val_h, p_cal_h)
+                bss = brier_skill_score(y_val_h, p_cal_h)
+                ece = expected_calibration_error(y_val_h, p_cal_h)
+                print(f"  [MultiTargetScorer] {head_name} calibration: "
+                      f"Brier={bs:.4f}  BSS={bss:+.3f}  ECE={ece:.4f}")
+
+            # ── Calibrate penalty tier heads ─────────────────────────────
+            for tier_name, y_tier, head_attr, iso_attr in [
+                ("P75", y_pen_p75, "_head_pen_p75", "_iso_pen_p75"),
+                ("P90", y_pen_p90, "_head_pen_p90", "_iso_pen_p90"),
+                ("P95", y_pen_p95, "_head_pen_p95", "_iso_pen_p95"),
+            ]:
+                head = getattr(self, head_attr)
+                p_val_t = _clf_proba_batch(head, X_val)
+                iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+                iso.fit(p_val_t, y_tier[val_idx].astype(float))
+                setattr(self, iso_attr, iso)
+                p_cal_t = iso.predict(p_val_t)
+                bs  = brier_score(y_tier[val_idx], p_cal_t)
+                bss = brier_skill_score(y_tier[val_idx], p_cal_t)
+                ece = expected_calibration_error(y_tier[val_idx], p_cal_t)
+                print(f"  [MultiTargetScorer] Penalty {tier_name} calibration: "
+                      f"Brier={bs:.4f}  BSS={bss:+.3f}  ECE={ece:.4f}")
+
+            # ── Legacy Platt calibration (kept for backward compat) ──────
+            p_pen_val = _clf_proba_batch(self._head_pen_nonzero, X_val)
+            self._platt_wr  = _fit_platt(y_wr[val_idx].astype(float),              p_wr_val)
+            self._platt_inj = _fit_platt(y_inj[val_idx].astype(float),             p_inj_val)
+            self._platt_pen = _fit_platt((y_logp[val_idx] > 0).astype(float),      p_pen_val)
+
+            # Hurdle penalty diagnostics on validation fold.
+            p_any_pen_cal  = _apply_platt_batch(p_pen_val, self._platt_pen)
+            cond_logp_val  = _reg_predict_batch(self._head_log_pen, X_val)
+            hurdle_pen_usd = p_any_pen_cal * np.exp(cond_logp_val)
+            actual_pen_usd = np.expm1(y_logp[val_idx])
+            rho_p, _ = spearmanr(hurdle_pen_usd, actual_pen_usd)
+            r_p, _   = pearsonr(np.log1p(hurdle_pen_usd), y_logp[val_idx])
             print(
-                f"  [MultiTargetScorer] Platt WR:  a={self._platt_wr[0]:.3f}  "
-                f"b={self._platt_wr[1]:.3f}"
+                f"  [MultiTargetScorer] Hurdle Pen (val): "
+                f"rho={rho_p:+.3f}  r(log-space)={r_p:+.3f}"
             )
-            print(
-                f"  [MultiTargetScorer] Platt Inj: a={self._platt_inj[0]:.3f}  "
-                f"b={self._platt_inj[1]:.3f}"
-            )
+
+            # Isotonic calibration for conditional log-penalty GBR (Head 2b).
+            # Disabled: quantile loss (alpha=0.80) already targets the 80th percentile;
+            # isotonic fitting on actual labels would map predictions back toward the mean.
+            self._iso_log_pen = None
+
+            # Isotonic calibration for gravity regression head.
+            raw_grav_val = _reg_predict_batch(self._head_gravity, X_val)
+            iso_grav = IsotonicRegression(out_of_bounds="clip")
+            iso_grav.fit(raw_grav_val, y_grav[val_idx])
+            self._iso_grav = iso_grav
 
         # Temperature slots kept for backward-compat with old pickled models.
         self._temp_wr  = 1.0
         self._temp_inj = 1.0
 
-        # ── Post-training temperature scaling ─────────────────────────
-        # Fit temperature parameters on the 20% training-holdout validation
-        # fold to bring the OLS calibration slope near 1.0.  Temperature is
-        # applied at inference time (predict / predict_batch) so AUROC is
-        # preserved (monotone transform) and the slope meets the [0.9, 1.1]
-        # target on held-out data with similar prevalence.
-        # Temperature scaling: no longer applied (Platt calibration on holdout
-        # subsumes temperature scaling with better statistical efficiency).
-        self._temp_wr  = 1.0
-        self._temp_inj = 1.0
-
-        # ── Composite weight optimization ──────────────────────────────
+        # ── Composite weight optimization ────────────────────────────────
         if optimize_weights and len(val_idx) >= 50:
             y_adv_val = np.array([rows[i]["real_label"] for i in val_idx])
             pred_val  = self.predict_batch(X_val)
@@ -350,13 +487,27 @@ class MultiTargetRiskScorer:
             print(
                 f"  [MultiTargetScorer] Optimized weights: "
                 f"w1={self._weights[0]:.3f} w2={self._weights[1]:.3f} "
-                f"w3={self._weights[2]:.3f} w4={self._weights[3]:.3f}"
+                f"w3={self._weights[2]:.3f}"
             )
         else:
             print(
                 f"  [MultiTargetScorer] Using default weights: "
-                f"w1={_DEFAULT_W1} w2={_DEFAULT_W2} w3={_DEFAULT_W3} w4={_DEFAULT_W4}"
+                f"w1={_DEFAULT_W1} w2={_DEFAULT_W2} w3={_DEFAULT_W3}"
             )
+
+        # ── Build score CDF for percentile stretching ────────────────────
+        # Use validation fold (or full data if no val) to build empirical CDF
+        # that transforms raw probability-based scores -> percentile ranks.
+        if len(val_idx) >= 50:
+            pred_cdf  = self.predict_batch(X_val)
+            raw_vals  = np.array([self._raw_composite(p) for p in pred_cdf])
+            self._score_cdf = np.sort(raw_vals)
+            print(f"  [MultiTargetScorer] Score CDF built from {len(raw_vals)} val samples "
+                  f"(range [{raw_vals.min():.3f}, {raw_vals.max():.3f}])")
+        else:
+            pred_cdf  = self.predict_batch(X)
+            raw_vals  = np.array([self._raw_composite(p) for p in pred_cdf])
+            self._score_cdf = np.sort(raw_vals)
 
         return self
 
@@ -364,7 +515,7 @@ class MultiTargetRiskScorer:
     #  Inference
     # ------------------------------------------------------------------ #
     def predict(self, x: np.ndarray) -> Dict[str, float]:
-        """Run all 4 prediction heads on a single feature row or batch.
+        """Run all prediction heads on a single feature row.
 
         Parameters
         ----------
@@ -372,46 +523,175 @@ class MultiTargetRiskScorer:
 
         Returns
         -------
-        dict:
-            p_serious_wr_event  (float 0-1)
-            expected_penalty_usd (float >= 0)
-            p_injury_event      (float 0-1)
-            gravity_score       (float >= 0)
+        dict with keys:
+            p_serious_wr_event   (float 0-1, isotonic-calibrated)
+            p_injury_event       (float 0-1, isotonic-calibrated)
+            p_penalty_ge_p75     (float 0-1)
+            p_penalty_ge_p90     (float 0-1)
+            p_penalty_ge_p95     (float 0-1)
+            expected_penalty_usd (float >= 0, legacy hurdle)
+            gravity_score        (float >= 0, legacy)
         """
         if not self._is_fitted:
             return self._empty_prediction()
         x2d = np.atleast_2d(x)
-        platt_wr  = getattr(self, "_platt_wr",  np.array([1.0, 0.0]))
-        platt_inj = getattr(self, "_platt_inj", np.array([1.0, 0.0]))
-        return {
-            "p_serious_wr_event":  _apply_platt_scalar(float(_clf_proba(self._head_wr,     x2d)), platt_wr),
-            "expected_penalty_usd": float(max(0.0, math.expm1(
+
+        # ── Primary binary heads — prefer isotonic, fall back to Platt ──
+        iso_wr  = getattr(self, "_iso_wr",  None)
+        iso_inj = getattr(self, "_iso_inj", None)
+        raw_wr  = float(_clf_proba(self._head_wr,     x2d))
+        raw_inj = float(_clf_proba(self._head_injury, x2d))
+        p_wr  = float(iso_wr.predict([raw_wr])[0])   if iso_wr  is not None else _apply_platt_scalar(raw_wr,  getattr(self, "_platt_wr",  np.array([1.0, 0.0])))
+        p_inj = float(iso_inj.predict([raw_inj])[0]) if iso_inj is not None else _apply_platt_scalar(raw_inj, getattr(self, "_platt_inj", np.array([1.0, 0.0])))
+
+        # ── Penalty tier heads (may not exist on old pickles) ────────────
+        p_pen_p75 = p_pen_p90 = p_pen_p95 = 0.0
+        for attr_head, attr_iso, setter in [
+            ("_head_pen_p75", "_iso_pen_p75", "p75"),
+            ("_head_pen_p90", "_iso_pen_p90", "p90"),
+            ("_head_pen_p95", "_iso_pen_p95", "p95"),
+        ]:
+            head = getattr(self, attr_head, None)
+            if head is not None:
+                raw_p = float(_clf_proba(head, x2d))
+                iso = getattr(self, attr_iso, None)
+                cal_p = float(iso.predict([raw_p])[0]) if iso is not None else raw_p
+                if setter == "p75":
+                    p_pen_p75 = cal_p
+                elif setter == "p90":
+                    p_pen_p90 = cal_p
+                else:
+                    p_pen_p95 = cal_p
+
+        # ── Legacy regression heads (kept for backward compat) ──────────
+        iso_grav    = getattr(self, "_iso_grav", None)
+        iso_log_pen = getattr(self, "_iso_log_pen", None)
+        head_pen_nz = getattr(self, "_head_pen_nonzero", None)
+        platt_pen   = getattr(self, "_platt_pen", np.array([1.0, 0.0]))
+
+        raw_grav = float(_reg_predict(self._head_gravity, x2d))
+        cal_grav = float(iso_grav.predict([raw_grav])[0]) if iso_grav is not None else raw_grav
+
+        if head_pen_nz is not None:
+            p_any_pen  = _apply_platt_scalar(float(_clf_proba(head_pen_nz, x2d)), platt_pen)
+            cond_logp  = float(_reg_predict(self._head_log_pen, x2d))
+            if iso_log_pen is not None:
+                cond_logp = float(iso_log_pen.predict([cond_logp])[0])
+            expected_pen = p_any_pen * float(math.expm1(max(0.0, cond_logp)))
+        else:
+            expected_pen = float(max(0.0, math.expm1(
                 float(_reg_predict(self._head_log_pen, x2d))
-            ))),
-            "p_injury_event":      _apply_platt_scalar(float(_clf_proba(self._head_injury, x2d)), platt_inj),
-            "gravity_score":       float(max(0.0, _reg_predict(self._head_gravity, x2d))),
+            )))
+
+        return {
+            "p_serious_wr_event":   p_wr,
+            "p_injury_event":       p_inj,
+            "p_penalty_ge_p75":     p_pen_p75,
+            "p_penalty_ge_p90":     p_pen_p90,
+            "p_penalty_ge_p95":     p_pen_p95,
+            "expected_penalty_usd": float(max(0.0, expected_pen)),
+            "gravity_score":        float(max(0.0, cal_grav)),
         }
 
     def predict_batch(self, X: np.ndarray) -> List[Dict[str, float]]:
         """Predict for a batch of feature rows (efficient vectorized path)."""
         if not self._is_fitted:
             return [self._empty_prediction() for _ in range(len(X))]
-        platt_wr  = getattr(self, "_platt_wr",  np.array([1.0, 0.0]))
-        platt_inj = getattr(self, "_platt_inj", np.array([1.0, 0.0]))
-        wr   = _apply_platt_batch(_clf_proba_batch(self._head_wr,     X), platt_wr)
-        logp = _reg_predict_batch(self._head_log_pen, X)
-        inj  = _apply_platt_batch(_clf_proba_batch(self._head_injury, X), platt_inj)
-        grav = _reg_predict_batch(self._head_gravity, X)
+        n = len(X)
+
+        # ── Primary binary heads — prefer isotonic, fall back to Platt ──
+        iso_wr  = getattr(self, "_iso_wr",  None)
+        iso_inj = getattr(self, "_iso_inj", None)
+        raw_wr  = _clf_proba_batch(self._head_wr,     X)
+        raw_inj = _clf_proba_batch(self._head_injury, X)
+        wr  = iso_wr.predict(raw_wr)   if iso_wr  is not None else _apply_platt_batch(raw_wr,  getattr(self, "_platt_wr",  np.array([1.0, 0.0])))
+        inj = iso_inj.predict(raw_inj) if iso_inj is not None else _apply_platt_batch(raw_inj, getattr(self, "_platt_inj", np.array([1.0, 0.0])))
+
+        # ── Penalty tier heads ──────────────────────────────────────────
+        pen_p75 = pen_p90 = pen_p95 = np.zeros(n)
+        for attr_head, attr_iso, tier in [
+            ("_head_pen_p75", "_iso_pen_p75", "p75"),
+            ("_head_pen_p90", "_iso_pen_p90", "p90"),
+            ("_head_pen_p95", "_iso_pen_p95", "p95"),
+        ]:
+            head = getattr(self, attr_head, None)
+            if head is not None:
+                raw_p = _clf_proba_batch(head, X)
+                iso = getattr(self, attr_iso, None)
+                cal_p = iso.predict(raw_p) if iso is not None else raw_p
+                if tier == "p75":
+                    pen_p75 = cal_p
+                elif tier == "p90":
+                    pen_p90 = cal_p
+                else:
+                    pen_p95 = cal_p
+
+        # ── Legacy regression heads ─────────────────────────────────────
+        iso_grav    = getattr(self, "_iso_grav", None)
+        iso_log_pen = getattr(self, "_iso_log_pen", None)
+        head_pen_nz = getattr(self, "_head_pen_nonzero", None)
+        platt_pen   = getattr(self, "_platt_pen", np.array([1.0, 0.0]))
+
+        raw_grav = _reg_predict_batch(self._head_gravity, X)
+        grav     = iso_grav.predict(raw_grav) if iso_grav is not None else raw_grav
+
+        if head_pen_nz is not None:
+            p_any_pen = _apply_platt_batch(_clf_proba_batch(head_pen_nz, X), platt_pen)
+            cond_logp = _reg_predict_batch(self._head_log_pen, X)
+            if iso_log_pen is not None:
+                cond_logp = iso_log_pen.predict(cond_logp)
+            expected_pen = p_any_pen * np.expm1(np.maximum(0.0, cond_logp))
+        else:
+            raw_logp     = _reg_predict_batch(self._head_log_pen, X)
+            expected_pen = np.expm1(np.maximum(0.0, raw_logp))
 
         return [
             {
-                "p_serious_wr_event":  float(wr[i]),
-                "expected_penalty_usd": float(max(0.0, math.expm1(float(logp[i])))),
-                "p_injury_event":      float(inj[i]),
-                "gravity_score":       float(max(0.0, float(grav[i]))),
+                "p_serious_wr_event":   float(wr[i]),
+                "p_injury_event":       float(inj[i]),
+                "p_penalty_ge_p75":     float(pen_p75[i]),
+                "p_penalty_ge_p90":     float(pen_p90[i]),
+                "p_penalty_ge_p95":     float(pen_p95[i]),
+                "expected_penalty_usd": float(max(0.0, float(expected_pen[i]))),
+                "gravity_score":        float(max(0.0, float(grav[i]))),
             }
-            for i in range(len(X))
+            for i in range(n)
         ]
+
+    # ------------------------------------------------------------------ #
+    #  Composite score (v2 — probability-first)
+    # ------------------------------------------------------------------ #
+    def _raw_composite(self, pred: Dict[str, float]) -> float:
+        """Weighted sum of calibrated probabilities (before transformation).
+
+        Returns a value in [0, 1] representing the raw probability-weighted
+        composite.  Used internally by fit() to build the score CDF.
+        """
+        w1, w2, w3 = self._weights[:3]
+        p_wr  = pred.get("p_serious_wr_event", 0.0)
+        p_inj = pred.get("p_injury_event", 0.0)
+        p_ext = pred.get("p_penalty_ge_p95", 0.0)
+        return w1 * p_wr + w2 * p_inj + w3 * p_ext
+
+    def _transform_score(self, raw: float) -> float:
+        """Monotonic percentile stretching to expand top-end separation.
+
+        Steps:
+        1. Map raw composite -> percentile rank via empirical CDF built at
+           training time.
+        2. Apply convex power stretch: stretched = pctile ^ alpha.
+           With alpha=2 (square), the 50th percentile maps to 25 and
+           the 90th maps to 81, placing most companies below 50 and
+           spreading the actionable high-risk range across 50-100.
+        """
+        cdf = getattr(self, "_score_cdf", None)
+        if cdf is None or len(cdf) == 0:
+            # Fallback: linear scaling
+            return raw * 100.0
+        pctile = float(np.searchsorted(cdf, raw, side="right")) / len(cdf)
+        # Convex stretch: compresses low-risk, expands high-risk separation
+        stretched = pctile ** _STRETCH_ALPHA
+        return stretched * 100.0
 
     def composite_score(
         self,
@@ -422,37 +702,19 @@ class MultiTargetRiskScorer:
     ) -> float:
         """Compute 0-100 composite risk score from a prediction dict.
 
-        Applies smooth evidence shrinkage toward the population mean instead
-        of hard evidence ceilings, eliminating the score wall at ~55 observed
-        in validation plots.
+        v2 formula: all inputs are calibrated probabilities.
+            raw = w1 * p_wr + w2 * p_injury + w3 * p_extreme_penalty
+        Then: evidence-shrink -> percentile-stretch -> rescale to 0-100.
         """
-        w1, w2, w3, w4 = self._weights
+        raw = self._raw_composite(pred)
 
-        pen_component = min(
-            math.log1p(max(0.0, pred["expected_penalty_usd"])) /
-            math.log1p(_PENALTY_REF_USD) * 100.0,
-            100.0,
-        )
-        grav_component = min(
-            math.log1p(max(0.0, pred["gravity_score"])) /
-            math.log1p(_GRAVITY_REF) * 100.0,
-            100.0,
-        )
-
-        raw = (
-            w1 * pred["p_serious_wr_event"] * 100.0
-            + w2 * pen_component
-            + w3 * pred["p_injury_event"]   * 100.0
-            + w4 * grav_component
-        )
-
-        # Smooth evidence shrinkage: pulls low-inspection scores toward the
-        # population mean rather than hard-capping them.
-        # confidence approaches 0 for n=1 (~0.28) and 1 for n>=10 (~0.96).
+        # Smooth evidence shrinkage toward population mean.
         confidence = 1.0 - math.exp(-n_inspections / 3.0)
-        score = raw * confidence + _SCORE_PRIOR * (1.0 - confidence)
+        shrunk = raw * confidence + (_SCORE_PRIOR / 100.0) * (1.0 - confidence)
 
-        # Hard cap only for the most extreme evidence case (fatality + willful)
+        score = self._transform_score(shrunk)
+
+        # Hard cap only for the most extreme evidence case
         if has_fatality and has_willful:
             score = min(score, 70.0)
 
@@ -503,8 +765,11 @@ class MultiTargetRiskScorer:
     def _empty_prediction(self) -> Dict[str, float]:
         return {
             "p_serious_wr_event":   0.0,
-            "expected_penalty_usd": 0.0,
             "p_injury_event":       0.0,
+            "p_penalty_ge_p75":     0.0,
+            "p_penalty_ge_p90":     0.0,
+            "p_penalty_ge_p95":     0.0,
+            "expected_penalty_usd": 0.0,
             "gravity_score":        0.0,
         }
 
@@ -515,36 +780,19 @@ def _optimize_weights(
     pred_batch: List[Dict[str, float]],
     y_adv: np.ndarray,
 ) -> List[float]:
-    """Find weights that maximize Spearman ρ between composite score and y_adv.
+    """Find 3-component weights maximizing Spearman rho between composite and y_adv.
 
-    Strategy: pre-compute the vectorized component arrays once, then use a
-    fast grid search over a coarse lattice followed by Nelder-Mead refinement.
-    Nelder-Mead tolerates the non-differentiability of Spearman correlation
-    much better than gradient-based SLSQP.
+    v2: components are calibrated probabilities — no log-transform needed.
+    Uses grid search + Nelder-Mead refinement (handles non-differentiable rho).
     """
     from scipy.stats import spearmanr
 
-    n = len(pred_batch)
+    # Pre-compute component arrays (vectorized)
+    p_wr  = np.array([p.get("p_serious_wr_event", 0.0) for p in pred_batch])
+    p_inj = np.array([p.get("p_injury_event", 0.0)     for p in pred_batch])
+    p_ext = np.array([p.get("p_penalty_ge_p95", 0.0)   for p in pred_batch])
 
-    # Pre-compute component arrays (vectorized — avoids per-iteration Python loop)
-    p_wr  = np.array([p["p_serious_wr_event"] * 100.0       for p in pred_batch])
-    pen_n = np.array([
-        min(
-            math.log1p(max(0.0, p["expected_penalty_usd"])) /
-            math.log1p(_PENALTY_REF_USD) * 100.0, 100.0,
-        )
-        for p in pred_batch
-    ])
-    p_inj = np.array([p["p_injury_event"] * 100.0            for p in pred_batch])
-    grav_n = np.array([
-        min(
-            math.log1p(max(0.0, p["gravity_score"])) /
-            math.log1p(_GRAVITY_REF) * 100.0, 100.0,
-        )
-        for p in pred_batch
-    ])
-
-    components = np.stack([p_wr, pen_n, p_inj, grav_n], axis=1)  # (n, 4)
+    components = np.stack([p_wr, p_inj, p_ext], axis=1)  # (n, 3)
 
     def _neg_spearman_vec(raw_weights: np.ndarray) -> float:
         w = np.maximum(raw_weights, 0.0)
@@ -552,46 +800,35 @@ def _optimize_weights(
         if s < 1e-9:
             return 0.0
         w = w / s
-        scores = components @ w          # fast dot product
+        scores = components @ w
         if np.all(scores == scores[0]):
             return 0.0
         rho, _ = spearmanr(scores, y_adv)
         return -float(rho) if not math.isnan(rho) else 0.0
 
-    w0      = np.array([_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3, _DEFAULT_W4])
+    w0      = np.array([_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3])
     rho_def = -_neg_spearman_vec(w0)
 
-    # ── Stage 1: coarse grid search over 25 candidate starting points ──
+    # ── Stage 1: coarse grid search ──
     best_w   = w0.copy()
     best_val = _neg_spearman_vec(w0)
 
     grid_points = [
-        # Near-default exploration around [0.35, 0.30, 0.20, 0.15]
-        [0.35, 0.30, 0.20, 0.15],
-        [0.40, 0.25, 0.20, 0.15],
-        [0.40, 0.30, 0.15, 0.15],
-        [0.35, 0.30, 0.25, 0.10],
-        [0.30, 0.30, 0.25, 0.15],
-        # Injury-heavy (test if p_injury head is underweighted)
-        [0.30, 0.25, 0.30, 0.15],
-        [0.35, 0.25, 0.30, 0.10],
-        [0.30, 0.30, 0.30, 0.10],
-        # WR-dominant
-        [0.50, 0.25, 0.15, 0.10],
-        [0.45, 0.25, 0.20, 0.10],
-        [0.45, 0.30, 0.15, 0.10],
-        [0.50, 0.20, 0.20, 0.10],
-        # Penalty-heavy
-        [0.30, 0.40, 0.20, 0.10],
-        [0.35, 0.35, 0.20, 0.10],
-        [0.30, 0.35, 0.25, 0.10],
-        # Gravity-heavy
-        [0.35, 0.25, 0.15, 0.25],
-        [0.35, 0.30, 0.15, 0.20],
-        [0.30, 0.25, 0.20, 0.25],
-        # Equal-ish
-        [0.25, 0.25, 0.25, 0.25],
-        [0.30, 0.25, 0.25, 0.20],
+        [0.60, 0.30, 0.10],
+        [0.50, 0.35, 0.15],
+        [0.55, 0.30, 0.15],
+        [0.65, 0.25, 0.10],
+        [0.50, 0.40, 0.10],
+        [0.55, 0.35, 0.10],
+        [0.60, 0.25, 0.15],
+        [0.70, 0.20, 0.10],
+        [0.45, 0.40, 0.15],
+        [0.50, 0.30, 0.20],
+        [0.40, 0.40, 0.20],
+        [0.55, 0.25, 0.20],
+        [0.65, 0.30, 0.05],
+        [0.60, 0.35, 0.05],
+        [0.50, 0.25, 0.25],
     ]
     for gw in grid_points:
         gw_arr = np.array(gw)
@@ -601,27 +838,25 @@ def _optimize_weights(
             best_val = val
             best_w   = gw_arr.copy()
 
-    # ── Stage 2: Nelder-Mead starting from the best grid point ──────────
-    # Parametrise as 3 free weights; 4th = max(0, 1 - sum)
-    def _nm_objective(v3: np.ndarray) -> float:
-        v = np.concatenate([np.maximum(v3, 0.0), [max(0.0, 1.0 - float(np.sum(np.maximum(v3, 0.0))))]])
-        # L2 regularization towards defaults (λ=0.1) — light constraint to prevent
-        # degenerate all-zero weights while allowing meaningful exploration
+    # ── Stage 2: Nelder-Mead from best grid point ──
+    def _nm_objective(v2: np.ndarray) -> float:
+        v = np.concatenate([np.maximum(v2, 0.0),
+                            [max(0.0, 1.0 - float(np.sum(np.maximum(v2, 0.0))))]])
         reg = 0.1 * float(np.sum((v - w0) ** 2))
         return _neg_spearman_vec(v) + reg
 
-    v0_3 = best_w[:3].copy()
+    v0_2 = best_w[:2].copy()
     try:
         res = minimize(
             _nm_objective,
-            v0_3,
+            v0_2,
             method="Nelder-Mead",
             options={"maxiter": 2000, "xatol": 1e-4, "fatol": 1e-5},
         )
         if res.success or res.fun < best_val:
-            v3   = np.maximum(res.x, 0.0)
-            w4   = max(0.0, 1.0 - float(v3.sum()))
-            w_nm = np.concatenate([v3, [w4]])
+            v2   = np.maximum(res.x, 0.0)
+            w3   = max(0.0, 1.0 - float(v2.sum()))
+            w_nm = np.concatenate([v2, [w3]])
             w_nm = np.maximum(w_nm, 0.0)
             w_nm /= w_nm.sum()
             if _neg_spearman_vec(w_nm) <= best_val:
@@ -630,17 +865,16 @@ def _optimize_weights(
     except Exception:
         pass
 
-    # Enforce minimum w4 >= 0.05: the gravity signal always contributes,
-    # preventing degenerate solutions that completely ignore violation severity.
-    if best_w[3] < 0.05:
-        best_w[3] = 0.05
+    # Enforce minimum w3 >= 0.05: penalty signal always contributes
+    if best_w[2] < 0.05:
+        best_w[2] = 0.05
         best_w = best_w / np.sum(best_w)
 
     rho_opt = -_neg_spearman_vec(best_w)
     if rho_opt >= rho_def - 0.001:
         return best_w.tolist()
 
-    return [_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3, _DEFAULT_W4]
+    return [_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3]
 
 
 # ── Internal prediction helpers ─────────────────────────────────────────────

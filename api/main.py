@@ -146,6 +146,8 @@ def _assessment_response(assessment) -> AssessmentResponse:
         recommendation=assessment.recommendation,
         explanation=assessment.explanation,
         confidence_score=assessment.confidence_score,
+        risk_confidence=assessment.risk_confidence,
+        confidence_detail=assessment.confidence_detail,
         feature_weights=assessment.feature_weights,
         percentile_rank=assessment.percentile_rank,
         industry_label=assessment.industry_label,
@@ -169,8 +171,11 @@ def _assessment_response(assessment) -> AssessmentResponse:
         risk_targets=(
             ProbabilisticRiskTargetsOut(
                 p_serious_wr_event=assessment.risk_targets.p_serious_wr_event,
-                expected_penalty_usd_12m=assessment.risk_targets.expected_penalty_usd_12m,
                 p_injury_event=assessment.risk_targets.p_injury_event,
+                p_penalty_ge_p75=assessment.risk_targets.p_penalty_ge_p75,
+                p_penalty_ge_p90=assessment.risk_targets.p_penalty_ge_p90,
+                p_penalty_ge_p95=assessment.risk_targets.p_penalty_ge_p95,
+                expected_penalty_usd_12m=assessment.risk_targets.expected_penalty_usd_12m,
                 gravity_score=assessment.risk_targets.gravity_score,
                 composite_risk_score=assessment.risk_targets.composite_risk_score,
             )

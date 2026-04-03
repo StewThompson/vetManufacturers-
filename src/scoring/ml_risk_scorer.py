@@ -48,7 +48,7 @@ class MLRiskScorer:
     ]
 
     FEATURE_NAMES = [
-        # ── Absolute signals (18) ──────────────────────────────────────
+        # ── Absolute signals (20) ──────────────────────────────────────
         "log_inspections",
         "log_violations",
         "serious_violations",
@@ -67,6 +67,14 @@ class MLRiskScorer:
         "penalties_per_inspection",
         "clean_ratio",
         "time_adjusted_penalty",
+        "recent_wr_rate",
+        "trend_delta",
+        # ── High-signal penalty discriminators (4) ────────────────────
+        "log_willful_raw",
+        "log_repeat_raw",
+        "has_any_fatality",
+        "log_max_insp_penalty",
+        "log_estab_size",
         # ── Industry-relative z-scores (4) ────────────────────────────
         # 0.0 sentinel when NAICS unavailable
         "relative_violation_rate",
@@ -103,6 +111,8 @@ class MLRiskScorer:
         "penalties_per_inspection": "Penalties / Inspection ($)",
         "clean_ratio": "Clean Inspection Ratio",
         "time_adjusted_penalty": "Time-Adjusted Penalty ($)",
+        "recent_wr_rate": "Recent W/R Violation Rate",
+        "trend_delta": "Violation Trend (recent − all-time vpi)",
         "relative_violation_rate": "Violation Rate vs. Industry (z)",
         "relative_penalty": "Avg Penalty vs. Industry (z)",
         "relative_serious_ratio": "Serious Ratio vs. Industry (z)",
@@ -143,27 +153,18 @@ class MLRiskScorer:
     # Cutoff used to build the real-label training sample.  Establishments
     # with inspections before this date get their features aggregated;
     # those same establishments' post-cutoff inspections become the
-    # real outcome labels that replace circular pseudo-labels during training.
+    # real outcome labels used to train the multi-target model.
     #
     # Pushing this back (earlier than today-minus-1yr) gives a richer paired
     # sample because more establishments have had time to accumulate post-
-    # cutoff inspections.  The current default (2020-01-01) gives ≥6 years of
-    # outcome data within the 10-year bulk cache.
-    #
-    # NOTE: if TEMPORAL_CUTOFF falls outside the bulk cache window
-    # (< today - 10yr) the labeler will find no pre-cutoff inspections and
-    # fall back gracefully to pseudo-labels only.
-    TEMPORAL_LABEL_CUTOFF = date(2020, 1, 1)
+    # cutoff inspections.  Moved to 2022-01-01 to avoid the COVID-era inspection
+    # suppression window (2020-2021) which creates false negatives for genuinely
+    # risky companies that weren't reinspected during the pandemic.
+    TEMPORAL_LABEL_CUTOFF = date(2022, 1, 1)
 
     # Maximum number of real-label rows to add to the training matrix.
     # 50_000 exceeds the ~30k paired pool so effectively "use all paired rows".
     TEMPORAL_SAMPLE_SIZE = 50_000
-
-    # Weight multiplier applied to real-label training rows.
-    # 8× gives real-label rows ~27% of the effective gradient signal even
-    # when the pseudo-label population is 10× larger.  Real labels are direct
-    # OSHA observations and should outweigh the heuristic pseudo-labels.
-    TEMPORAL_LABEL_WEIGHT = 8.0
 
     def __init__(self, osha_client=None):
         self.osha_client = osha_client
@@ -233,6 +234,10 @@ class MLRiskScorer:
         inj_count = 0
         gravities: list = []
         time_adj_pen = 0.0
+        max_insp_pen = 0.0
+        estab_sizes: list = []
+        recent_viol_count = 0
+        recent_wr_raw     = 0
 
         naics_votes: Counter = Counter()
 
@@ -246,6 +251,8 @@ class MLRiskScorer:
 
             pens = [v.penalty_amount for v in viols]
             insp_pen = sum(pens)
+            if insp_pen > max_insp_pen:
+                max_insp_pen = insp_pen
             total_pen += insp_pen
             all_penalties.extend(pens)
             age_years = max(0.0, (date.today() - r.date_opened).days / 365.25)
@@ -253,6 +260,8 @@ class MLRiskScorer:
 
             if r.date_opened >= one_year_ago:
                 recent += 1
+                recent_viol_count += len(viols)
+                recent_wr_raw += sum(1 for v in viols if v.is_willful or v.is_repeat)
 
             if r.accidents:
                 severe += 1
@@ -274,6 +283,14 @@ class MLRiskScorer:
 
             if r.naics_code:
                 naics_votes[r.naics_code] += 1
+
+            if r.nr_in_estab:
+                try:
+                    sz = float(r.nr_in_estab)
+                    if sz > 0:
+                        estab_sizes.append(sz)
+                except (ValueError, TypeError):
+                    pass
 
         naics_code = naics_votes.most_common(1)[0][0] if naics_votes else None
 
@@ -297,12 +314,28 @@ class MLRiskScorer:
         raw_serious_rate = serious_raw / max(n_viols, 1)
         raw_wr_rate      = (willful_raw + repeat_raw) / max(n_viols, 1)
 
+        # Recent-window breakdown features
+        total_wr       = willful_raw + repeat_raw
+        recent_wr_rate = recent_wr_raw / max(total_wr, 1)
+        vpi_recent     = recent_viol_count / max(recent, 1)
+        trend_delta    = vpi - vpi_recent
+
+        median_estab_size = float(np.median(estab_sizes)) if estab_sizes else 0.0
+
         features_17 = [
             n_insp, n_viols, serious_rate, willful_rate, repeat_rate,
             total_pen, avg_pen, max_pen, recent_ratio, severe_rate, vpi,
             acc_rate, fat_rate, inj_rate, avg_gravity,
             pen_per_insp, clean_ratio,
             time_adj_pen,
+            recent_wr_rate,
+            trend_delta,
+            # High-signal penalty discriminators (Option B expansion)
+            math.log1p(willful_raw),
+            math.log1p(repeat_raw),
+            1.0 if fat_count > 0 else 0.0,
+            math.log1p(max_insp_pen),
+            math.log1p(median_estab_size),
         ]
 
         return features_17, naics_code, vpi, avg_pen, raw_serious_rate, raw_wr_rate
@@ -364,94 +397,6 @@ class MLRiskScorer:
         return self._log_transform_features(raw)
 
     # ------------------------------------------------------------------ #
-    #  Heuristic label generation (domain knowledge) — internal only
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _heuristic_label(row: np.ndarray) -> float:
-        """Map 46 raw OSHA features → 0-100 heuristic risk score used as
-        GBR training target (rescaled to match temporal adverse distribution
-        during training when real labels are available)."""
-        (n_insp, n_viols, serious, willful, repeat,
-         total_pen, avg_pen, max_pen, recent_ratio, severe, vpi,
-         accident_count, fatality_count, injury_count, avg_gravity,
-         pen_per_insp, clean_ratio,
-         time_adj_pen) = row[:18]
-
-        naics_unknown = float(row[-1])
-
-        score = 0.0
-        dormant_scale = 0.5 if recent_ratio < 0.01 else 1.0
-        fat_dormant_scale = 0.5 if recent_ratio < 0.01 else 1.0
-        insp_confidence = min(0.5 + n_insp / 10.0, 1.0)
-
-        if fatality_count > 0:
-            eff_fatalities = min(fatality_count * 5.0, 5.0)
-            rate_contrib = min(12.0 + max(eff_fatalities - 1.0, 0.0) * 3.0, 24.0)
-            abs_proxy = n_insp * fatality_count
-            pattern_boost = min(np.log1p(abs_proxy) * 2.0, 8.0)
-            score += (rate_contrib + pattern_boost) * fat_dormant_scale * insp_confidence
-        score += min(severe * 25.0, 6)
-        score += min(injury_count * 6.0, 4)
-        score += min(accident_count * 10.0, 4)
-        score = min(score, 34)
-
-        score += min(willful * 60.0, 20) * dormant_scale
-        score += min(repeat  * 50.0, 15) * dormant_scale
-        score += min(serious * 25.0, 15)
-        if avg_gravity > 0:
-            score += min(avg_gravity * 0.6, 6)
-
-        if recent_ratio > 0 and (willful + repeat) > 0:
-            active_wr = recent_ratio * (willful * 3.0 + repeat * 2.0) * 25.0
-            score += min(active_wr, 20.0)
-
-        score += recent_ratio * 12.0
-        score += min(vpi * 2.5, 10)
-
-        if recent_ratio > 0.5 and vpi >= 1.5:
-            trajectory_premium = min((recent_ratio - 0.5) * 2.0 * (vpi - 1.0), 8.0)
-            score += trajectory_premium
-        elif recent_ratio < 0.2 and vpi < 0.5 and n_insp >= 3:
-            score -= min((0.2 - recent_ratio) * 10.0, 5.0)
-
-        if time_adj_pen > 0:
-            score += min(time_adj_pen / 40_000, 10.0)
-        if pen_per_insp > 0:
-            score += min(pen_per_insp / 20_000, 6.0)
-
-        if naics_unknown > 0.5:
-            score += 4.0
-
-        is_dormant = recent_ratio < 0.01
-        fat_blocks_clean = (
-            (fatality_count > 0 or accident_count > 0 or severe > 0)
-            and not is_dormant
-        )
-        if clean_ratio > 0 and not fat_blocks_clean:
-            if n_insp >= 3:
-                score -= clean_ratio * 10.0
-            elif n_insp == 2:
-                score -= clean_ratio * 4.0
-
-        if n_insp <= 1:
-            score += 2.5
-        elif n_insp <= 3:
-            score += 1.5
-        elif n_insp <= 5:
-            score += 0.5
-
-        if fatality_count > 0 and (willful + repeat) > 0:
-            score += 8.0 * insp_confidence * dormant_scale
-        if willful > 0 and repeat > 0:
-            score += 5.0 * insp_confidence * dormant_scale
-        if recent_ratio > 0.5 and serious >= 0.25:
-            score += 4.0
-
-        return float(np.clip(score, 0, 100))
-
-    _pseudo_label = _heuristic_label
-
-    # ------------------------------------------------------------------ #
     #  Population data from bulk cache
     # ------------------------------------------------------------------ #
     def _fetch_population(self) -> List[Dict]:
@@ -497,6 +442,8 @@ class MLRiskScorer:
             fat_count = 0
             inj_count = 0
             time_adj_pen = 0.0
+            recent_viol_count = 0   # violation count from recent inspections only
+            recent_wr_raw     = 0   # W/R violation count from recent inspections
 
             # Majority-vote NAICS code for this establishment
             naics_votes: dict = defaultdict(int)
@@ -505,10 +452,12 @@ class MLRiskScorer:
                 od = insp.get("open_date", "")
                 try:
                     d = date.fromisoformat(od[:10])
-                    if d >= one_year_ago:
+                    is_recent = (d >= one_year_ago)
+                    if is_recent:
                         recent += 1
                     age_years = max(0.0, (date.today() - d).days / 365.25)
                 except (ValueError, TypeError):
+                    is_recent = False
                     age_years = 0.0
                 insp_viols = client.get_violations_for_activity(act)
                 insp_pen = sum(
@@ -519,6 +468,12 @@ class MLRiskScorer:
                 viols.extend(insp_viols)
                 if not insp_viols:
                     clean += 1
+                if is_recent:
+                    recent_viol_count += len(insp_viols)
+                    recent_wr_raw += sum(
+                        1 for v in insp_viols
+                        if v.get("viol_type") in ("W", "R")
+                    )
 
                 # Accident stats (uses cached indexes, no API calls)
                 acc_stats = client.get_accident_count_for_activity(act)
@@ -576,6 +531,12 @@ class MLRiskScorer:
             raw_serious_rate = serious_raw / max(n_viols, 1)
             raw_wr_rate      = (willful_raw + repeat_raw) / max(n_viols, 1)
 
+            # Recent-window breakdown features
+            total_wr = willful_raw + repeat_raw
+            recent_wr_rate = recent_wr_raw / max(total_wr, 1)
+            vpi_recent     = recent_viol_count / max(recent, 1)
+            trend_delta    = vpi - vpi_recent
+
             population.append({
                 "name": estab,
                 "features": [
@@ -584,6 +545,8 @@ class MLRiskScorer:
                     acc_rate, fat_rate, inj_rate, avg_gravity,
                     pen_per_insp, clean_ratio,
                     time_adj_pen,
+                    recent_wr_rate,
+                    trend_delta,
                     # Relative features will be appended below
                 ],
                 # Scratch fields for industry stats — removed before persisting
@@ -676,7 +639,7 @@ class MLRiskScorer:
                 sample_size=self.TEMPORAL_SAMPLE_SIZE,
             )
         except Exception as e:
-            print(f"  Temporal label build failed ({e}); using pseudo-labels only.")
+            print(f"  Temporal label build failed ({e}); model will not be fitted.")
             rows = []
         return rows
 
@@ -684,122 +647,45 @@ class MLRiskScorer:
     #  Model training
     # ------------------------------------------------------------------ #
     def _train(self, population: List[Dict]):
-        """Build feature matrix, generate pseudo-labels, train pipeline.
+        """Build population feature matrix and train GBR on real temporal labels.
 
-        Training label strategy
-        -----------------------
-        Step 1 — Pseudo-label population (all ~370k establishments):
-            Each row receives a heuristic pseudo-label computed from raw
-            OSHA features.  These form the bulk of the training set and
-            ensure the model covers all industries and risk levels.
+        Training strategy
+        -----------------
+        The full population feature matrix is built from ~370k establishments
+        for percentile ranking.  The GBR is trained solely on real adverse
+        outcome labels from the temporal label builder (pre-cutoff features
+        paired with post-cutoff adverse outcomes).
 
-        Step 2 — Real-label augmentation (≤ TEMPORAL_SAMPLE_SIZE rows):
-            A stratified sample of paired establishments (pre-TEMPORAL_LABEL_
-            CUTOFF features → post-cutoff real adverse outcomes) is appended
-            to the training matrix.  These rows break the circular dependency
-            for the labeled fraction.
-
-            Real-label rows use features aggregated from pre-cutoff inspections
-            only (LEAKAGE GUARD: no future information in features).  Their
-            pre-cutoff feature distribution is compatible with the full-history
-            population because all features are per-inspection RATES.
-
-            A TEMPORAL_LABEL_WEIGHT × sample-weight multiplier ensures real
-            labels exert proportionally more influence on the loss than
-            pseudo-labels (which have higher uncertainty).
-
-        Step 3 — 80/20 split and tail calibration:
-            The augmented matrix is split 80/20.  The 20% calibration fold
-            is drawn from the pseudo-label population only (real-label rows
-            all go into training) so the calibrator still maps raw GBR scores
-            onto the pseudo-label scale for backward compatibility.
+        If insufficient real-label rows are available the pipeline is left
+        unfitted; score() falls back gracefully to 50.0.
         """
-        # X_raw may contain NaN in z-score features for NAICS-missing rows.
-        # Pseudo-labels use only absolute signals + naics_unknown flag;
-        # the model trains on NaN→0.0 matrix for z-scores.
         X_raw = np.array([p["features"] for p in population], dtype=float)
-        y_pseudo = np.array([self._pseudo_label(row) for row in X_raw])
         X_pop = np.nan_to_num(X_raw, nan=0.0)
         X_pop = self._log_transform_features(X_pop)
+        self.population_features = X_pop
 
-        # ── Step 2: load real-label augmentation rows ─────────────────────
+        # ── Load real temporal labels ─────────────────────────────────────
         temporal_rows = self._load_temporal_labels()
         n_real = len(temporal_rows)
 
-        if n_real > 0:
-            X_real_raw = np.array(
-                [r["features_46"] for r in temporal_rows], dtype=float
-            )
-            X_real_raw = np.nan_to_num(X_real_raw, nan=0.0)
-            X_real = self._log_transform_features(X_real_raw)
-            y_real = np.array([r["real_label"] for r in temporal_rows], dtype=float)
-            print(
-                f"  Temporal label augmentation: {n_real:,} real-label rows added "
-                f"(cutoff={self.TEMPORAL_LABEL_CUTOFF}).  "
-                f"Real label mean={y_real.mean():.1f}  "
-                f"pseudo mean={y_pseudo.mean():.1f}"
-            )
-        else:
-            print("  No temporal labels available; training on pseudo-labels only.")
+        if n_real < 10:
+            print("  Insufficient real-label rows for training; model not fitted.")
+            return
 
-        # ── Step 2b: rescale pseudo-labels to match real adverse distribution ──
-        # Pseudo-labels are heuristic proxies that systematically over-predict
-        # (mean≈29 vs real adverse mean≈12).  When real-label rows are present,
-        # we z-score the pseudo-labels to share the same mean and std as the
-        # real distribution.  This removes the contradictory gradient pull
-        # (pseudo rows pushing toward 29, real rows pushing toward 12) while
-        # preserving the rank structure (Spearman ρ≈0.25 with real adverses).
-        if n_real >= 10:
-            p_mean = float(y_pseudo.mean())
-            p_std  = max(float(y_pseudo.std()), 1e-6)
-            r_mean = float(y_real.mean())
-            r_std  = max(float(y_real.std()), 1e-6)
-            y_pseudo = np.clip(
-                (y_pseudo - p_mean) * (r_std / p_std) + r_mean, 0.0, 100.0
-            )
-            print(
-                f"  Pseudo-labels rescaled: mean {p_mean:.1f}->{y_pseudo.mean():.1f}  "
-                f"std {p_std:.1f}->{y_pseudo.std():.1f}  "
-                f"(matched to real adverse distribution)"
-            )
+        X_real_raw = np.array(
+            [r["features_46"] for r in temporal_rows], dtype=float
+        )
+        X_real_raw = np.nan_to_num(X_real_raw, nan=0.0)
+        X_real = self._log_transform_features(X_real_raw)
+        y_real = np.array([r["real_label"] for r in temporal_rows], dtype=float)
+        print(
+            f"  Training on {n_real:,} real-label rows "
+            f"(cutoff={self.TEMPORAL_LABEL_CUTOFF})  "
+            f"label mean={y_real.mean():.1f}  std={y_real.std():.1f}"
+        )
 
-        # ── Step 3: 80/20 split on the pseudo-label population ────────────
-        # Real-label rows are always placed in the training fold so that the
-        # calibration fold remains purely pseudo-label for backward compat.
-        rng = np.random.default_rng(42)
-        n_pop = len(X_pop)
-        idx = rng.permutation(n_pop)
-        split = int(n_pop * 0.8)
-        train_idx, cal_idx = idx[:split], idx[split:]
-
-        X_train_pop, y_train_pop = X_pop[train_idx], y_pseudo[train_idx]
-        X_cal,        y_cal       = X_pop[cal_idx],   y_pseudo[cal_idx]
-
-        # ── Combine pseudo-label train fold with real-label rows ──────────
-        if n_real > 0:
-            X_train = np.vstack([X_train_pop, X_real])
-            y_train = np.concatenate([y_train_pop, y_real])
-        else:
-            X_train = X_train_pop
-            y_train = y_train_pop
-
-        # ── Tail sample weights ───────────────────────────────────────────
-        # Ramp starts at the Recommend→Caution boundary (y=30) rather than 40
-        # to give the model a stronger gradient signal throughout the Caution
-        # band.  Steeper slope (1 unit per 10 score points) and an 8× cap
-        # counteract the 79:1 class imbalance between Recommend and
-        # Do-Not-Recommend establishments.
-        sw_pseudo = np.clip(1.0 + np.maximum(0.0, y_train_pop - 30.0) / 10.0, 1.0, 8.0)
-        if n_real > 0:
-            # Flat weight for real rows — no tail ramp.
-            # Real adverse labels are direct observations; their own magnitude
-            # already encodes severity.  Applying the pseudo-label tail ramp
-            # (calibrated for mean=29) to real labels (mean≈12) would suppress
-            # most real rows to near-1× weight, negating the multiplier.
-            sw_real   = np.full(len(y_real), self.TEMPORAL_LABEL_WEIGHT, dtype=float)
-            sw_train  = np.concatenate([sw_pseudo, sw_real])
-        else:
-            sw_train = sw_pseudo
+        # ── Tail sample weights (ramp on high-risk real rows) ─────────────
+        sw = np.clip(1.0 + np.maximum(0.0, y_real - 30.0) / 10.0, 1.0, 8.0)
 
         # ── Model: Huber loss + higher capacity + min leaf ────────────────
         self.pipeline = Pipeline([
@@ -815,164 +701,17 @@ class MLRiskScorer:
                 random_state=42,
             )),
         ])
-        self.pipeline.fit(X_train, y_train, model__sample_weight=sw_train)
-        self.population_features = X_pop
-        self._n_temporal_labels = n_real  # stored for diagnostics / tests
+        self.pipeline.fit(X_real, y_real, model__sample_weight=sw)
+        self._n_temporal_labels = n_real
 
-        # ── Fit calibrator on real-label pairs (raw_pred → real adverse) ─────
-        # TailCalibrator was designed to fit on (raw_score, future_adverse).
-        # Using pseudo-labels here was feeding it circular targets (the same
-        # heuristic the model was trained to reproduce).  Real adverse outcomes
-        # are the correct calibration target: they tell the calibrator exactly
-        # how each raw prediction level maps to observed future compliance harm.
+        # ── Fit calibrator on real-label pairs (raw_pred → real adverse) ──
         self._calibrator = TailCalibrator()
-        if n_real >= 10:
-            pred_real = self.pipeline.predict(X_real)
-            self._calibrator.fit(pred_real, y_real)
-            _cal_note = f"{n_real:,} real-label pairs (pred → real adverse outcome)"
-        else:
-            # Fallback when temporal labels unavailable
-            cal_preds = self.pipeline.predict(X_cal)
-            self._calibrator.fit(cal_preds, y_cal)
-            _cal_note = f"{len(X_cal):,} pseudo-label holdout rows"
+        pred_real = self.pipeline.predict(X_real)
+        self._calibrator.fit(pred_real, y_real)
         print(
-            f"ML Risk Model trained on {len(X_train):,} rows "
-            f"({len(X_train_pop):,} pseudo-label + {n_real:,} real-label);  "
-            f"calibrator fitted on {_cal_note}."
+            f"ML Risk Model trained on {n_real:,} real-label rows;  "
+            f"calibrator fitted on {n_real:,} real-label pairs."
         )
-
-    # ------------------------------------------------------------------ #
-    #  Persistence
-    # ------------------------------------------------------------------ #
-    #  Temporal calibration
-    # ------------------------------------------------------------------ #
-    def _refit_calibrator_from_temporal(self, population: List[Dict]) -> None:
-        """Refit the tail calibrator using real future outcomes (2024+).
-
-        After training, this method loads post-2024 inspections and violations
-        from the bulk CSVs, computes real future adverse outcome scores for each
-        training establishment that also received inspections after 2024-01-01,
-        and re-fits the calibrator so that the raw-score→calibrated-score mapping
-        reflects actual compliance outcomes rather than self-referential
-        pseudo-labels.
-
-        This corrects the circular calibration problem: fitting the calibrator
-        on pseudo-label holdout only un-compresses back to already-faulty labels.
-        Real temporal data reveals how raw scores actually predict future harm.
-        """
-        insp_path = os.path.join(self.CACHE_DIR, "inspections_bulk.csv")
-        viol_path = os.path.join(self.CACHE_DIR, "violations_bulk.csv")
-
-        if not os.path.exists(insp_path) or not os.path.exists(viol_path):
-            print("  Temporal calibration skipped: bulk CSVs not found in ml_cache/.")
-            return
-
-        if self.pipeline is None or self.population_features is None:
-            return
-
-        CUTOFF = date(2024, 1, 1)
-        print("  Refitting calibrator from real temporal outcomes (2024+ holdout)…")
-
-        # Get raw model predictions for every population establishment.
-        pop_raw_scores = self.pipeline.predict(self.population_features)
-        name_to_raw: Dict[str, float] = {
-            p["name"]: float(pop_raw_scores[i])
-            for i, p in enumerate(population)
-        }
-
-        # Stream post-2024 inspections, keeping only names we trained on.
-        post_estabs: Dict[str, list] = defaultdict(list)
-        csv.field_size_limit(10 * 1024 * 1024)
-        with open(insp_path, encoding="utf-8", errors="replace", newline="") as f:
-            for row in csv.DictReader(f):
-                name = (row.get("estab_name") or "UNKNOWN").upper()
-                if name not in name_to_raw:
-                    continue
-                od = row.get("open_date", "")
-                try:
-                    d = date.fromisoformat(od[:10])
-                except (ValueError, TypeError):
-                    continue
-                if d >= CUTOFF:
-                    post_estabs[name].append(row)
-
-        if not post_estabs:
-            print("  No post-2024 inspections for known establishments; skipping.")
-            return
-
-        # Load violations for post-2024 activity numbers only (leakage guard).
-        post_acts: set = {
-            str(r.get("activity_nr", ""))
-            for rows in post_estabs.values()
-            for r in rows
-        }
-        viols_by_act: Dict[str, list] = defaultdict(list)
-        with open(viol_path, encoding="utf-8", errors="replace", newline="") as f:
-            for row in csv.DictReader(f):
-                if row.get("delete_flag") == "X":
-                    continue
-                act = str(row.get("activity_nr", ""))
-                if act in post_acts:
-                    viols_by_act[act].append(row)
-
-        # Compute (raw_score, future_adverse) pairs.
-        raw_scores_cal: list = []
-        future_advs_cal: list = []
-
-        for name, fut_inspections in post_estabs.items():
-            raw_pred = name_to_raw[name]
-            fut_viols: list = []
-            fut_fat = 0
-            for insp in fut_inspections:
-                act = str(insp.get("activity_nr", ""))
-                fut_viols.extend(viols_by_act.get(act, []))
-                fut_fat += int(insp.get("fatalities", "0") or 0)
-
-            fut_n   = len(fut_inspections)
-            fut_wr  = sum(1 for v in fut_viols if v.get("viol_type") in ("W", "R"))
-            fut_s   = sum(1 for v in fut_viols if v.get("viol_type") == "S")
-            fut_pen = sum(
-                float(v.get("current_penalty") or v.get("initial_penalty") or 0)
-                for v in fut_viols
-            )
-            fut_vr    = len(fut_viols) / fut_n if fut_n > 0 else 0.0
-            any_fatal = int(fut_fat > 0)
-
-            # Mirror the adverse-outcome formula used in test_real_world_validation.
-            adv = 0.0
-            adv += 20.0 * any_fatal
-            adv += min((fut_fat - 1) * 5.0, 15.0) if fut_fat > 1 else 0.0
-            adv += 8.0 * int(fut_wr > 0)
-            adv += min(fut_wr * 3.0, 15.0)
-            adv += min(fut_s * 1.0, 10.0)
-            adv += min(math.log1p(fut_pen) * 0.8, 10.0)
-            adv += min(fut_vr * 2.0, 10.0)
-
-            raw_scores_cal.append(raw_pred)
-            future_advs_cal.append(adv)
-
-        n_pairs = len(raw_scores_cal)
-        if n_pairs < 100:
-            print(
-                f"  Only {n_pairs} temporal pairs found; "
-                "keeping pseudo-label calibrator."
-            )
-            return
-
-        print(
-            f"  Fitting temporal calibrator on {n_pairs:,} "
-            "(raw_score, future_adverse) pairs…"
-        )
-        new_cal = TailCalibrator()
-        new_cal.fit(
-            np.array(raw_scores_cal, dtype=float),
-            np.array(future_advs_cal, dtype=float),
-        )
-        if new_cal.is_fitted:
-            self._calibrator = new_cal
-            print("  Temporal calibrator fitted and attached.")
-        else:
-            print("  Temporal calibrator fit produced too few bins; keeping pseudo-label version.")
 
     # ------------------------------------------------------------------ #
     def _save(self, population: List[Dict]):
@@ -1069,7 +808,6 @@ class MLRiskScorer:
                 print("Insufficient population data ")
                 return
             self._train(population)
-            self._refit_calibrator_from_temporal(population)
             self._save(population)
         except Exception as e:
             print(f"Population fetch failed ({e})")
@@ -1257,15 +995,18 @@ class MLRiskScorer:
         risk_score = estab["weighted_avg_score"]
 
         # ── Percentile rank within population ─────────────────────────
-        if self.population_features is not None and len(self.population_features) > 0:
+        if self.pipeline is not None and self.population_features is not None and len(self.population_features) > 0:
             pop_scores = self.pipeline.predict(self.population_features)
             percentile = float(np.mean(pop_scores <= risk_score) * 100)
         else:
             percentile = 50.0
 
         # ── Feature importances from the GB model ─────────────────────
-        gb = self.pipeline.named_steps["model"]
-        importances = dict(zip(self.FEATURE_NAMES, gb.feature_importances_.tolist()))
+        if self.pipeline is not None:
+            gb = self.pipeline.named_steps["model"]
+            importances = dict(zip(self.FEATURE_NAMES, gb.feature_importances_.tolist()))
+        else:
+            importances = {}
 
         # Aggregate feature values for display
         agg_X = estab["aggregate_features"]
@@ -1379,7 +1120,6 @@ class MLRiskScorer:
         population = self._fetch_population()
         if len(population) >= 5:
             self._train(population)
-            self._refit_calibrator_from_temporal(population)
             self._save(population)
             return True
         return False

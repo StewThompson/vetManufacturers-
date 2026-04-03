@@ -1,19 +1,10 @@
 ﻿"""
 test_real_world_validation.py — External-validity testing for the manufacturer risk score.
 
-EXTERNAL VALIDITY vs. PSEUDO-LABEL RECONSTRUCTION
-==================================================
-The companion suite (test_temporal_validation.py) checks that the ML model
-accurately reproduces its own pseudo-labels on held-out time periods.  That
-is a necessary sanity check, but it cannot answer the key question for
-practitioners:
-
-    "Does a high manufacturer risk score — computed entirely from
-     historical OSHA records — predict worse compliance outcomes
-     in the future?"
-
-This module answers that question directly.  For every establishment that
-has at least one OSHA inspection before the cutoff date, we:
+EXTERNAL VALIDITY
+=================
+For every establishment that has at least one OSHA inspection before the
+cutoff date, we:
 
   1. BASELINE RISK SCORE (predictor)
        Aggregate only pre-cutoff inspections → 46-feature representation →
@@ -53,8 +44,7 @@ Test categories
   7.  Calibration report by risk band         ← diagnostic, always passes
   8.  Industry robustness
   9.  Sparse-data robustness
- 10.  Multi-cutoff sensitivity analysis
- 11.  Summary report                          ← diagnostic, always passes
+ 10.  Summary report                          ← diagnostic, always passes
 """
 import sys
 import os
@@ -69,14 +59,13 @@ from datetime import date, timedelta
 from typing import List, Dict, Tuple, Optional
 
 from scipy.stats import spearmanr, pearsonr
-from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
 from sklearn.metrics import roc_auc_score
 from collections import Counter
 
 # ── Project imports ────────────────────────────────────────────────────
 from src.scoring.ml_risk_scorer import MLRiskScorer
+from src.scoring.multi_target_scorer import MultiTargetRiskScorer
 from src.scoring.industry_stats import compute_industry_stats, compute_relative_features
 from src.data_retrieval.naics_lookup import load_naics_map
 
@@ -87,12 +76,6 @@ from src.data_retrieval.naics_lookup import load_naics_map
 
 # Primary split: score with pre-2024 data, measure outcomes from 2024 onward.
 CUTOFF_DATE = date(2024, 1, 1)
-
-# Additional cutoffs for sensitivity analysis (multi-split).
-# The bulk cache covers a 10-year rolling window (from ~2016-03 onwards),
-# so the earliest usable "historical" cutoff is early 2017 (giving at
-# least one full year of training history before the split).
-MULTI_CUTOFF_DATES = [date(2018, 1, 1), date(2020, 1, 1), date(2022, 1, 1), date(2024, 1, 1)]
 
 CACHE_DIR = "ml_cache"
 
@@ -388,7 +371,7 @@ def _build_per_establishment_data(
     accident_stats: dict,
     naics_map: dict,
     cutoff_date: date = CUTOFF_DATE,
-    min_hist_inspections: int = 1,
+    min_hist_inspections: int = 2,
     max_establishments: Optional[int] = _MAX_ESTAB_DEV,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Split all inspections per establishment into historical features and
@@ -459,7 +442,11 @@ def _build_per_establishment_data(
         viols:    list = []
         acc_count    = fat_count = inj_count = 0
         time_adj_pen = 0.0
+        max_insp_pen = 0.0
+        estab_sizes: list = []
         naics_votes: Dict[str, int] = defaultdict(int)
+        recent_viol_count = 0
+        recent_wr_raw     = 0
 
         for insp in hist_list:
             act = str(insp.get("activity_nr", ""))
@@ -483,9 +470,20 @@ def _build_per_establishment_data(
                     float(v.get("current_penalty") or v.get("initial_penalty") or 0)
                     for v in insp_viols
                 )
+                if insp_pen_sum > max_insp_pen:
+                    max_insp_pen = insp_pen_sum
                 if insp_pen_sum > 0:
                     age_years = max(0.0, (date.today() - insp_d).days / 365.25)
                     time_adj_pen += insp_pen_sum * math.exp(-age_years / 3.0)
+
+            nr_raw = str(insp.get("nr_in_estab") or "").strip()
+            if nr_raw:
+                try:
+                    sz = float(nr_raw)
+                    if sz > 0:
+                        estab_sizes.append(sz)
+                except ValueError:
+                    pass
 
             acc = accident_stats.get(act, {"accidents": 0, "fatalities": 0, "injuries": 0})
             acc_count += acc["accidents"]
@@ -493,6 +491,12 @@ def _build_per_establishment_data(
             inj_count += acc["injuries"]
             if acc["accidents"] > 0:
                 severe += 1
+
+            if insp_d is not None and insp_d >= one_year_ago:
+                recent_viol_count += len(insp_viols)
+                recent_wr_raw += sum(
+                    1 for v in insp_viols if v.get("viol_type") in ("W", "R")
+                )
 
             nc = str(insp.get("naics_code") or "").strip()
             if nc and nc.isdigit() and len(nc) >= 4:
@@ -537,17 +541,30 @@ def _build_per_establishment_data(
         raw_serious_rate = serious_raw / max(n_viols, 1)
         raw_wr_rate      = (willful_raw + repeat_raw) / max(n_viols, 1)
 
+        total_wr       = willful_raw + repeat_raw
+        recent_wr_rate = recent_wr_raw / max(total_wr, 1)
+        vpi_recent     = recent_viol_count / max(recent, 1)
+        trend_delta    = vpi - vpi_recent
+
         hist_pop.append({
             "name": estab,
             "n_inspections": n_insp,
             "n_future_inspections": len(future_list),
-            # 18 absolute features — same ordering as MLRiskScorer.FEATURE_NAMES[:18]
+            # 24 absolute features — same ordering as MLRiskScorer.FEATURE_NAMES[:24]
             "features": [
                 n_insp, n_viols, serious_rate, willful_rate, repeat_rate,
                 total_pen, avg_pen, max_pen, recent_ratio, severe_rate, vpi,
                 acc_rate, fat_rate, inj_rate, avg_gravity,
                 pen_per_insp, clean_ratio,
                 time_adj_pen,
+                recent_wr_rate,
+                trend_delta,
+                # Option B: high-signal penalty discriminators
+                math.log1p(willful_raw),
+                math.log1p(repeat_raw),
+                1.0 if fat_count > 0 else 0.0,
+                math.log1p(max_insp_pen),
+                math.log1p(float(np.median(estab_sizes)) if estab_sizes else 0.0),
             ],
             "_industry_group":   naics_group,
             "_raw_vpi":          vpi,
@@ -583,7 +600,7 @@ def _build_feature_matrix(
     naics_map: dict,
     scorer: MLRiskScorer,
 ) -> np.ndarray:
-    """Append industry z-scores + NAICS one-hot to 18-feature rows → n × 47 array.
+    """Append industry z-scores + NAICS one-hot to 24-feature rows → n × 53 array.
 
     LEAKAGE GUARD: industry_stats must have been computed from the historical
     population only (never the full or future population).
@@ -616,192 +633,6 @@ def _build_feature_matrix(
     X = np.array(rows, dtype=float)
     X = np.nan_to_num(X, nan=0.0)
     return X
-
-
-# ====================================================================== #
-#  Scoring: train GBR on historical population, return calibrated predictions
-# ====================================================================== #
-
-def _train_and_score_historical(
-    hist_X: np.ndarray,
-    hist_y: np.ndarray,
-    random_state: int = 42,
-) -> Tuple[np.ndarray, Pipeline]:
-    """Train a GBR on historical data (pseudo-labels) and score all establishments.
-
-    Uses linear calibration (same approach as test_temporal_validation.py)
-    to ensure scores sit in the 0–100 pseudo-label range.
-
-    Returns:
-        baseline_scores : calibrated predictions in [0, 100], shape (n,)
-        pipeline        : fitted sklearn Pipeline (for feature-importance inspection)
-    """
-    hist_X_log = MLRiskScorer._log_transform_features(hist_X)
-
-    pipeline = Pipeline([
-        ("scaler", StandardScaler()),
-        ("model",  GradientBoostingRegressor(
-            n_estimators=100, max_depth=3, learning_rate=0.1,
-            random_state=random_state,
-        )),
-    ])
-    pipeline.fit(hist_X_log, hist_y)
-
-    raw_preds = pipeline.predict(hist_X_log)
-
-    # Linear calibration using training-set statistics so that calibrated
-    # scores approximate the pseudo-label distribution (mean, std).
-    r = float(np.corrcoef(hist_y, raw_preds)[0, 1])
-    b = float(np.std(hist_y)) / max(r * float(np.std(raw_preds)), 1e-9)
-    a = float(np.mean(hist_y)) - b * float(np.mean(raw_preds))
-    baseline_scores = np.clip(a + b * raw_preds, 0.0, 100.0)
-
-    return baseline_scores, pipeline
-
-
-def _train_and_score_with_temporal_labels(
-    hist_X: np.ndarray,
-    hist_y: np.ndarray,
-    temporal_rows: list,
-    random_state: int = 42,
-) -> np.ndarray:
-    """Train a GBR augmented with real temporal labels, then score all establishments.
-
-    Stacks real-label rows (pre-cutoff features, post-cutoff adverse outcome)
-    on top of the pseudo-label population, giving real rows 3× sample weight.
-    This mirrors the augmentation strategy used in MLRiskScorer._train() but
-    uses the same lightweight GBR params as _train_and_score_historical() for
-    fast test execution.
-
-    Args:
-        hist_X         : n × 47 historical feature matrix (pseudo-label population)
-        hist_y         : n pseudo-labels in [0, 100]
-        temporal_rows  : list of dicts from load_or_build_temporal_labels;
-                         each dict has keys 'features_46' and 'real_label'
-        random_state   : RNG seed
-
-    Returns:
-        temporal_scores : calibrated predictions for ALL hist_X establishments,
-                          in [0, 100], shape (n,).  If temporal_rows is empty,
-                          falls back to _train_and_score_historical.
-    """
-    if not temporal_rows:
-        scores, _ = _train_and_score_historical(hist_X, hist_y, random_state)
-        return scores
-
-    TEMPORAL_LABEL_WEIGHT = MLRiskScorer.TEMPORAL_LABEL_WEIGHT
-
-    # Build real-label matrix; log-transform matches production scorer.
-    X_real = np.array([r["features_46"] for r in temporal_rows], dtype=float)
-    X_real = np.nan_to_num(X_real, nan=0.0)
-    X_real = MLRiskScorer._log_transform_features(X_real)
-    y_real = np.array([r["real_label"] for r in temporal_rows], dtype=float)
-
-    hist_X_log = MLRiskScorer._log_transform_features(hist_X)
-
-    # Rescale pseudo-labels to match real adverse distribution.
-    # Pseudo-labels over-predict by ~2.4x (mean~29 vs real mean~12).  Without
-    # rescaling, the two label sets pull the GBR toward contradictory targets
-    # and the real-label signal is partially washed out even with high weights.
-    p_mean = float(hist_y.mean())
-    p_std  = max(float(hist_y.std()), 1e-6)
-    r_mean = float(y_real.mean())
-    r_std  = max(float(y_real.std()), 1e-6)
-    hist_y_scaled = np.clip(
-        (hist_y - p_mean) * (r_std / p_std) + r_mean, 0.0, 100.0
-    )
-
-    # Combine: rescaled pseudo-label population + real-label rows
-    X_train = np.vstack([hist_X_log, X_real])
-    y_train = np.concatenate([hist_y_scaled, y_real])
-
-    # Sample weights: pseudo rows uniform, real rows TEMPORAL_LABEL_WEIGHT x
-    w_pseudo = np.ones(len(hist_y_scaled), dtype=float)
-    w_real   = np.full(len(y_real), TEMPORAL_LABEL_WEIGHT, dtype=float)
-    sample_weight = np.concatenate([w_pseudo, w_real])
-
-    pipeline = Pipeline([
-        ("scaler", StandardScaler()),
-        ("model",  GradientBoostingRegressor(
-            n_estimators=100, max_depth=3, learning_rate=0.1,
-            random_state=random_state,
-        )),
-    ])
-    pipeline.fit(X_train, y_train, model__sample_weight=sample_weight)
-
-    raw_preds = pipeline.predict(hist_X_log)
-
-    # Calibrate against rescaled pseudo-labels (mean≈real_mean, std≈real_std).
-    # Using the full ~400K population gives a well-conditioned, low-variance
-    # estimate of r and std.  hist_y_scaled already has the same distribution
-    # as y_real, so outputs are anchored to the correct absolute scale.
-    r = float(np.corrcoef(hist_y_scaled, raw_preds)[0, 1])
-    b = float(np.std(hist_y_scaled)) / max(abs(r) * float(np.std(raw_preds)), 1e-9)
-    a = float(np.mean(hist_y_scaled)) - b * float(np.mean(raw_preds))
-    temporal_scores = np.clip(a + b * raw_preds, 0.0, 100.0)
-
-    return temporal_scores
-
-
-# ====================================================================== #
-#  Scoring helper for multiple cutoff dates (multi-split sensitivity)
-# ====================================================================== #
-
-def _run_cutoff_analysis(
-    all_inspections: list,
-    viols_by_activity: dict,
-    accident_stats: dict,
-    naics_map: dict,
-    scorer: MLRiskScorer,
-    cutoff_date: date,
-) -> Optional[Dict]:
-    """Run the full split → score → outcome pipeline for one cutoff date.
-
-    Returns a dict of arrays ready for correlation analysis, or None if
-    there are insufficient paired establishments.
-    """
-    hist_pop, future_outcomes = _build_per_establishment_data(
-        all_inspections, viols_by_activity, accident_stats, naics_map,
-        cutoff_date=cutoff_date,
-    )
-    if len(hist_pop) < MIN_HIST_ESTABLISHMENTS:
-        return None
-
-    # LEAKAGE GUARD: industry stats from historical population only.
-    hist_df = pd.DataFrame([{
-        "industry_group":   p["_industry_group"],
-        "raw_vpi":          p["_raw_vpi"],
-        "raw_avg_pen":      p["_raw_avg_pen"],
-        "raw_serious_rate": p["_raw_serious_rate"],
-        "raw_wr_rate":      p["_raw_wr_rate"],
-    } for p in hist_pop])
-    hist_industry_stats = compute_industry_stats(
-        hist_df, min_sample=MLRiskScorer.INDUSTRY_MIN_SAMPLE, naics_map=naics_map,
-    )
-    scorer._industry_stats = hist_industry_stats
-
-    hist_X = _build_feature_matrix(hist_pop, hist_industry_stats, naics_map, scorer)
-    hist_y = np.array([MLRiskScorer._heuristic_label(row) for row in hist_X])
-    baseline_scores, _ = _train_and_score_historical(hist_X, hist_y)
-
-    # Pair establishments that have both scores and future data.
-    paired_scores, paired_adverse = [], []
-    for p, outc, score in zip(hist_pop, future_outcomes, baseline_scores):
-        if outc["has_future_data"]:
-            paired_scores.append(score)
-            paired_adverse.append(outc["future_adverse_outcome_score"])
-
-    if len(paired_scores) < MIN_FUTURE_ESTABLISHMENTS:
-        return None
-
-    return {
-        "cutoff":          cutoff_date,
-        "n_hist":          len(hist_pop),
-        "n_paired":        len(paired_scores),
-        "scores":          np.array(paired_scores),
-        "adverse_scores":  np.array(paired_adverse),
-        "spearman_rho":    float(spearmanr(paired_scores, paired_adverse)[0]),
-    }
 
 
 # ====================================================================== #
@@ -1060,13 +891,13 @@ def _auroc_if_sufficient(
 # ====================================================================== #
 
 class RealWorldData:
-    """Session-scoped holder: loads bulk OSHA data, computes baseline
-    scores from pre-cutoff history, and measures future outcomes.
+    """Session-scoped holder: loads bulk OSHA data, scores via the MT model,
+    and measures future outcomes.
 
     Architecture
     ------------
     * hist_pop          : all establishments with >= 1 pre-cutoff inspection
-    * baseline_scores   : GBR score for each hist_pop member (shape n,)
+    * baseline_scores   : MT composite score for each hist_pop member (shape n,)
     * future_outcomes   : future outcome dict for each hist_pop member
     * paired_*          : subset where has_future_data is True
 
@@ -1083,13 +914,11 @@ class RealWorldData:
         self.scorer: Optional[MLRiskScorer] = None
         self.naics_map: dict = {}
         self.hist_industry_stats: dict = {}
-        self.pipeline: Optional[Pipeline] = None
 
         self.hist_pop: List[Dict] = []
         self.future_outcomes: List[Dict] = []
         self.baseline_scores: np.ndarray = np.array([])
         self.hist_X: np.ndarray = np.array([])
-        self.hist_y: np.ndarray = np.array([])
 
         # Paired subset (both historical score AND future data available)
         self.paired_pop: List[Dict] = []
@@ -1108,10 +937,6 @@ class RealWorldData:
         self.swr_75th_flags: np.ndarray = np.array([])
         # "High" / "Medium" / "Low" confidence tag per paired establishment
         self.confidence_tags: List[str] = []
-        # Temporal-label model: scores produced by augmented GBR (real labels)
-        self.temporal_rows: list = []
-        self.temporal_scores: np.ndarray = np.array([])
-        self.paired_temporal_scores: np.ndarray = np.array([])
     @classmethod
     def get(cls) -> "RealWorldData":
         if cls._instance is None:
@@ -1144,7 +969,7 @@ class RealWorldData:
         self.hist_pop, self.future_outcomes = _build_per_establishment_data(
             inspections, viols_by_activity, accident_stats, self.naics_map,
             cutoff_date=CUTOFF_DATE,
-            min_hist_inspections=1,
+            min_hist_inspections=2,
         )
         print(f"  Establishments with >= 1 historical inspection: {len(self.hist_pop):,}")
         n_with_future = sum(1 for o in self.future_outcomes if o["has_future_data"])
@@ -1175,72 +1000,31 @@ class RealWorldData:
         self.hist_X = _build_feature_matrix(
             self.hist_pop, self.hist_industry_stats, self.naics_map, self.scorer,
         )
-        self.hist_y = np.array([MLRiskScorer._heuristic_label(row) for row in self.hist_X])
 
-        # ── Train scoring model and produce baseline scores ─────────────
-        self.baseline_scores, self.pipeline = _train_and_score_historical(
-            self.hist_X, self.hist_y,
-        )
-        print(f"  Baseline score range: [{self.baseline_scores.min():.1f}, "
-              f"{self.baseline_scores.max():.1f}]  "
-              f"mean={self.baseline_scores.mean():.1f}  "
-              f"std={self.baseline_scores.std():.1f}")
-
-        # ── Temporal-label augmented model ──────────────────────────────
-        # Load (or build) real-label training rows using a 2020 training
-        # cutoff so the outcome window is 2020–2024 (fully within cache).
-        try:
-            from src.scoring.labeling.temporal_labeler import (
-                load_or_build_temporal_labels,
-                summarise_temporal_labels,
+        # ── Score all establishments via the MT model ───────────────────
+        mt_scorer = MultiTargetRiskScorer.load_if_exists(CACHE_DIR)
+        if mt_scorer is not None:
+            hist_X_log = MLRiskScorer._log_transform_features(
+                np.nan_to_num(self.hist_X, nan=0.0)
             )
-            _label_cutoff = MLRiskScorer.TEMPORAL_LABEL_CUTOFF
-            self.temporal_rows = load_or_build_temporal_labels(
-                scorer=self.scorer,
-                inspections_path=os.path.join(CACHE_DIR, "inspections_bulk.csv"),
-                violations_path=os.path.join(CACHE_DIR, "violations_bulk.csv"),
-                accidents_path=os.path.join(CACHE_DIR, "accidents_bulk.csv"),
-                injuries_path=os.path.join(CACHE_DIR, "accident_injuries_bulk.csv"),
-                naics_map=self.naics_map,
-                cache_dir=CACHE_DIR,
-                cutoff_date=_label_cutoff,
-                outcome_end_date=CUTOFF_DATE,
-            )
-            if self.temporal_rows:
-                summarise_temporal_labels(self.temporal_rows)
-                self.temporal_scores = _train_and_score_with_temporal_labels(
-                    self.hist_X, self.hist_y, self.temporal_rows,
-                )
-                print(f"  Temporal-label model score range: "
-                      f"[{self.temporal_scores.min():.1f}, "
-                      f"{self.temporal_scores.max():.1f}]  "
-                      f"mean={self.temporal_scores.mean():.1f}")
-            else:
-                print("  WARNING: No temporal training labels found — "
-                      "temporal model will mirror baseline.")
-                self.temporal_scores = self.baseline_scores.copy()
-        except Exception as exc:
-            print(f"  WARNING: Could not build temporal labels ({exc}) — "
-                  "temporal model will mirror baseline.")
-            self.temporal_scores = self.baseline_scores.copy()
+            preds = mt_scorer.predict_batch(hist_X_log)
+            self.baseline_scores = np.array([mt_scorer.composite_score(p) for p in preds])
+            print(f"  MT model score range: [{self.baseline_scores.min():.1f}, "
+                  f"{self.baseline_scores.max():.1f}]  "
+                  f"mean={self.baseline_scores.mean():.1f}  "
+                  f"std={self.baseline_scores.std():.1f}")
+        else:
+            print("  WARNING: MT model not found in cache. Using fallback scores (50).")
+            self.baseline_scores = np.full(len(self.hist_pop), 50.0)
 
         # ── Build paired subset ─────────────────────────────────────────
-        temporal_scores_aligned = (
-            self.temporal_scores
-            if len(self.temporal_scores) == len(self.hist_pop)
-            else self.baseline_scores
-        )
-        for p, outc, score, t_score in zip(
-            self.hist_pop, self.future_outcomes,
-            self.baseline_scores, temporal_scores_aligned,
+        for p, outc, score in zip(
+            self.hist_pop, self.future_outcomes, self.baseline_scores,
         ):
             if outc["has_future_data"]:
                 self.paired_pop.append(p)
                 self.paired_outcomes.append(outc)
                 self.paired_scores = np.append(self.paired_scores, score)
-                self.paired_temporal_scores = np.append(
-                    self.paired_temporal_scores, t_score
-                )
 
         print(f"  Paired establishments (score + future outcomes): "
               f"{len(self.paired_pop):,}")
@@ -1293,20 +1077,6 @@ class RealWorldData:
             self.paired_scores, self.paired_adverse_scores
         ) if len(self.paired_pop) >= MIN_FUTURE_ESTABLISHMENTS else (float("nan"), 0, 0)
         print(f"  Spearman(score, future_adverse): rho={rho_adv:.3f}")
-
-        if (
-            len(self.paired_temporal_scores) == len(self.paired_scores)
-            and len(self.paired_scores) >= MIN_FUTURE_ESTABLISHMENTS
-        ):
-            rho_temp, _, _ = _spearman_bootstrap_ci(
-                self.paired_temporal_scores, self.paired_adverse_scores
-            )
-            delta = rho_temp - rho_adv
-            direction = "improved" if delta > 0 else ("equal" if delta == 0 else "regressed")
-            print(
-                f"  Spearman(temporal, future_adverse): rho={rho_temp:.3f}  "
-                f"delta_rho={delta:+.3f} ({direction})"
-            )
         print("=" * 70 + "\n")
 
         self.loaded = True

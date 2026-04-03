@@ -1,4 +1,4 @@
-﻿"""tests/validation/test_mt_composite.py
+"""tests/validation/test_mt_composite.py
 Tests 6-13: composite score, monotonicity, separation, calibration,
 industry robustness, penalty tiers, composite dominance, summary.
 """
@@ -444,39 +444,7 @@ def test_band_monotonicity_wr_rate():
 
 
 # ====================================================================== #
-#  Test 12: Composite ≥ pseudo-label Spearman
-# ====================================================================== #
-
-def test_composite_beats_pseudo_label_spearman():
-    """Composite score's Spearman rho must equal or beat the pseudo-label rank correlation."""
-    mt = _get_mt_scorer()
-    if mt is None:
-        pytest.skip("Multi-target model not loaded")
-    X, rows, y_adv = _get_val_data()
-    if len(rows) < MIN_PAIRED:
-        pytest.skip("Insufficient data")
-
-    preds      = mt.predict_batch(X)
-    composites = np.array([mt.composite_score(p) for p in preds])
-    y          = np.array(y_adv)
-    pseudo     = np.array([r["pseudo_label"] for r in rows])
-
-    rho_comp, _ = spearmanr(composites, y)
-    rho_pseudo, _ = spearmanr(pseudo, y)
-
-    print(
-        f"\n  Composite Spearman rho={rho_comp:.4f}  "
-        f"vs Pseudo-label Spearman rho={rho_pseudo:.4f}"
-    )
-    # Allow small tolerance — composite must not be meaningfully worse
-    assert rho_comp >= rho_pseudo - 0.05, (
-        f"Composite Spearman ({rho_comp:.4f}) more than 0.05 below "
-        f"pseudo-label Spearman ({rho_pseudo:.4f}); multi-target model regressing"
-    )
-
-
-# ====================================================================== #
-#  Test 13: Summary report (diagnostic, always passes)
+#  Test 12: Summary report (diagnostic, always passes)
 # ====================================================================== #
 
 def test_summary_report():
@@ -510,10 +478,11 @@ def test_summary_report():
     p_inj      = np.array([p["p_injury_event"]      for p in preds])
     p_pen      = np.array([p["expected_penalty_usd"] for p in preds])
     p_grav     = np.array([p["gravity_score"]       for p in preds])
-    pseudo     = np.array([r["pseudo_label"]        for r in rows])
+    p_pen_p75  = np.array([p.get("p_penalty_ge_p75", 0.0) for p in preds])
+    p_pen_p90  = np.array([p.get("p_penalty_ge_p90", 0.0) for p in preds])
+    p_pen_p95  = np.array([p.get("p_penalty_ge_p95", 0.0) for p in preds])
 
     rho_comp,   _ = spearmanr(composites, y)
-    rho_pseudo, _ = spearmanr(pseudo,     y)
     lift           = _compute_decile_lift(composites, y, decile=10)
     k              = max(1, int(n * 0.10))
     top_k_idx      = np.argsort(composites)[::-1][:k]
@@ -534,8 +503,7 @@ def test_summary_report():
     print(f"  === Ranking Power ===")
     print(f"  Composite Spearman rho:           {rho_comp:.4f}  "
           f"({'STRONG' if rho_comp >= SPEARMAN_STRONG else 'MINIMUM' if rho_comp >= SPEARMAN_MINIMUM else 'WEAK'})")
-    print(f"  Pseudo-label Spearman rho:        {rho_pseudo:.4f}  (baseline)")
-    print(f"  Improvement:                    {rho_comp - rho_pseudo:+.4f}")
+
     print(f"  Top-decile lift:                {lift:.3f}×  "
           f"({'STRONG' if lift >= LIFT_STRONG else 'MINIMUM' if lift >= LIFT_MINIMUM else 'WEAK'}×)")
     print(f"  Top-10% injury/fatal capture:   {capture_inj:.1%}")
@@ -547,6 +515,11 @@ def test_summary_report():
     print(f"  === Regression Heads ===")
     print(f"  Log-penalty Spearman:           {rho_pen:.4f}")
     print(f"  Gravity Spearman:               {rho_grav:.4f}")
+    print()
+    print(f"  === Penalty Tier Heads ===")
+    print(f"  P(pen>=P75) mean:  {p_pen_p75.mean():.4f}  range [{p_pen_p75.min():.4f}, {p_pen_p75.max():.4f}]")
+    print(f"  P(pen>=P90) mean:  {p_pen_p90.mean():.4f}  range [{p_pen_p90.min():.4f}, {p_pen_p90.max():.4f}]")
+    print(f"  P(pen>=P95) mean:  {p_pen_p95.mean():.4f}  range [{p_pen_p95.min():.4f}, {p_pen_p95.max():.4f}]")
     print()
     bin_means = _compute_bin_means(composites, y, n_bins=5)
     print(f"  === Monotonicity (5-bin composite vs adversity) ===")

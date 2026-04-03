@@ -9,12 +9,10 @@ Tests cover:
 5. New API fields present in score() output
 """
 
-import math
 import numpy as np
 from datetime import date, timedelta
-from collections import Counter
 
-from src.models.osha_record import OSHARecord, Violation, AccidentSummary
+from src.models.osha_record import OSHARecord, Violation
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────

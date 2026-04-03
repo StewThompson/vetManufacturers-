@@ -28,7 +28,6 @@ Usage (from code)
 
 import os
 import sys
-import math
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _TESTS_DIR    = os.path.dirname(__file__)

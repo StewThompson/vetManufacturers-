@@ -2,8 +2,6 @@ import type { AssessmentResponse, AssessParams, SearchResponse, SSEEvent } from 
 
 const BASE = '/api'
 
-// ── REST helpers ─────────────────────────────────────────────────────────────
-
 async function apiFetch<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`)
   if (!res.ok) {
@@ -21,8 +19,6 @@ export const searchCompanies = (q: string): Promise<SearchResponse> =>
 
 export const getLocations = (company: string): Promise<string[]> =>
   apiFetch(`/locations?company=${encodeURIComponent(company)}`)
-
-// ── SSE assess ───────────────────────────────────────────────────────────────
 
 /**
  * Opens a server-sent-event stream for an assessment.

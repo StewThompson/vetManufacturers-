@@ -2,13 +2,10 @@ import { useCallback, useRef, useState } from 'react'
 import { openAssessStream, recalculateDroppingHighRisk } from './api/client'
 import type { AssessmentResponse, SSEEvent } from './types/assessment'
 import SearchCard from './components/SearchCard'
-import ProgressStream, {
-  ExplanationPanel,
-  OutlookPanel,
-  RiskBanner,
-  RiskTargetsPanel,
-  StatsGrid,
-} from './components/AssessmentResult'
+import ProgressStream from './components/ProgressStream'
+import { RiskBanner } from './components/RiskBanner'
+import { ExplanationPanel } from './components/ExplanationPanel'
+import { OutlookPanel, RiskTargetsPanel, StatsGrid } from './components/AssessmentResult'
 import ViolationsGrid from './components/ViolationsGrid'
 import SiteBreakdown from './components/SiteBreakdown'
 import ChatBox from './components/ChatBox'
@@ -91,7 +88,6 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      {/* Top bar */}
       <header className="topbar">
         <div className="topbar-logo">
           Manufacturer <span>Compliance</span> Intelligence
@@ -130,7 +126,6 @@ export default function App() {
       )}
 
       {page === 'assessment' && <div className="main">
-        {/* Left sidebar — search */}
         <aside className="sidebar">
           <SearchCard
             onSelectionChange={handleSelectionChange}
@@ -139,9 +134,7 @@ export default function App() {
           />
         </aside>
 
-        {/* Right content — results */}
         <main className="content">
-          {/* Progress stream */}
           <ProgressStream
             messages={progress}
             isRunning={isRunning}

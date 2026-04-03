@@ -16,6 +16,8 @@ entity-resolution backend (e.g. fuzzy matching against an EIN database) later.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -23,6 +25,10 @@ from typing import Dict, List, Optional, Tuple
 
 from rapidfuzz import fuzz, process, utils as rfutils
 from src.data_retrieval.normalization.company_names import company_match_key as _cmk
+
+
+SEARCH_SCORE_CUTOFF = 55
+SEARCH_LIMIT = 500
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -101,9 +107,6 @@ class SearchResultSet:
 #  to store company_key in the DB — so rapidfuzz matches map directly to DB
 #  rows with zero mismatch between search results and scored facilities.
 # ──────────────────────────────────────────────────────────────────────────────
-
-import json
-import os
 
 _COMPANY_KEY_INDEX_PATH = os.path.join("ml_cache", "company_key_index.json")
 
@@ -354,8 +357,8 @@ def group_establishments(
         query_key, company_keys,
         scorer=fuzz.WRatio,
         processor=rfutils.default_process,
-        score_cutoff=55,
-        limit=500,
+        score_cutoff=SEARCH_SCORE_CUTOFF,
+        limit=SEARCH_LIMIT,
     )
 
     groups: List[GroupedCompanyResult] = []

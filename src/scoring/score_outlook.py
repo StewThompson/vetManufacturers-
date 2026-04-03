@@ -183,6 +183,67 @@ def compute_12m_outlook(
     }
 
 
+def _fmt_viols(v: float) -> str:
+    if v < 0.5:
+        return "fewer than 1 violation"
+    return f"approximately {v:.1f} violation{'s' if v != 1.0 else ''}"
+
+
+def _fmt_pen(p: float) -> str:
+    if p < 500:
+        return "minimal penalties"
+    if p < 1_000:
+        return f"~${p:,.0f} in penalties"
+    return f"~${p:,.0f} in OSHA penalties"
+
+
+def _build_opening(
+    risk_band: str,
+    risk_score: float,
+    site_str: str,
+    insp_desc: str,
+    viols_sent: str,
+    pen_sent: str,
+) -> str:
+    if risk_band == "low":
+        return (
+            f"This supplier presents a low compliance risk (score {risk_score:.0f}). "
+            f"Based on recent inspection trends across {site_str}, we project "
+            f"{insp_desc} in the next 12 months, resulting in {viols_sent} "
+            f"and {pen_sent}."
+        )
+    if risk_band == "moderate":
+        return (
+            f"This supplier carries a moderate compliance risk (score {risk_score:.0f}). "
+            f"Projecting from recent inspection patterns across {site_str}, expect "
+            f"{insp_desc}, {viols_sent}, and {pen_sent} over the next 12 months."
+        )
+    return (
+        f"This supplier is flagged as high-risk (score {risk_score:.0f}). "
+        f"Based on observed enforcement patterns across {site_str}, the next "
+        f"12 months may see {insp_desc}, {viols_sent}, "
+        f"and {pen_sent}."
+    )
+
+
+def _build_severity_sentence(
+    expected_serious: float,
+    expected_willful_repeat: float,
+) -> str:
+    parts = []
+    if expected_serious >= 0.3:
+        parts.append(f"~{expected_serious:.1f} Serious")
+    if expected_willful_repeat >= 0.2:
+        parts.append(f"~{expected_willful_repeat:.1f} Willful/Repeat")
+    if not parts:
+        return ""
+    plural = sum(1 for _ in parts) > 1 or expected_serious + expected_willful_repeat != 1.0
+    return (
+        f" Of the projected violations, {' and '.join(parts)} "
+        f"citation{'s are' if plural else ' is'} estimated."
+    )
+
+
 def _build_narrative(
     risk_score: float,
     risk_band: str,
@@ -206,68 +267,20 @@ def _build_narrative(
             f"could result in violations if underlying safety practices are not established."
         )
 
-    # Rounding helpers for human readability
-    def _fmt_viols(v: float) -> str:
-        if v < 0.5:
-            return "fewer than 1 violation"
-        return f"approximately {v:.1f} violation{'s' if v != 1.0 else ''}"
-
-    def _fmt_pen(p: float) -> str:
-        if p < 500:
-            return "minimal penalties"
-        if p < 1_000:
-            return f"~${p:,.0f} in penalties"
-        return f"~${p:,.0f} in OSHA penalties"
-
     insp_desc = (
         f"roughly {expected_inspections:.1f} inspection visit{'s' if expected_inspections != 1.0 else ''}"
         if expected_inspections >= 0.5
         else "a low likelihood of an inspection visit"
     )
 
-    viols_sent = _fmt_viols(expected_violations)
-    pen_sent   = _fmt_pen(expected_penalties)
-
-    if risk_band == "low":
-        opening = (
-            f"This supplier presents a low compliance risk (score {risk_score:.0f}). "
-            f"Based on recent inspection trends across {site_str}, we project "
-            f"{insp_desc} in the next 12 months, resulting in {viols_sent} "
-            f"and {pen_sent}."
-        )
-    elif risk_band == "moderate":
-        opening = (
-            f"This supplier carries a moderate compliance risk (score {risk_score:.0f}). "
-            f"Projecting from recent inspection patterns across {site_str}, expect "
-            f"{insp_desc}, {viols_sent}, and {pen_sent} over the next 12 months."
-        )
-    else:
-        opening = (
-            f"This supplier is flagged as high-risk (score {risk_score:.0f}). "
-            f"Based on observed enforcement patterns across {site_str}, the next "
-            f"12 months may see {insp_desc}, {viols_sent}, "
-            f"and {pen_sent}."
-        )
-
-    # Severity sentence
-    severity_parts = []
-    if expected_serious >= 0.3:
-        severity_parts.append(f"~{expected_serious:.1f} Serious")
-    if expected_willful_repeat >= 0.2:
-        severity_parts.append(f"~{expected_willful_repeat:.1f} Willful/Repeat")
-
-    if severity_parts:
-        severity_sent = (
-            f" Of the projected violations, {' and '.join(severity_parts)} "
-            f"citation{'s are' if sum(1 for _ in severity_parts) > 1 or expected_serious + expected_willful_repeat != 1.0 else ' is'} estimated."
-        )
-    else:
-        severity_sent = ""
-
+    opening = _build_opening(
+        risk_band, risk_score, site_str, insp_desc,
+        _fmt_viols(expected_violations), _fmt_pen(expected_penalties),
+    )
+    severity_sent = _build_severity_sentence(expected_serious, expected_willful_repeat)
     caveat = (
         " These are statistical projections based on historical rates; "
         "actual outcomes depend on OSHA targeting priorities, operational changes, "
         "and corrective actions taken."
     )
-
     return opening + severity_sent + caveat

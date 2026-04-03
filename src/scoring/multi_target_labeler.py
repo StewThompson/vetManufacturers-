@@ -28,6 +28,7 @@ Design notes
 from __future__ import annotations
 
 import csv
+import logging
 import math
 import os
 import pickle
@@ -41,18 +42,20 @@ import pandas as pd
 if TYPE_CHECKING:
     from src.scoring.ml_risk_scorer import MLRiskScorer
 
-from src.scoring.labeling.temporal_labeler import (
-    _parse_date,
-    _stream_inspections,
-    _build_violation_index,
+from src.scoring.labeling.helpers import (
+    ADV_MAX,
     _aggregate_hist_features,
+    _build_violation_index,
     _compute_adverse,
     _normalize_adverse,
+    _parse_date,
     _stratified_sample,
-    ADV_MAX,
+    _stream_inspections,
 )
 from src.scoring.labeling.inspection_propensity import InspectionPropensityModel
 from src.scoring.penalty_percentiles import lookup_threshold
+
+logger = logging.getLogger(__name__)
 
 
 CACHE_FILENAME = "multi_target_labels.pkl"
@@ -300,7 +303,7 @@ def build_multi_target_sample(
     one_year_ago = cutoff_date - timedelta(days=1095)
 
     # ── PASS 1: split inspections into hist / future per establishment ─────
-    print(f"  [MultiTargetLabeler] Scanning inspections (cutoff={cutoff_date}) …")
+    logger.info("  [MultiTargetLabeler] Scanning inspections (cutoff=%s) …", cutoff_date)
     estab_hist:   Dict[str, list] = defaultdict(list)
     estab_future: Dict[str, list] = defaultdict(list)
 
@@ -327,7 +330,7 @@ def build_multi_target_sample(
         n for n in estab_hist
         if len(estab_hist[n]) >= min_hist_insp and len(estab_future.get(n, [])) >= 1
     ]
-    print(f"  [MultiTargetLabeler] {len(paired_names):,} paired establishments found.")
+    logger.info("  [MultiTargetLabeler] %s paired establishments found.", f"{len(paired_names):,}")
 
     if not paired_names:
         return []
@@ -341,9 +344,9 @@ def build_multi_target_sample(
         n for n in estab_hist
         if len(estab_hist[n]) >= min_hist_insp and len(estab_future.get(n, [])) == 0
     ]
-    print(
-        f"  [MultiTargetLabeler] {len(unpaired_names):,} unpaired establishments "
-        f"(used for IPW propensity estimation only)."
+    logger.info(
+        "  [MultiTargetLabeler] %s unpaired establishments (used for IPW only).",
+        f"{len(unpaired_names):,}",
     )
     ipw_model = InspectionPropensityModel(naics_sectors=scorer.NAICS_SECTORS)
     ipw_model.fit(
@@ -364,19 +367,19 @@ def build_multi_target_sample(
         r["activity_nr"] for n in paired_names for r in estab_future.get(n, [])
     }
 
-    print(
-        f"  [MultiTargetLabeler] Building violation indices "
-        f"({len(all_hist_acts):,} hist + {len(all_future_acts):,} future acts) …"
+    logger.info(
+        "  [MultiTargetLabeler] Building violation indices (%s hist + %s future acts)…",
+        f"{len(all_hist_acts):,}", f"{len(all_future_acts):,}",
     )
     hist_viol_index   = _build_violation_index(violations_path, all_hist_acts)
     future_viol_index = _build_violation_index(violations_path, all_future_acts)
 
-    print("  [MultiTargetLabeler] Building injury/fatality stats …")
+    logger.info("  [MultiTargetLabeler] Building injury/fatality stats …")
     hist_fatals   = _build_hosp_fatal_stats(accidents_path, injuries_path, all_hist_acts)
     future_hosp_fatal = _build_hosp_fatal_stats(accidents_path, injuries_path, all_future_acts)
 
     # ── PASS 3: aggregate features and targets ─────────────────────────────
-    print(f"  [MultiTargetLabeler] Computing features + targets for {len(paired_names):,} establishments …")
+    logger.info("  [MultiTargetLabeler] Computing features + targets for %s establishments …", f"{len(paired_names):,}")
     rows_raw: list = []
     scratch_industry: list = []
 
@@ -493,10 +496,12 @@ def build_multi_target_sample(
     pos   = sum(1 for r in sampled if r["any_wr_serious"])
     neg   = len(sampled) - pos
     inj   = sum(1 for r in sampled if r["any_injury_fatal"])
-    print(
-        f"  [MultiTargetLabeler] Sample: {len(sampled):,} rows, "
-        f"WR/Serious: {pos:,} pos / {neg:,} neg ({pos/max(1,len(sampled)):.1%} rate), "
-        f"Injury/Fatal: {inj:,} ({inj/max(1,len(sampled)):.1%} rate)"
+    logger.info(
+        "  [MultiTargetLabeler] Sample: %s rows, WR/Serious: %s pos / %s neg (%.1f%%), "
+        "Injury/Fatal: %s (%.1f%%)",
+        f"{len(sampled):,}", f"{pos:,}", f"{neg:,}",
+        pos / max(1, len(sampled)) * 100,
+        f"{inj:,}", inj / max(1, len(sampled)) * 100,
     )
     return sampled
 
@@ -528,12 +533,10 @@ def load_or_build(
                 blob = pickle.load(f)
             if blob.get("fingerprint") == fp_new:
                 rows = blob["rows"]
-                print(
-                    f"  [MultiTargetLabeler] Loaded {len(rows):,} rows from cache."
-                )
+                logger.info("  [MultiTargetLabeler] Loaded %s rows from cache.", f"{len(rows):,}")
                 return rows
         except Exception as e:
-            print(f"  [MultiTargetLabeler] Cache load failed ({e}); rebuilding.")
+            logger.warning("  [MultiTargetLabeler] Cache load failed (%s); rebuilding.", e)
 
     rows = build_multi_target_sample(
         scorer=scorer,
@@ -553,6 +556,6 @@ def load_or_build(
         with open(cache_path, "wb") as f:
             pickle.dump({"fingerprint": fp_new, "rows": rows}, f)
     except Exception as e:
-        print(f"  [MultiTargetLabeler] Could not write cache ({e}).")
+        logger.warning("  [MultiTargetLabeler] Could not write cache: %s", e)
 
     return rows

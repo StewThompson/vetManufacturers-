@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import re
 from typing import Callable
 from dotenv import load_dotenv
@@ -13,6 +14,8 @@ from src.scoring.risk_assessor import RiskAssessor
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 class VettingAgent:
     _NON_ALNUM_RE = re.compile(r"[^A-Z0-9]+")
 
@@ -24,7 +27,7 @@ class VettingAgent:
         if api_key:
             self.client = genai.Client(api_key=api_key)
         else:
-            print("Warning: GOOGLE_API_KEY not found in environment variables. LLM features will be disabled.")
+            logger.warning("GOOGLE_API_KEY not found. LLM features will be disabled.")
             self.client = None
 
     def get_all_company_names(self) -> list[str]:
@@ -87,8 +90,10 @@ class VettingAgent:
                         seen_activity_nrs.add(act_nr)
                         all_inspections.append(insp)
 
-        print(f"  vet_by_raw_estab_names: {len(raw_names)} selected name(s) → "
-              f"{len(seen_activity_nrs)} unique inspections")
+        logger.info(
+            "  vet_by_raw_estab_names: %s selected name(s) → %s unique inspections",
+            len(raw_names), len(seen_activity_nrs),
+        )
         if progress_cb:
             progress_cb("🏗 Building inspection records…")
         records = self.osha_client._build_records(all_inspections, years_back=years_back) if all_inspections else []
@@ -113,7 +118,7 @@ class VettingAgent:
         3. Assess risk
         4. Return assessment
         """
-        print(f"Agent starting vetting process for: {name}")
+        logger.info("Agent starting vetting process for: %s", name)
 
         # 1. Resolve identity (stub)
         manufacturer = Manufacturer(name=name, location=location)
@@ -189,7 +194,7 @@ class VettingAgent:
                 assessment.explanation = response.text
 
         except Exception as e:
-            print(f"Error generating LLM summary: {e}")
+            logger.warning("Error generating LLM summary: %s", e)
 
     @classmethod
     def _normalize_code_text(cls, value: str) -> str:
@@ -549,7 +554,7 @@ class VettingAgent:
         if not self.client:
             return "LLM features are not available. Please set GOOGLE_API_KEY."
 
-        print(f"User asked: '{question}' about {assessment.manufacturer.name}")
+        logger.debug("User asked: '%s' about %s", question, assessment.manufacturer.name)
 
         try:
             code_evidence_context = self.get_code_evidence_report(assessment, question)
@@ -687,7 +692,7 @@ would improve the answer. Be professional and concise.
                 contents.append(candidate.content)
                 fn_response_parts = []
                 for fc in fn_calls:
-                    print(f"  [Gemini tool] {fc.name}({dict(fc.args)})")
+                    logger.debug("  [Gemini tool] %s(%s)", fc.name, dict(fc.args))
                     result_text = self._dispatch_tool_call(fc.name, dict(fc.args), assessment)
                     fn_response_parts.append(
                         genai_types.Part.from_function_response(

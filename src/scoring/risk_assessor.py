@@ -1,5 +1,6 @@
 from typing import List, Optional
 import math
+import logging
 from datetime import date, timedelta
 
 from src.models.manufacturer import Manufacturer
@@ -7,6 +8,8 @@ from src.models.osha_record import OSHARecord
 from src.models.assessment import RiskAssessment, ProbabilisticRiskTargets
 from src.scoring.ml_risk_scorer import MLRiskScorer
 from src.scoring.score_outlook import compute_12m_outlook
+
+logger = logging.getLogger(__name__)
 
 # Bühlmann credibility prior: sites with fewer than K inspections regress
 # toward the portfolio mean; K=5 matches NCCI workers'-comp experience-rating.
@@ -32,7 +35,7 @@ class RiskAssessor:
         Assess risk using the ML-weighted scoring model, then build a
         human-readable explanation.
         """
-        print(f"Assessing risk for: {manufacturer.name} based on {len(records)} records.")
+        logger.info("Assessing risk for: %s based on %s records.", manufacturer.name, len(records))
 
         # --- ML scoring (legacy GBR — provides features, percentiles, site scores) ---
         ml_result = self.ml_scorer.score(records)
@@ -191,7 +194,7 @@ class RiskAssessor:
                 risk_score = round(composite, 1)
 
             except Exception as _mt_err:
-                print(f"  [RiskAssessor] Multi-target prediction failed: {_mt_err}")
+                logger.warning("  [RiskAssessor] Multi-target prediction failed: %s", _mt_err)
 
         # --- Recommendation ---
         # Derived from the final risk_score (composite when MT model is available,

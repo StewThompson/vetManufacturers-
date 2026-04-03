@@ -36,11 +36,11 @@ probabilities in [0, 1].  The raw score is then:
 Calibration
 -----------
 All binary heads use isotonic regression calibration fitted on a held-out
-validation fold (no leakage).  Calibration quality is logged during training
-via Brier score, BSS, and ECE.
+validation fold (no leakage).
 """
 from __future__ import annotations
 
+import logging
 import math
 import os
 import pickle
@@ -55,6 +55,8 @@ from sklearn.ensemble import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+logger = logging.getLogger(__name__)
+
 
 MODEL_FILE = "multi_target_model.pkl"
 
@@ -62,12 +64,6 @@ MODEL_FILE = "multi_target_model.pkl"
 _DEFAULT_W1 = 0.60   # p_serious_wr_event
 _DEFAULT_W2 = 0.30   # p_injury_event
 _DEFAULT_W3 = 0.10   # p_extreme_penalty (P95 tier)
-
-# Legacy 4-component weights (kept for backward compat with old pickles)
-_LEGACY_W1 = 0.35
-_LEGACY_W2 = 0.30
-_LEGACY_W3 = 0.20
-_LEGACY_W4 = 0.15
 
 # Reference values for normalizing regression outputs (legacy heads only)
 _PENALTY_REF_USD = 200_000.0
@@ -209,8 +205,7 @@ class MultiTargetRiskScorer:
         # ── Composite weight vector [w1, w2, w3] (3 probability components) ──
         self._weights: List[float] = [_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3]
 
-        # Post-training temperature slots are kept for backward-compatibility
-        # with old pickled models; Platt calibration replaces them.
+        # Temperature slots kept for backward-compatibility with old pickled models.
         self._temp_wr: float = 1.0
         self._temp_inj: float = 1.0
 
@@ -228,9 +223,8 @@ class MultiTargetRiskScorer:
         self._platt_inj: np.ndarray = _identity.copy()
         self._platt_pen: np.ndarray = _identity.copy()
 
-        # Isotonic calibration for regression heads
-        self._iso_pen: Optional[object] = None      # kept for compat; unused by hurdle path
-        self._iso_log_pen: Optional[object] = None  # calibrates conditional log-penalty GBR
+        self._iso_pen: Optional[object] = None
+        self._iso_log_pen: Optional[object] = None
         self._iso_grav: Optional[object] = None
 
         # ── Score transformation ───────────────────────────────────────
@@ -282,11 +276,9 @@ class MultiTargetRiskScorer:
         # Normalize to mean=1 so fitted regularisation scale stays constant.
         weights_raw = np.array([r.get("ipw_weight", 1.0) for r in rows], dtype=float)
         weights_norm = weights_raw / weights_raw.mean()
-        print(
-            f"  [MultiTargetScorer] IPW weight stats — "
-            f"min={weights_norm.min():.2f}  mean=1.00  "
-            f"P95={float(np.percentile(weights_norm, 95)):.2f}  "
-            f"max={weights_norm.max():.2f}"
+        logger.info(
+            "  [MultiTargetScorer] IPW weight stats — min=%.2f  mean=1.00  P95=%.2f  max=%.2f",
+            weights_norm.min(), float(np.percentile(weights_norm, 95)), weights_norm.max(),
         )
 
         rng = np.random.default_rng(rng_seed)
@@ -327,7 +319,7 @@ class MultiTargetRiskScorer:
                 pipe.fit(X_fit, y_fit)
             return pipe
 
-        print("  [MultiTargetScorer] Training Head 1: WR/Serious event (binary) …")
+        logger.info("  [MultiTargetScorer] Training Head 1: WR/Serious event (binary) …")
         self._head_wr = _train_hgbc_raw(
             X_tr, y_wr[train_idx], hgbc_params=_HGBC_PARAMS, sample_weight=sw_tr
         )
@@ -335,7 +327,7 @@ class MultiTargetRiskScorer:
         # ── Hurdle model for Head 2 ────────────────────────────────────────
         # 2a: binary classifier — does any future penalty exist?
         y_any_pen = (y_logp > 0).astype(int)
-        print("  [MultiTargetScorer] Training Head 2a: any-penalty binary (hurdle) …")
+        logger.info("  [MultiTargetScorer] Training Head 2a: any-penalty binary (hurdle) …")
         self._head_pen_nonzero = _train_hgbc_raw(
             X_tr, y_any_pen[train_idx],
             hgbc_params=_HGBC_PARAMS,
@@ -346,9 +338,9 @@ class MultiTargetRiskScorer:
         # Eliminates the zero-inflation anchor that causes scale compression.
         pos_mask_tr = y_logp[train_idx] > 0
         n_pos_pen = int(pos_mask_tr.sum())
-        print(
-            f"  [MultiTargetScorer] Training Head 2b: conditional log-penalty GBR "
-            f"({n_pos_pen:,} positive-penalty rows) …"
+        logger.info(
+            "  [MultiTargetScorer] Training Head 2b: conditional log-penalty GBR (%s positive-penalty rows) …",
+            f"{n_pos_pen:,}",
         )
         if n_pos_pen >= 20:
             self._head_log_pen = _train_gbr_pipe(
@@ -357,12 +349,10 @@ class MultiTargetRiskScorer:
                 sample_weight=sw_tr[pos_mask_tr],
             )
         else:
-            # Fallback: train on all rows (too few positives for conditional GBR)
-            print("  [MultiTargetScorer] WARNING: fewer than 20 positive-penalty rows; "
-                  "falling back to unconditional GBR.")
+            logger.warning("  [MultiTargetScorer] Fewer than 20 positive-penalty rows; falling back to unconditional GBR.")
             self._head_log_pen = _train_gbr_pipe(X_tr, y_logp[train_idx], sample_weight=sw_tr)
 
-        print("  [MultiTargetScorer] Training Head 3: hospitalization/fatality (binary) …")
+        logger.info("  [MultiTargetScorer] Training Head 3: hospitalization/fatality (binary) …")
         self._head_injury = _train_hgbc_raw(
             X_tr, y_inj[train_idx], hgbc_params=_HGBC_INJURY_PARAMS, sample_weight=sw_tr
         )
@@ -378,8 +368,10 @@ class MultiTargetRiskScorer:
             ("P95 (extreme)",  y_pen_p95, "_head_pen_p95"),
         ]:
             pos_rate = y_tier[train_idx].mean()
-            print(f"  [MultiTargetScorer] Training penalty tier {tier_name} "
-                  f"(pos rate={pos_rate:.1%}) …")
+            logger.info(
+                "  [MultiTargetScorer] Training penalty tier %s (pos rate=%.1f%%) …",
+                tier_name, pos_rate * 100,
+            )
             head = _train_hgbc_raw(
                 X_tr, y_tier[train_idx],
                 hgbc_params=_HGBC_PARAMS,
@@ -387,7 +379,7 @@ class MultiTargetRiskScorer:
             )
             setattr(self, attr_name, head)
 
-        print("  [MultiTargetScorer] Training Head 4: gravity-weighted severity (regression) …")
+        logger.info("  [MultiTargetScorer] Training Head 4: gravity-weighted severity (regression) …")
         self._head_gravity = _train_gbr_pipe(X_tr, y_grav[train_idx], sample_weight=sw_tr)
 
         self._is_fitted = True
@@ -401,7 +393,7 @@ class MultiTargetRiskScorer:
             from scipy.stats import spearmanr, pearsonr
             from src.scoring.calibration import brier_score, brier_skill_score, expected_calibration_error
 
-            print("  [MultiTargetScorer] Post-hoc isotonic calibration on training holdout ...")
+            logger.info("  [MultiTargetScorer] Post-hoc isotonic calibration on training holdout …")
 
             # ── Calibrate primary binary heads with isotonic regression ──
             p_wr_val  = _clf_proba_batch(self._head_wr,     X_val)
@@ -425,8 +417,10 @@ class MultiTargetRiskScorer:
                 bs  = brier_score(y_val_h, p_cal_h)
                 bss = brier_skill_score(y_val_h, p_cal_h)
                 ece = expected_calibration_error(y_val_h, p_cal_h)
-                print(f"  [MultiTargetScorer] {head_name} calibration: "
-                      f"Brier={bs:.4f}  BSS={bss:+.3f}  ECE={ece:.4f}")
+                logger.info(
+                    "  [MultiTargetScorer] %s calibration: Brier=%.4f  BSS=%+.3f  ECE=%.4f",
+                    head_name, bs, bss, ece,
+                )
 
             # ── Calibrate penalty tier heads ─────────────────────────────
             for tier_name, y_tier, head_attr, iso_attr in [
@@ -443,8 +437,10 @@ class MultiTargetRiskScorer:
                 bs  = brier_score(y_tier[val_idx], p_cal_t)
                 bss = brier_skill_score(y_tier[val_idx], p_cal_t)
                 ece = expected_calibration_error(y_tier[val_idx], p_cal_t)
-                print(f"  [MultiTargetScorer] Penalty {tier_name} calibration: "
-                      f"Brier={bs:.4f}  BSS={bss:+.3f}  ECE={ece:.4f}")
+                logger.info(
+                    "  [MultiTargetScorer] Penalty %s calibration: Brier=%.4f  BSS=%+.3f  ECE=%.4f",
+                    tier_name, bs, bss, ece,
+                )
 
             # ── Legacy Platt calibration (kept for backward compat) ──────
             p_pen_val = _clf_proba_batch(self._head_pen_nonzero, X_val)
@@ -459,9 +455,9 @@ class MultiTargetRiskScorer:
             actual_pen_usd = np.expm1(y_logp[val_idx])
             rho_p, _ = spearmanr(hurdle_pen_usd, actual_pen_usd)
             r_p, _   = pearsonr(np.log1p(hurdle_pen_usd), y_logp[val_idx])
-            print(
-                f"  [MultiTargetScorer] Hurdle Pen (val): "
-                f"rho={rho_p:+.3f}  r(log-space)={r_p:+.3f}"
+            logger.info(
+                "  [MultiTargetScorer] Hurdle Pen (val): rho=%+.3f  r(log-space)=%+.3f",
+                rho_p, r_p,
             )
 
             # Isotonic calibration for conditional log-penalty GBR (Head 2b).
@@ -484,15 +480,14 @@ class MultiTargetRiskScorer:
             y_adv_val = np.array([rows[i]["real_label"] for i in val_idx])
             pred_val  = self.predict_batch(X_val)
             self._weights = _optimize_weights(pred_val, y_adv_val)
-            print(
-                f"  [MultiTargetScorer] Optimized weights: "
-                f"w1={self._weights[0]:.3f} w2={self._weights[1]:.3f} "
-                f"w3={self._weights[2]:.3f}"
+            logger.info(
+                "  [MultiTargetScorer] Optimized weights: w1=%.3f w2=%.3f w3=%.3f",
+                self._weights[0], self._weights[1], self._weights[2],
             )
         else:
-            print(
-                f"  [MultiTargetScorer] Using default weights: "
-                f"w1={_DEFAULT_W1} w2={_DEFAULT_W2} w3={_DEFAULT_W3}"
+            logger.info(
+                "  [MultiTargetScorer] Using default weights: w1=%s w2=%s w3=%s",
+                _DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3,
             )
 
         # ── Build score CDF for percentile stretching ────────────────────
@@ -502,8 +497,10 @@ class MultiTargetRiskScorer:
             pred_cdf  = self.predict_batch(X_val)
             raw_vals  = np.array([self._raw_composite(p) for p in pred_cdf])
             self._score_cdf = np.sort(raw_vals)
-            print(f"  [MultiTargetScorer] Score CDF built from {len(raw_vals)} val samples "
-                  f"(range [{raw_vals.min():.3f}, {raw_vals.max():.3f}])")
+            logger.info(
+                "  [MultiTargetScorer] Score CDF built from %s val samples (range [%.3f, %.3f])",
+                len(raw_vals), raw_vals.min(), raw_vals.max(),
+            )
         else:
             pred_cdf  = self.predict_batch(X)
             raw_vals  = np.array([self._raw_composite(p) for p in pred_cdf])
@@ -755,7 +752,7 @@ class MultiTargetRiskScorer:
         try:
             return cls.load(path)
         except Exception as e:
-            print(f"  [MultiTargetScorer] Could not load from {path}: {e}")
+            logger.warning("  [MultiTargetScorer] Could not load from %s: %s", path, e)
             return None
 
     @property

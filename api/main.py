@@ -44,9 +44,6 @@ from api.schemas import (
     ProbabilisticRiskTargetsOut,
     SearchResponse,
     SiteScoreOut,
-    SSEError,
-    SSEProgress,
-    SSEResult,
 )
 
 # ── App + CORS ────────────────────────────────────────────────────────────────
@@ -136,8 +133,6 @@ def _assessment_response(assessment) -> AssessmentResponse:
             state=s.get("state"),
         )
         for s in assessment.site_scores
-        # site_scores may contain a private _log_feats array used internally;
-        # SiteScoreOut only picks named fields so it never reaches the wire.
     ]
 
     return AssessmentResponse(

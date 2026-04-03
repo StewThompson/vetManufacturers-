@@ -3,34 +3,13 @@ inspection-selection bias correction.
 
 OSHA establishments are not inspected at random: industry (NAICS), size, and
 prior inspection history all strongly predict whether an establishment receives
-a follow-up inspection.  Because ``build_multi_target_sample`` retains only
-*paired* establishments (≥ ``min_hist_insp`` historical AND ≥ 1 future
-inspection), the training set over-represents high-activity, large employers —
-particularly in NAICS 33 (manufacturing) which is inspected ~8× more often
-than NAICS 54 (professional services).
-
-This module fits a logistic propensity model
-
-    P(future_inspection = 1 | log_hist_count, NAICS)
-
-over the combined paired (y=1) + unpaired (y=0) population and returns
-clip(1 / P, 1, max_weight) IPW weights for each paired row, so that the
-GBM heads learn from a sample that better approximates the full employer
-population rather than the inspection-conditional subset.
-
-Features (industry-stratified)
--------------------------------
-  * log1p(hist_insp_count)         — prior inspection volume proxy
-  * NAICS 2-digit one-hot (N + 1)  — industry × inspection rate confound;
-                                     the +1 dim captures unknown / unmapped codes
-
-The model is intentionally lightweight (LogisticRegression, C=1.0) because
-its purpose is bias correction, not accurate classification.  The propensity
-scores only need to rank establishments coarsely by their inspection
-probability within each industry stratum.
+a follow-up inspection.  This module fits a logistic propensity model and
+returns clip(1/P, 1, max_weight) IPW weights so the GBM heads train on a
+sample that better approximates the full employer population.
 """
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from typing import List, Optional
 
@@ -38,6 +17,8 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+logger = logging.getLogger(__name__)
 
 
 class InspectionPropensityModel:
@@ -128,25 +109,22 @@ class InspectionPropensityModel:
         n_neg = len(y_arr) - n_pos
 
         if n_pos < 5 or n_neg < 5:
-            # Not enough data on one side — fall back to uniform weights
-            print(
-                f"  [IPW] Insufficient paired/unpaired counts "
-                f"(pos={n_pos}, neg={n_neg}); using uniform weights."
+            logger.warning(
+                "  [IPW] Insufficient paired/unpaired counts (pos=%s, neg=%s); using uniform weights.",
+                n_pos, n_neg,
             )
             self._model = None
             return self
 
         self._model.fit(X, y_arr)
 
-        # Diagnostic: print propensity P95 and per-industry mean
         probs = self._model.predict_proba(X[y_arr == 1])[:, 1]
         weights = np.clip(1.0 / np.clip(probs, 0.05, 1.0), 1.0, self._max_weight)
-        print(
-            f"  [IPW] Propensity model fitted  "
-            f"paired={n_pos:,}  unpaired={n_neg:,}  "
-            f"weight P50={np.percentile(weights, 50):.2f}  "
-            f"P95={np.percentile(weights, 95):.2f}  "
-            f"max={weights.max():.2f}"
+        logger.info(
+            "  [IPW] Propensity model fitted  paired=%s  unpaired=%s  "
+            "weight P50=%.2f  P95=%.2f  max=%.2f",
+            f"{n_pos:,}", f"{n_neg:,}",
+            np.percentile(weights, 50), np.percentile(weights, 95), weights.max(),
         )
         return self
 
@@ -167,6 +145,5 @@ class InspectionPropensityModel:
         ]
         X = np.array(X_rows, dtype=float)
         probs = self._model.predict_proba(X)[:, 1]
-        # Floor at 0.05 to prevent division by near-zero probability
         probs = np.clip(probs, 0.05, 1.0)
         return np.clip(1.0 / probs, 1.0, self._max_weight)

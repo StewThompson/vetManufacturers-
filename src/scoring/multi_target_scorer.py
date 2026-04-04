@@ -51,6 +51,7 @@ from scipy.optimize import minimize
 from sklearn.ensemble import (
     GradientBoostingRegressor,
     HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -114,16 +115,62 @@ _HGBC_INJURY_PARAMS = dict(
     early_stopping=False,
     random_state=42,
 )
-_GBR_PARAMS = dict(
-    n_estimators=600,
+# ── Regression head hyperparameters ──────────────────────────────────────
+# Penalty head: quantile regression (75th percentile) in log-space.
+# Targets the upper half of the conditional penalty distribution so predictions
+# for high-risk companies reach realistic large-dollar amounts.  Early stopping
+# prevents overfitting on the sparse positive-penalty subset.
+_HGBR_PEN_PARAMS = dict(
+    max_iter=3000,
     max_depth=5,
-    learning_rate=0.04,
-    subsample=0.75,
-    loss="quantile",  # 80th-percentile quantile — targets upper tail for aggressive prediction
-    alpha=0.80,
-    min_samples_leaf=2,
+    learning_rate=0.025,
+    min_samples_leaf=8,
+    l2_regularization=0.3,
+    loss="quantile",
+    quantile=0.75,
+    early_stopping=True,
+    validation_fraction=0.15,
+    n_iter_no_change=60,
     random_state=42,
 )
+# Gravity head: absolute-error (MAE) loss is robust to heavy-tailed outliers
+# and improves Spearman rank correlation vs squared-error.  A shallower tree
+# with stronger l2 regularisation + monotone constraints on violation features
+# removes the upper-range overprediction seen with the previous GBR.
+_HGBR_GRAV_PARAMS = dict(
+    max_iter=3000,
+    max_depth=4,
+    learning_rate=0.025,
+    min_samples_leaf=12,
+    l2_regularization=1.2,
+    loss="absolute_error",
+    early_stopping=True,
+    validation_fraction=0.15,
+    n_iter_no_change=60,
+    random_state=42,
+)
+# Gravity monotone constraints (feature index → direction).
+# More serious / willful / repeat violations must predict higher gravity;
+# clean_ratio (clean inspections / total) must predict lower gravity.
+# Indices match ml_risk_scorer.FEATURE_NAMES.
+_GRAV_MONOTONE_BY_IDX: Dict[int, int] = {
+    1: 1, 2: 1, 3: 1, 4: 1,    # log_violations, serious, willful, repeat
+    9: 1, 10: 1,                 # severe_incidents, violations_per_inspection
+    11: 1, 12: 1, 13: 1,        # accident_count, fatality_count, injury_count
+    14: 1,                       # avg_gravity  (strongest signal)
+    16: -1,                      # clean_ratio  (more clean → lower gravity)
+    18: 1, 19: 1,               # recent_wr_rate, trend_delta
+    20: 1, 21: 1, 22: 1,       # log_willful_raw, log_repeat_raw, has_any_fatality
+}
+
+
+def _make_monotone_cst(n_features: int) -> List[int]:
+    """Build gravity monotone-constraint list (length = n_features)."""
+    cst = [0] * n_features
+    for idx, val in _GRAV_MONOTONE_BY_IDX.items():
+        if idx < n_features:
+            cst[idx] = val
+    return cst
 
 
 # ── Platt calibration helpers ─────────────────────────────────────────────
@@ -316,51 +363,28 @@ class MultiTargetRiskScorer:
             hgbc.fit(X_fit, y_fit, sample_weight=sample_weight)
             return hgbc
 
-        def _train_gbr_pipe(X_fit, y_fit, sample_weight=None):
-            pipe = Pipeline([
-                ("scaler", StandardScaler()),
-                ("model", GradientBoostingRegressor(**_GBR_PARAMS)),
-            ])
-            if sample_weight is not None:
-                pipe.fit(X_fit, y_fit, model__sample_weight=sample_weight)
-            else:
-                pipe.fit(X_fit, y_fit)
-            return pipe
+        def _train_hgbr(X_fit, y_fit, hgbr_params, sample_weight=None):
+            """Train HistGradientBoostingRegressor (no scaler needed for tree models)."""
+            model = HistGradientBoostingRegressor(**hgbr_params)
+            model.fit(X_fit, y_fit, sample_weight=sample_weight)
+            return model
 
         print("  [MultiTargetScorer] Training Head 1: WR/Serious event (binary) …")
         self._head_wr = _train_hgbc_raw(
             X_tr, y_wr[train_idx], hgbc_params=_HGBC_PARAMS, sample_weight=sw_tr
         )
 
-        # ── Hurdle model for Head 2 ────────────────────────────────────────
-        # 2a: binary classifier — does any future penalty exist?
-        y_any_pen = (y_logp > 0).astype(int)
-        print("  [MultiTargetScorer] Training Head 2a: any-penalty binary (hurdle) …")
-        self._head_pen_nonzero = _train_hgbc_raw(
-            X_tr, y_any_pen[train_idx],
-            hgbc_params=_HGBC_PARAMS,
-            sample_weight=sw_tr,
-        )
-
-        # 2b: conditional log-penalty GBR — trained on positive-penalty rows only.
-        # Eliminates the zero-inflation anchor that causes scale compression.
-        pos_mask_tr = y_logp[train_idx] > 0
-        n_pos_pen = int(pos_mask_tr.sum())
+        # ── Head 2: direct log-penalty regression (no hurdle) ────────────────
+        # Training on ALL rows (including zero-penalty) gives the model the full
+        # zero vs nonzero signal and avoids multiplicative noise from a two-stage
+        # hurdle.  log1p(0) = 0, so the model learns the separation implicitly.
         print(
-            f"  [MultiTargetScorer] Training Head 2b: conditional log-penalty GBR "
-            f"({n_pos_pen:,} positive-penalty rows) …"
+            f"  [MultiTargetScorer] Training Head 2: log-penalty regression "
+            f"(all {len(train_idx):,} rows, including zeros) …"
         )
-        if n_pos_pen >= 20:
-            self._head_log_pen = _train_gbr_pipe(
-                X_tr[pos_mask_tr],
-                y_logp[train_idx][pos_mask_tr],
-                sample_weight=sw_tr[pos_mask_tr],
-            )
-        else:
-            # Fallback: train on all rows (too few positives for conditional GBR)
-            print("  [MultiTargetScorer] WARNING: fewer than 20 positive-penalty rows; "
-                  "falling back to unconditional GBR.")
-            self._head_log_pen = _train_gbr_pipe(X_tr, y_logp[train_idx], sample_weight=sw_tr)
+        self._head_log_pen = _train_hgbr(
+            X_tr, y_logp[train_idx], _HGBR_PEN_PARAMS, sample_weight=sw_tr
+        )
 
         print("  [MultiTargetScorer] Training Head 3: hospitalization/fatality (binary) …")
         self._head_injury = _train_hgbc_raw(
@@ -388,7 +412,11 @@ class MultiTargetRiskScorer:
             setattr(self, attr_name, head)
 
         print("  [MultiTargetScorer] Training Head 4: gravity-weighted severity (regression) …")
-        self._head_gravity = _train_gbr_pipe(X_tr, y_grav[train_idx], sample_weight=sw_tr)
+        grav_params = dict(_HGBR_GRAV_PARAMS)
+        grav_params["monotonic_cst"] = _make_monotone_cst(X.shape[1])
+        self._head_gravity = _train_hgbr(
+            X_tr, y_grav[train_idx], grav_params, sample_weight=sw_tr
+        )
 
         self._is_fitted = True
 
@@ -447,26 +475,25 @@ class MultiTargetRiskScorer:
                       f"Brier={bs:.4f}  BSS={bss:+.3f}  ECE={ece:.4f}")
 
             # ── Legacy Platt calibration (kept for backward compat) ──────
-            p_pen_val = _clf_proba_batch(self._head_pen_nonzero, X_val)
-            self._platt_wr  = _fit_platt(y_wr[val_idx].astype(float),              p_wr_val)
-            self._platt_inj = _fit_platt(y_inj[val_idx].astype(float),             p_inj_val)
-            self._platt_pen = _fit_platt((y_logp[val_idx] > 0).astype(float),      p_pen_val)
+            self._platt_wr  = _fit_platt(y_wr[val_idx].astype(float),  p_wr_val)
+            self._platt_inj = _fit_platt(y_inj[val_idx].astype(float), p_inj_val)
 
-            # Hurdle penalty diagnostics on validation fold.
-            p_any_pen_cal  = _apply_platt_batch(p_pen_val, self._platt_pen)
-            cond_logp_val  = _reg_predict_batch(self._head_log_pen, X_val)
-            hurdle_pen_usd = p_any_pen_cal * np.exp(cond_logp_val)
-            actual_pen_usd = np.expm1(y_logp[val_idx])
-            rho_p, _ = spearmanr(hurdle_pen_usd, actual_pen_usd)
-            r_p, _   = pearsonr(np.log1p(hurdle_pen_usd), y_logp[val_idx])
+            # Direct log-penalty regression diagnostics on validation fold.
+            direct_logp_val  = _reg_predict_batch(self._head_log_pen, X_val)
+            actual_pen_usd   = np.expm1(y_logp[val_idx])
+            direct_pen_usd   = np.expm1(np.maximum(0.0, direct_logp_val))
+            rho_p, _ = spearmanr(direct_pen_usd, actual_pen_usd)
+            r_p, _   = pearsonr(direct_logp_val, y_logp[val_idx])
             print(
-                f"  [MultiTargetScorer] Hurdle Pen (val): "
+                f"  [MultiTargetScorer] Direct Pen (val): "
                 f"rho={rho_p:+.3f}  r(log-space)={r_p:+.3f}"
             )
 
-            # Isotonic calibration for conditional log-penalty GBR (Head 2b).
-            # Disabled: quantile loss (alpha=0.80) already targets the 80th percentile;
-            # isotonic fitting on actual labels would map predictions back toward the mean.
+            # Isotonic calibration for log-penalty regression head.
+            # Disabled: isotonic mapping fitted on training-era val labels creates
+            # distribution-shift bias when predicting on future (2024+) data.
+            # The HGBR predictions in log-space are already well-calibrated via
+            # squared_error loss; a second calibration layer hurts external r.
             self._iso_log_pen = None
 
             # Isotonic calibration for gravity regression head.

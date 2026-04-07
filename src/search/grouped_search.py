@@ -365,6 +365,11 @@ def group_establishments(
     unmatched: List[str] = []
 
     for ckey, rf_score, _idx in hits:
+        # Skip candidates much shorter than the query — these match via partial-ratio
+        # substring (e.g. "AI", "E", "St" matching inside "FASTENAL") and produce
+        # misleading "Other Possible Matches" entries.
+        if len(ckey) < max(2, len(query_key) // 2):
+            continue
         score = rf_score / 100.0
         estabs = ckey_to_estabs.get(ckey, [])
         if not estabs:

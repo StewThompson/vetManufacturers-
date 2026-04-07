@@ -154,7 +154,6 @@ def build_multi_target_model(scorer, *, sample_size: int, force: bool = False):
         naics_map=scorer._naics_map,
         penalty_thresholds=penalty_thresholds,
         sample_size=sample_size,
-        min_hist_insp=2,
     )
     print(f"  Labels built: {len(rows):,} rows  ({time.time()-t0:.1f}s)")
 
@@ -180,7 +179,7 @@ def build_multi_target_model(scorer, *, sample_size: int, force: bool = False):
     print(f"  Composite weights: {[f'{w:.3f}' for w in mt._weights]}")
 
     mt.save(model_path)
-    print(f"  Saved → {model_path}")
+    print(f"  Saved -> {model_path}")
 
 
 # ------------------------------------------------------------------ #

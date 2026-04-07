@@ -20,7 +20,8 @@ from tests.validation.mt_shared import (
     CAPTURE_MINIMUM, CAPTURE_STRONG,
     REGRESSION_SPEARMAN, MAX_CALIBRATION_VIOLATIONS,
     BRIER_SS_MIN, ECE_MAX,
-    BRIER_SS_MIN_P_INJURY, ECE_MAX_P_INJURY, CALIB_SLOPE_MIN_P_INJURY,
+    BRIER_SS_MIN_P_INJURY, ECE_MAX_P_INJURY,
+    CALIB_SLOPE_MIN_P_INJURY, CALIB_SLOPE_MAX_P_INJURY,
     CALIB_SLOPE_MIN, CALIB_SLOPE_MAX, CALIB_INTERCEPT_MIN, CALIB_INTERCEPT_MAX,
     PR_AUC_RATIO_P_EVENT, PR_AUC_RATIO_P_INJURY, PR_AUC_AP_FLOOR_EVENT,
     _get_scorer, _get_mt_scorer, _get_val_data,
@@ -499,11 +500,11 @@ def test_p_injury_calibration_slope():
     slope, intercept = _calibration_slope_intercept(y_true, y_pred)
     print(
         f"\n  p_injury calibration: slope={slope:.4f}  intercept={intercept:.4f}  "
-        f"(slope target: [{CALIB_SLOPE_MIN_P_INJURY},{CALIB_SLOPE_MAX}]  "
+        f"(slope target: [{CALIB_SLOPE_MIN_P_INJURY},{CALIB_SLOPE_MAX_P_INJURY}]  "
         f"intercept target: [{CALIB_INTERCEPT_MIN},{CALIB_INTERCEPT_MAX}])"
     )
-    assert CALIB_SLOPE_MIN_P_INJURY <= slope <= CALIB_SLOPE_MAX, (
-        f"p_injury calibration slope {slope:.4f} outside [{CALIB_SLOPE_MIN_P_INJURY},{CALIB_SLOPE_MAX}]"
+    assert CALIB_SLOPE_MIN_P_INJURY <= slope <= CALIB_SLOPE_MAX_P_INJURY, (
+        f"p_injury calibration slope {slope:.4f} outside [{CALIB_SLOPE_MIN_P_INJURY},{CALIB_SLOPE_MAX_P_INJURY}]"
     )
     assert CALIB_INTERCEPT_MIN <= intercept <= CALIB_INTERCEPT_MAX, (
         f"p_injury calibration intercept {intercept:.4f} outside "

@@ -218,13 +218,19 @@ export default function SearchCard({
 
       {/* Search results — floats outside the sidebar as a fixed panel */}
       {searchResults && (
+        <>
+          {/* Transparent backdrop — click anywhere outside panel to dismiss */}
+          <div
+            style={{ position: 'fixed', inset: 0, zIndex: 199 }}
+            onClick={() => setSearchResults(null)}
+          />
         <div
           className="search-results-panel"
           style={{
             left: 368,
-            top: 0,
+            top: 56,
             width: 420,
-            maxHeight: 'calc(100vh - 16px)',
+            maxHeight: 'calc(100vh - 72px)',
           }}
         >
           <div style={{
@@ -274,6 +280,7 @@ export default function SearchCard({
             )}
           </div>
         </div>
+        </>
       )}
 
       {/* Industry filter — shown when 2+ NAICS sectors are present */}

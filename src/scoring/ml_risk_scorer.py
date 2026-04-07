@@ -1,5 +1,4 @@
 import csv
-import logging
 import math
 import os
 import json
@@ -18,9 +17,10 @@ from src.models.osha_record import OSHARecord
 from src.data_retrieval.naics_lookup import get_industry_name, load_naics_map
 from src.scoring.industry_stats import compute_industry_stats, compute_relative_features
 from src.scoring.tail_calibrator import TailCalibrator
-from src.scoring.features import extract_establishment_features_raw
 
-logger = logging.getLogger(__name__)
+
+# compute_industry_stats and compute_relative_features are re-exported
+# from src.scoring.industry_stats for backward compatibility.
 
 
 class MLRiskScorer:
@@ -32,11 +32,12 @@ class MLRiskScorer:
     broader population of inspected establishments.
     """
     INDUSTRY_MIN_SAMPLE = 10
+    # Expand log transformation to more features with large ranges
     # Log-compress only volume counts and accident/fatality/injury rates —
     # NOT penalty amounts.  Large penalties directly signal severity;
     # compressing $10K → $1M to 5.5 → 13.8 destroys high-end differentiation.
-    # time_adjusted_penalty (index 17) is also intentionally unlogged.
-    LOG_FEATURE_INDICES = [0, 1, 11, 12, 13]
+    # time_adjusted_penalty (17) is also intentionally unlogged.
+    LOG_FEATURE_INDICES = [0, 1, 11, 12, 13]  # inspection/violation counts, accident/fatality/injury rates
 
     # Canonical 2-digit NAICS sectors for one-hot encoding.
     NAICS_SECTORS = [
@@ -68,12 +69,6 @@ class MLRiskScorer:
         "time_adjusted_penalty",
         "recent_wr_rate",
         "trend_delta",
-        # ── High-signal penalty discriminators (4) ────────────────────
-        "log_willful_raw",
-        "log_repeat_raw",
-        "has_any_fatality",
-        "log_max_insp_penalty",
-        "log_estab_size",
         # ── Industry-relative z-scores (4) ────────────────────────────
         # 0.0 sentinel when NAICS unavailable
         "relative_violation_rate",
@@ -156,10 +151,9 @@ class MLRiskScorer:
     #
     # Pushing this back (earlier than today-minus-1yr) gives a richer paired
     # sample because more establishments have had time to accumulate post-
-    # cutoff inspections.  Moved to 2022-01-01 to avoid the COVID-era inspection
-    # suppression window (2020-2021) which creates false negatives for genuinely
-    # risky companies that weren't reinspected during the pandemic.
-    TEMPORAL_LABEL_CUTOFF = date(2022, 1, 1)
+    # cutoff inspections.  The current default (2020-01-01) gives ≥6 years of
+    # outcome data within the 10-year bulk cache.
+    TEMPORAL_LABEL_CUTOFF = date(2020, 1, 1)
 
     # Maximum number of real-label rows to add to the training matrix.
     # 50_000 exceeds the ~30k paired pool so effectively "use all paired rows".
@@ -208,12 +202,120 @@ class MLRiskScorer:
     def _extract_establishment_features_raw(
         self, records: List[OSHARecord],
     ) -> tuple:
-        """Delegate to the module-level feature extractor in features.py."""
-        return extract_establishment_features_raw(records)
+        """Extract the 17 absolute features for one establishment.
+
+        Returns ``(feature_list_17, naics_code)`` where *feature_list_17*
+        uses **simple per-inspection rates** — identical semantics to
+        ``_fetch_population`` so that train and inference are aligned.
+
+        No recency weighting is applied.  Recency is captured by the
+        ``recent_ratio`` feature (inspections within the last year).
+        """
+        one_year_ago = date.today() - timedelta(days=1095)  # 3-year recency window
+        n_insp = len(records)
+        recent = 0
+        severe = 0
+        clean = 0
+        n_viols = 0
+        serious_raw = 0
+        willful_raw = 0
+        repeat_raw = 0
+        total_pen = 0.0
+        all_penalties: list = []
+        acc_count = 0
+        fat_count = 0
+        inj_count = 0
+        gravities: list = []
+        time_adj_pen = 0.0
+        recent_viol_count = 0
+        recent_wr_raw     = 0
+
+        naics_votes: Counter = Counter()
+
+        for r in records:
+            viols = r.violations
+            n_viols += len(viols)
+
+            serious_raw += sum(1 for v in viols if v.severity == "Serious")
+            willful_raw += sum(1 for v in viols if v.is_willful)
+            repeat_raw  += sum(1 for v in viols if v.is_repeat)
+
+            pens = [v.penalty_amount for v in viols]
+            insp_pen = sum(pens)
+            total_pen += insp_pen
+            all_penalties.extend(pens)
+            age_years = max(0.0, (date.today() - r.date_opened).days / 365.25)
+            time_adj_pen += insp_pen * math.exp(-age_years / 3.0)
+
+            if r.date_opened >= one_year_ago:
+                recent += 1
+                recent_viol_count += len(viols)
+                recent_wr_raw += sum(1 for v in viols if v.is_willful or v.is_repeat)
+
+            if r.accidents:
+                severe += 1
+                for a in r.accidents:
+                    acc_count += 1
+                    if a.fatality:
+                        fat_count += 1
+                    inj_count += len(a.injuries)
+
+            for v in viols:
+                if v.gravity:
+                    try:
+                        gravities.append(float(v.gravity))
+                    except (ValueError, TypeError):
+                        pass
+
+            if not viols:
+                clean += 1
+
+            if r.naics_code:
+                naics_votes[r.naics_code] += 1
+
+        naics_code = naics_votes.most_common(1)[0][0] if naics_votes else None
+
+        # Per-inspection rates — same scale as _fetch_population training data
+        avg_pen = float(np.mean(all_penalties)) if all_penalties else 0.0
+        max_pen = max(all_penalties) if all_penalties else 0.0
+        recent_ratio  = recent      / n_insp if n_insp else 0.0
+        vpi           = n_viols     / n_insp if n_insp else 0.0
+        avg_gravity   = float(np.mean(gravities)) if gravities else 0.0
+        pen_per_insp  = total_pen   / n_insp if n_insp else 0.0
+        clean_ratio   = clean       / n_insp if n_insp else 0.0
+        serious_rate  = serious_raw / n_insp if n_insp else 0.0
+        willful_rate  = willful_raw / n_insp if n_insp else 0.0
+        repeat_rate   = repeat_raw  / n_insp if n_insp else 0.0
+        severe_rate   = severe      / n_insp if n_insp else 0.0
+        acc_rate      = acc_count   / n_insp if n_insp else 0.0
+        fat_rate      = fat_count   / n_insp if n_insp else 0.0
+        inj_rate      = inj_count   / n_insp if n_insp else 0.0
+
+        # Fraction-of-violations metrics for industry comparison
+        raw_serious_rate = serious_raw / max(n_viols, 1)
+        raw_wr_rate      = (willful_raw + repeat_raw) / max(n_viols, 1)
+
+        # Recent-window breakdown features
+        total_wr       = willful_raw + repeat_raw
+        recent_wr_rate = recent_wr_raw / max(total_wr, 1)
+        vpi_recent     = recent_viol_count / max(recent, 1)
+        trend_delta    = vpi - vpi_recent
+
+        features_17 = [
+            n_insp, n_viols, serious_rate, willful_rate, repeat_rate,
+            total_pen, avg_pen, max_pen, recent_ratio, severe_rate, vpi,
+            acc_rate, fat_rate, inj_rate, avg_gravity,
+            pen_per_insp, clean_ratio,
+            time_adj_pen,
+            recent_wr_rate,
+            trend_delta,
+        ]
+
+        return features_17, naics_code, vpi, avg_pen, raw_serious_rate, raw_wr_rate
 
     def _complete_features(
         self,
-        features_raw: list,
+        features_17: list,
         naics_code: str,
         vpi: float,
         avg_pen: float,
@@ -245,7 +347,7 @@ class MLRiskScorer:
 
         naics_vec = self._encode_naics(naics_code)
 
-        row = features_raw + [
+        row = features_17 + [
             _safe(rel["relative_violation_rate"]),
             _safe(rel["relative_penalty"]),
             _safe(rel["relative_serious_ratio"]),
@@ -261,10 +363,10 @@ class MLRiskScorer:
         establishment (aggregated).  Uses simple per-inspection rates —
         identical to the training path in ``_fetch_population``.
         """
-        feats_raw, naics, vpi, avg_pen, sr, wr = (
+        feat17, naics, vpi, avg_pen, sr, wr = (
             self._extract_establishment_features_raw(records)
         )
-        raw = self._complete_features(feats_raw, naics, vpi, avg_pen, sr, wr)
+        raw = self._complete_features(feat17, naics, vpi, avg_pen, sr, wr)
         return self._log_transform_features(raw)
 
     # ------------------------------------------------------------------ #
@@ -281,12 +383,12 @@ class MLRiskScorer:
 
         client = self.osha_client
 
-        logger.info("Building population data from bulk cache…")
+        print("Building population data from bulk cache…")
         client.ensure_cache()
 
         insp_data = client.get_bulk_inspections()
         if not insp_data:
-            logger.warning("No inspection data in cache.")
+            print("  No inspection data in cache.")
             return []
 
         # Group inspections by establishment
@@ -303,7 +405,7 @@ class MLRiskScorer:
         for estab, inspections in estab_inspections.items():
             progress += 1
             if progress % 20000 == 0:
-                logger.info("    %s/%s establishments…", f"{progress:,}", f"{total_estabs:,}")
+                print(f"    {progress:,}/{total_estabs:,} establishments…")
             n_insp = len(inspections)
             recent = 0
             severe = 0
@@ -428,7 +530,7 @@ class MLRiskScorer:
                 "_raw_wr_rate": raw_wr_rate,
             })
 
-        logger.info("  Aggregated %s unique establishments.", len(population))
+        print(f"  Aggregated {len(population)} unique establishments.")
 
         # ── Compute industry stats from full population ────────────────────
         pop_df = pd.DataFrame([
@@ -446,7 +548,7 @@ class MLRiskScorer:
             min_sample=self.INDUSTRY_MIN_SAMPLE,
             naics_map=self._naics_map,
         )
-        logger.info("  Industry stats: %s industry groups.", len(self._industry_stats))
+        print(f"  Industry stats: {len(self._industry_stats)} industry groups.")
 
         # ── Append relative features + NAICS one-hot ──────────────────────
         for p in population:
@@ -510,7 +612,7 @@ class MLRiskScorer:
                 sample_size=self.TEMPORAL_SAMPLE_SIZE,
             )
         except Exception as e:
-            logger.warning("Temporal label build failed (%s); model will not be fitted.", e)
+            print(f"  Temporal label build failed ({e}); model will not be fitted.")
             rows = []
         return rows
 
@@ -540,7 +642,7 @@ class MLRiskScorer:
         n_real = len(temporal_rows)
 
         if n_real < 10:
-            logger.warning("Insufficient real-label rows for training; model not fitted.")
+            print("  Insufficient real-label rows for training; model not fitted.")
             return
 
         X_real_raw = np.array(
@@ -549,9 +651,10 @@ class MLRiskScorer:
         X_real_raw = np.nan_to_num(X_real_raw, nan=0.0)
         X_real = self._log_transform_features(X_real_raw)
         y_real = np.array([r["real_label"] for r in temporal_rows], dtype=float)
-        logger.info(
-            "Training on %s real-label rows (cutoff=%s)  label mean=%.1f  std=%.1f",
-            f"{n_real:,}", self.TEMPORAL_LABEL_CUTOFF, y_real.mean(), y_real.std(),
+        print(
+            f"  Training on {n_real:,} real-label rows "
+            f"(cutoff={self.TEMPORAL_LABEL_CUTOFF})  "
+            f"label mean={y_real.mean():.1f}  std={y_real.std():.1f}"
         )
 
         # ── Tail sample weights (ramp on high-risk real rows) ─────────────
@@ -578,9 +681,9 @@ class MLRiskScorer:
         self._calibrator = TailCalibrator()
         pred_real = self.pipeline.predict(X_real)
         self._calibrator.fit(pred_real, y_real)
-        logger.info(
-            "ML Risk Model trained on %s real-label rows; calibrator fitted.",
-            f"{n_real:,}",
+        print(
+            f"ML Risk Model trained on {n_real:,} real-label rows;  "
+            f"calibrator fitted on {n_real:,} real-label pairs."
         )
 
     # ------------------------------------------------------------------ #
@@ -633,10 +736,10 @@ class MLRiskScorer:
                     # Shape-mismatch guard: stale model after upgrade
                     expected_n = len(self.FEATURE_NAMES)
                     if feats.shape[1] != expected_n:
-                        logger.warning(
-                            "Model feature shape mismatch (%s vs %s expected). "
-                            "Deleting stale cache and retraining…",
-                            feats.shape[1], expected_n,
+                        print(
+                            f"  Model feature shape mismatch "
+                            f"({feats.shape[1]} vs {expected_n} expected). "
+                            "Deleting stale cache and retraining…"
                         )
                         try:
                             os.remove(model_path)
@@ -647,7 +750,7 @@ class MLRiskScorer:
                     # Feature-name guard: catches renames (e.g. raw→log)
                     cached_names = meta.get("feature_names", [])
                     if cached_names and cached_names != self.FEATURE_NAMES:
-                        logger.warning("Feature names changed. Retraining…")
+                        print("  Feature names changed. Retraining…")
                         try:
                             os.remove(model_path)
                         except OSError:
@@ -663,24 +766,24 @@ class MLRiskScorer:
                         try:
                             self._calibrator = TailCalibrator.load(cal_path)
                         except Exception as cal_e:
-                            logger.warning("Calibrator load failed (%s); running uncalibrated.", cal_e)
-                    logger.info("Loaded cached ML risk model (trained %s, %s estabs).", cache_date, len(pop))
+                            print(f"  Calibrator load failed ({cal_e}); running uncalibrated.")
+                    print(f"Loaded cached ML risk model (trained {cache_date}, {len(pop)} estabs).")
                     return
             except Exception as e:
                 if "feature shape mismatch" not in str(e):
-                    logger.warning("Cache load failed: %s", e)
+                    print(f"Cache load failed: {e}")
                 # Fall through to rebuild
 
-        logger.info("Building ML risk model from DOL API data...")
+        print("Building ML risk model from DOL API data...")
         try:
             population = self._fetch_population()
             if len(population) < 5:
-                logger.warning("Insufficient population data.")
+                print("Insufficient population data ")
                 return
             self._train(population)
             self._save(population)
         except Exception as e:
-            logger.warning("Population fetch failed (%s)", e)
+            print(f"Population fetch failed ({e})")
 
     # ------------------------------------------------------------------ #
     #  Per-establishment scoring
@@ -728,10 +831,10 @@ class MLRiskScorer:
         total_inspections = 0
 
         for estab_name, estab_records in groups.items():
-            feats_raw, naics, vpi, avg_pen, sr, wr = (
+            feat17, naics, vpi, avg_pen, sr, wr = (
                 self._extract_establishment_features_raw(estab_records)
             )
-            raw = self._complete_features(feats_raw, naics, vpi, avg_pen, sr, wr)
+            raw = self._complete_features(feat17, naics, vpi, avg_pen, sr, wr)
             log_feats = self._log_transform_features(raw)
 
             raw_pred = float(self.pipeline.predict(log_feats)[0])
@@ -744,10 +847,10 @@ class MLRiskScorer:
             # Exception: confirmed fatality + willful violations may
             # reach 70 regardless of inspection count.
             n_insp_this = len(estab_records)
-            # feats_raw extracted above
-
-            has_fatality = feats_raw[12] > 0
-            has_willful  = feats_raw[3] > 0
+            feat17_raw = feat17  # already extracted above
+            # feat17 is a raw list; willful is index 3, fatalities index 12
+            has_fatality = feat17_raw[12] > 0
+            has_willful  = feat17_raw[3] > 0
             if has_fatality and has_willful:
                 ceiling = 70.0
             elif n_insp_this <= 2:

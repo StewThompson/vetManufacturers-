@@ -371,7 +371,7 @@ def _build_per_establishment_data(
     accident_stats: dict,
     naics_map: dict,
     cutoff_date: date = CUTOFF_DATE,
-    min_hist_inspections: int = 2,
+    min_hist_inspections: int = 1,
     max_establishments: Optional[int] = _MAX_ESTAB_DEV,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Split all inspections per establishment into historical features and
@@ -442,8 +442,6 @@ def _build_per_establishment_data(
         viols:    list = []
         acc_count    = fat_count = inj_count = 0
         time_adj_pen = 0.0
-        max_insp_pen = 0.0
-        estab_sizes: list = []
         naics_votes: Dict[str, int] = defaultdict(int)
         recent_viol_count = 0
         recent_wr_raw     = 0
@@ -470,20 +468,9 @@ def _build_per_establishment_data(
                     float(v.get("current_penalty") or v.get("initial_penalty") or 0)
                     for v in insp_viols
                 )
-                if insp_pen_sum > max_insp_pen:
-                    max_insp_pen = insp_pen_sum
                 if insp_pen_sum > 0:
                     age_years = max(0.0, (date.today() - insp_d).days / 365.25)
                     time_adj_pen += insp_pen_sum * math.exp(-age_years / 3.0)
-
-            nr_raw = str(insp.get("nr_in_estab") or "").strip()
-            if nr_raw:
-                try:
-                    sz = float(nr_raw)
-                    if sz > 0:
-                        estab_sizes.append(sz)
-                except ValueError:
-                    pass
 
             acc = accident_stats.get(act, {"accidents": 0, "fatalities": 0, "injuries": 0})
             acc_count += acc["accidents"]
@@ -550,7 +537,7 @@ def _build_per_establishment_data(
             "name": estab,
             "n_inspections": n_insp,
             "n_future_inspections": len(future_list),
-            # 24 absolute features — same ordering as MLRiskScorer.FEATURE_NAMES[:24]
+            # 20 absolute features — same ordering as MLRiskScorer.FEATURE_NAMES[:20]
             "features": [
                 n_insp, n_viols, serious_rate, willful_rate, repeat_rate,
                 total_pen, avg_pen, max_pen, recent_ratio, severe_rate, vpi,
@@ -559,12 +546,6 @@ def _build_per_establishment_data(
                 time_adj_pen,
                 recent_wr_rate,
                 trend_delta,
-                # Option B: high-signal penalty discriminators
-                math.log1p(willful_raw),
-                math.log1p(repeat_raw),
-                1.0 if fat_count > 0 else 0.0,
-                math.log1p(max_insp_pen),
-                math.log1p(float(np.median(estab_sizes)) if estab_sizes else 0.0),
             ],
             "_industry_group":   naics_group,
             "_raw_vpi":          vpi,
@@ -600,7 +581,7 @@ def _build_feature_matrix(
     naics_map: dict,
     scorer: MLRiskScorer,
 ) -> np.ndarray:
-    """Append industry z-scores + NAICS one-hot to 24-feature rows → n × 53 array.
+    """Append industry z-scores + NAICS one-hot to 20-feature rows → n × 49 array.
 
     LEAKAGE GUARD: industry_stats must have been computed from the historical
     population only (never the full or future population).
@@ -969,7 +950,7 @@ class RealWorldData:
         self.hist_pop, self.future_outcomes = _build_per_establishment_data(
             inspections, viols_by_activity, accident_stats, self.naics_map,
             cutoff_date=CUTOFF_DATE,
-            min_hist_inspections=2,
+            min_hist_inspections=1,
         )
         print(f"  Establishments with >= 1 historical inspection: {len(self.hist_pop):,}")
         n_with_future = sum(1 for o in self.future_outcomes if o["has_future_data"])

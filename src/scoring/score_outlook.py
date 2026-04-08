@@ -64,11 +64,10 @@ def compute_12m_outlook(
         features are already aggregated across all sites).
     risk_targets : dict or None
         When provided (output of ``MultiTargetRiskScorer.predict()``), the
-        model-predicted ``expected_penalty_usd`` and ``expected_citations``
-        values replace the heuristic rate-based projections for violations
-        and penalties.  The inspection frequency (``expected_inspections_12m``)
-        continues to use the feature-rate heuristic because it is not
-        predicted by the multi-target heads.
+        model-predicted ``expected_penalty_usd``
+        values replace the heuristic rate-based projections for penalties.
+        The inspection frequency (``expected_inspections_12m``)
+        and violations frequency continue to use the feature-rate heuristic.
 
     Returns
     -------
@@ -137,12 +136,12 @@ def compute_12m_outlook(
     # violations and penalties — they are trained on real future outcomes
     # rather than extrapolated from historical rates.
     if risk_targets is not None:
-        expected_penalties      = float(risk_targets.get("expected_penalty_usd", 0.0))
-        expected_violations     = float(risk_targets.get("expected_citations", 0.0))
+        expected_penalties      = float(risk_targets.get("industry_p90_penalty", 0.0))
+        expected_violations     = annual_insp_rate * vpi
         # Serious/WR counts remain rate-based (not direct targets)
         expected_serious        = annual_insp_rate * serious_per_insp
         expected_willful_repeat = annual_insp_rate * (willful_per_insp + repeat_per_insp)
-        basis += " (violations + penalties from probabilistic model)"
+        basis += " (penalties from probabilistic model)"
     else:
         expected_violations     = annual_insp_rate * vpi
         expected_penalties      = annual_insp_rate * pen_per_insp
@@ -191,10 +190,10 @@ def _fmt_viols(v: float) -> str:
 
 def _fmt_pen(p: float) -> str:
     if p < 500:
-        return "minimal penalties"
+        return "a minimal large penalty threshold"
     if p < 1_000:
-        return f"~${p:,.0f} in penalties"
-    return f"~${p:,.0f} in OSHA penalties"
+        return f"an industry large penalty threshold of ~${p:,.0f}"
+    return f"an industry large penalty threshold of ~${p:,.0f}"
 
 
 def _build_opening(
@@ -209,20 +208,20 @@ def _build_opening(
         return (
             f"This supplier presents a low compliance risk (score {risk_score:.0f}). "
             f"Based on recent inspection trends across {site_str}, we project "
-            f"{insp_desc} in the next 12 months, resulting in {viols_sent} "
-            f"and {pen_sent}."
+            f"{insp_desc} in the next 12 months, resulting in {viols_sent}, "
+            f"measured against {pen_sent}."
         )
     if risk_band == "moderate":
         return (
             f"This supplier carries a moderate compliance risk (score {risk_score:.0f}). "
             f"Projecting from recent inspection patterns across {site_str}, expect "
-            f"{insp_desc}, {viols_sent}, and {pen_sent} over the next 12 months."
+            f"{insp_desc}, {viols_sent}, measured against {pen_sent}."
         )
     return (
         f"This supplier is flagged as high-risk (score {risk_score:.0f}). "
         f"Based on observed enforcement patterns across {site_str}, the next "
         f"12 months may see {insp_desc}, {viols_sent}, "
-        f"and {pen_sent}."
+        f"measured against {pen_sent}."
     )
 
 

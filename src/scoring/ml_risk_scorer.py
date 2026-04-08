@@ -313,6 +313,8 @@ class MLRiskScorer:
             fat_count = 0
             inj_count = 0
             time_adj_pen = 0.0
+            max_insp_pen = 0.0
+            estab_sizes: list = []
             recent_viol_count = 0   # violation count from recent inspections only
             recent_wr_raw     = 0   # W/R violation count from recent inspections
 
@@ -335,6 +337,8 @@ class MLRiskScorer:
                     float(v.get("current_penalty") or v.get("initial_penalty") or 0)
                     for v in insp_viols
                 )
+                if insp_pen > max_insp_pen:
+                    max_insp_pen = insp_pen
                 time_adj_pen += insp_pen * math.exp(-age_years / 3.0)
                 viols.extend(insp_viols)
                 if not insp_viols:
@@ -354,10 +358,18 @@ class MLRiskScorer:
                 if acc_stats["accidents"] > 0:
                     severe += 1
 
-                # Track NAICS votes
+                # Track NAICS votes and establishment size
                 nc = str(insp.get("naics_code") or "").strip()
                 if nc and nc.isdigit() and len(nc) >= 4:
                     naics_votes[nc[:4]] += 1
+                nr_raw = str(insp.get("nr_in_estab") or "").strip()
+                if nr_raw:
+                    try:
+                        sz = float(nr_raw)
+                        if sz > 0:
+                            estab_sizes.append(sz)
+                    except (ValueError, TypeError):
+                        pass
 
             naics_group = max(naics_votes, key=naics_votes.get) if naics_votes else None
 
@@ -408,6 +420,8 @@ class MLRiskScorer:
             vpi_recent     = recent_viol_count / max(recent, 1)
             trend_delta    = vpi - vpi_recent
 
+            median_estab_size = float(np.median(estab_sizes)) if estab_sizes else 0.0
+
             population.append({
                 "name": estab,
                 "features": [
@@ -418,6 +432,12 @@ class MLRiskScorer:
                     time_adj_pen,
                     recent_wr_rate,
                     trend_delta,
+                    # ── High-signal penalty discriminators (pre-log-transformed) ──
+                    math.log1p(willful_raw),
+                    math.log1p(repeat_raw),
+                    1.0 if fat_count > 0 else 0.0,
+                    math.log1p(max_insp_pen),
+                    math.log1p(median_estab_size),
                     # Relative features will be appended below
                 ],
                 # Scratch fields for industry stats — removed before persisting
@@ -548,6 +568,22 @@ class MLRiskScorer:
         )
         X_real_raw = np.nan_to_num(X_real_raw, nan=0.0)
         X_real = self._log_transform_features(X_real_raw)
+
+        # Guard: population and training data must share the same feature width.
+        # A mismatch means _fetch_population() and the temporal labeler were built
+        # at different code versions.  Saving a model trained on X_real onto a
+        # population_features matrix of a different width would cause the scaler
+        # to crash on every score() call, so abort cleanly here instead.
+        if X_real.shape[1] != X_pop.shape[1]:
+            logger.error(
+                "Feature-count mismatch: population has %d features but temporal "
+                "labels have %d.  Delete ml_cache/population_data.json and "
+                "ml_cache/temporal_labels.pkl to force a full rebuild.",
+                X_pop.shape[1], X_real.shape[1],
+            )
+            self.population_features = None  # ensure score() uses graceful fallback
+            return
+
         y_real = np.array([r["real_label"] for r in temporal_rows], dtype=float)
         logger.info(
             "Training on %s real-label rows (cutoff=%s)  label mean=%.1f  std=%.1f",
@@ -638,20 +674,22 @@ class MLRiskScorer:
                             "Deleting stale cache and retraining…",
                             feats.shape[1], expected_n,
                         )
-                        try:
-                            os.remove(model_path)
-                        except OSError:
-                            pass
+                        for _stale in (model_path, pop_path):
+                            try:
+                                os.remove(_stale)
+                            except OSError:
+                                pass
                         raise ValueError("feature shape mismatch")
 
                     # Feature-name guard: catches renames (e.g. raw→log)
                     cached_names = meta.get("feature_names", [])
                     if cached_names and cached_names != self.FEATURE_NAMES:
                         logger.warning("Feature names changed. Retraining…")
-                        try:
-                            os.remove(model_path)
-                        except OSError:
-                            pass
+                        for _stale in (model_path, pop_path):
+                            try:
+                                os.remove(_stale)
+                            except OSError:
+                                pass
                         raise ValueError("feature names mismatch")
 
                     self.pipeline = loaded_pipeline

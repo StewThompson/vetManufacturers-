@@ -178,6 +178,8 @@ class RiskAssessor:
                         has_willful=has_willful,
                     )
 
+                mt_predictions["industry_p90_penalty"] = p90_thresh
+
                 risk_targets_obj = ProbabilisticRiskTargets(
                     p_serious_wr_event=round(mt_predictions["p_serious_wr_event"], 4),
                     p_injury_event=round(mt_predictions["p_injury_event"], 4),
@@ -185,6 +187,7 @@ class RiskAssessor:
                     p_penalty_ge_p90=round(mt_predictions.get("p_penalty_ge_p90", 0.0), 4),
                     p_penalty_ge_p95=round(mt_predictions.get("p_penalty_ge_p95", 0.0), 4),
                     expected_penalty_usd_12m=round(mt_predictions.get("expected_penalty_usd", 0.0), 2),
+                    industry_p90_penalty=round(p90_thresh, 2),
                     gravity_score=round(mt_predictions.get("gravity_score", 0.0), 2),
                     composite_risk_score=round(composite, 1),
                 )

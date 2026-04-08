@@ -222,9 +222,9 @@ export default function SearchCard({
           className="search-results-panel"
           style={{
             left: 368,
-            top: 0,
+            top: 64,
             width: 420,
-            maxHeight: 'calc(100vh - 16px)',
+            maxHeight: 'calc(100vh - 80px)',
           }}
         >
           <div style={{

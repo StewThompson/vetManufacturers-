@@ -103,6 +103,8 @@ export interface ProbabilisticRiskTargetsOut {
   p_penalty_ge_p90: number
   /** Legacy: expected total OSHA penalty (USD) */
   expected_penalty_usd_12m: number
+  /** Threshold: large penalty value for the industry */
+  industry_p90_penalty: number
   /** Legacy: gravity-weighted violation severity score (raw) */
   gravity_score: number
   /** Weighted composite of primary heads (0–100) */

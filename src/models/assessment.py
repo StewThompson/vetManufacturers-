@@ -21,6 +21,7 @@ class ProbabilisticRiskTargets(BaseModel):
     # Legacy regression heads (kept for backward compat / outlook)
     expected_penalty_usd_12m: float = 0.0
     gravity_score: float = 0.0
+    industry_p90_penalty: float = 0.0
 
     # Composite score derived from the above (0-100)
     composite_risk_score: float = 0.0

@@ -115,6 +115,7 @@ class ProbabilisticRiskTargetsOut(BaseModel):
     # Legacy regression heads
     expected_penalty_usd_12m: float
     gravity_score: float
+    industry_p90_penalty: float = 0.0
     composite_risk_score: float
 
 

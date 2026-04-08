@@ -160,10 +160,9 @@ class VettingAgent:
               Composite Risk Score: {rt.composite_risk_score}/100
               P(Serious/Willful/Repeat event): {rt.p_serious_wr_event:.1%}
               Expected Penalty: ${rt.expected_penalty_usd_12m:,.0f}
-              Expected Citations: {rt.expected_citations_12m:.1f}
-              P(Penalty ≥ NAICS P75): {rt.p_moderate_penalty_event:.1%}
-              P(Penalty ≥ NAICS P90 / ${rt.large_penalty_threshold_usd:,.0f}): {rt.p_large_penalty_event:.1%}
-              P(Penalty ≥ NAICS P95): {rt.p_extreme_penalty_event:.1%}
+              P(Penalty ≥ NAICS P75): {rt.p_penalty_ge_p75:.1%}
+              P(Penalty ≥ NAICS P90 / ${rt.industry_p90_penalty:,.0f}): {rt.p_penalty_ge_p90:.1%}
+              P(Penalty ≥ NAICS P95): {rt.p_penalty_ge_p95:.1%}
 """
 
             prompt = f"""
@@ -606,10 +605,9 @@ Multi-Target ML Predictions (12-month forward outlook):
   Composite Risk Score : {rt.composite_risk_score}/100
   P(S/WR event)        : {rt.p_serious_wr_event:.1%}
   Expected Penalty     : ${rt.expected_penalty_usd_12m:,.0f}
-  Expected Citations   : {rt.expected_citations_12m:.1f}
-  P(≥ NAICS P75)       : {rt.p_moderate_penalty_event:.1%}
-  P(≥ NAICS P90 / ${rt.large_penalty_threshold_usd:,.0f}): {rt.p_large_penalty_event:.1%}
-  P(≥ NAICS P95)       : {rt.p_extreme_penalty_event:.1%}
+  P(≥ NAICS P75)       : {rt.p_penalty_ge_p75:.1%}
+  P(≥ NAICS P90 / ${rt.industry_p90_penalty:,.0f}): {rt.p_penalty_ge_p90:.1%}
+  P(≥ NAICS P95)       : {rt.p_penalty_ge_p95:.1%}
 """
 
             # ── Known IDs index for Gemini reference ──────────────────

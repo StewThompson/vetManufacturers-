@@ -80,10 +80,10 @@ export function OutlookPanel({ outlook }: { outlook: ComplianceOutlook12M }) {
           color={outlook.expected_violations_12m >= 2 ? 'var(--warning)' : undefined}
         />
         <OutlookStat
-          label="Expected Penalties"
-          value={`$${outlook.expected_penalties_usd_12m.toLocaleString('en-US')}`}
-          sub="estimated OSHA fines"
-          color={outlook.expected_penalties_usd_12m >= 5000 ? 'var(--warning)' : undefined}
+          label="Large Penalty"
+          value={`$${outlook.expected_penalties_usd_12m.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
+          sub="industry P90 threshold"
+          color={undefined}
         />
         <OutlookStat
           label="Serious Violations"
@@ -176,39 +176,12 @@ export function RiskTargetsPanel({ targets }: { targets: ProbabilisticRiskTarget
         </div>
         <div>
           <ProbabilityBar
-            label="Expected Penalty"
-            prob={Math.min(targets.expected_penalty_usd_12m / 200_000, 1)}
+            label="Probability of Large Penalty"
+            prob={targets.p_penalty_ge_p90}
             thresholds={[0.05, 0.15]}
-            sub={`Head 2 · est. $${targets.expected_penalty_usd_12m.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
+            sub={`Head 2 · probability of penalty ≥ industry P90`}
           />
         </div>
-      </div>
-
-      <div className="stat-grid" style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
-        <OutlookStat
-          label="Gravity Score"
-          value={targets.gravity_score.toFixed(1)}
-          sub="Head 4 · Σ(gravity × violation weight)"
-          color={
-            targets.gravity_score >= 50
-              ? 'var(--danger)'
-              : targets.gravity_score >= 20
-              ? 'var(--warning)'
-              : undefined
-          }
-        />
-        <OutlookStat
-          label="Expected Penalty"
-          value={`$${targets.expected_penalty_usd_12m.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
-          sub="Head 2 · 12-month total (USD)"
-          color={
-            targets.expected_penalty_usd_12m >= 10_000
-              ? 'var(--danger)'
-              : targets.expected_penalty_usd_12m >= 2_000
-              ? 'var(--warning)'
-              : undefined
-          }
-        />
       </div>
     </div>
   )

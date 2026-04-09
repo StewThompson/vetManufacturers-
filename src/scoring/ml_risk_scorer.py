@@ -10,7 +10,7 @@ from collections import defaultdict, Counter
 from datetime import date, timedelta
 from typing import List, Dict, Optional
 
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
@@ -27,7 +27,7 @@ class MLRiskScorer:
     """
     Machine-learning risk scorer using scikit-learn.
 
-    Trains a GradientBoostingRegressor on OSHA population data from the
+    Trains a HistGradientBoostingRegressor on OSHA population data from the
     DOL API so that every manufacturer's risk score is *relative* to the
     broader population of inspected establishments.
     """
@@ -173,6 +173,7 @@ class MLRiskScorer:
         self._calibrator: Optional[TailCalibrator] = None
         self._naics_map: dict = load_naics_map()
         self._n_temporal_labels: int = 0  # set by _train(); 0 when not yet trained
+        self._feature_importances: dict = {}  # computed once in _train()
         os.makedirs(self.CACHE_DIR, exist_ok=True)
         self._load_or_build()
 
@@ -593,22 +594,39 @@ class MLRiskScorer:
         # ── Tail sample weights (ramp on high-risk real rows) ─────────────
         sw = np.clip(1.0 + np.maximum(0.0, y_real - 30.0) / 10.0, 1.0, 8.0)
 
-        # ── Model: Huber loss + higher capacity + min leaf ────────────────
+        # ── Model: HistGBR (histogram-based — ~10-50x faster on large data) ──
+        # Uses absolute_error (L1/MAE) which is robust to outliers like Huber;
+        # early_stopping halts when val loss stagnates, avoiding long hangs.
         self.pipeline = Pipeline([
             ("scaler", StandardScaler()),
-            ("model", GradientBoostingRegressor(
-                n_estimators=500,
+            ("model", HistGradientBoostingRegressor(
+                max_iter=500,
                 max_depth=5,
                 learning_rate=0.05,
-                subsample=0.8,
-                loss="huber",
-                alpha=0.95,
+                loss="absolute_error",
                 min_samples_leaf=3,
+                early_stopping=True,
+                n_iter_no_change=20,
+                validation_fraction=0.1,
                 random_state=42,
             )),
         ])
         self.pipeline.fit(X_real, y_real, model__sample_weight=sw)
         self._n_temporal_labels = n_real
+
+        # HistGBR has no feature_importances_; compute via permutation on a
+        # random subsample (max 3000 rows) so it stays fast.
+        from sklearn.inspection import permutation_importance
+        rng = np.random.default_rng(42)
+        n_sub = min(3000, X_real.shape[0])
+        idx = rng.choice(X_real.shape[0], size=n_sub, replace=False)
+        pi = permutation_importance(
+            self.pipeline, X_real[idx], y_real[idx],
+            n_repeats=5, random_state=42, n_jobs=1,
+        )
+        self._feature_importances = dict(
+            zip(self.FEATURE_NAMES, pi.importances_mean.tolist())
+        )
 
         # ── Fit calibrator on real-label pairs (raw_pred → real adverse) ──
         self._calibrator = TailCalibrator()
@@ -624,7 +642,7 @@ class MLRiskScorer:
         model_path = os.path.join(self.CACHE_DIR, self.MODEL_FILE)
         pop_path = os.path.join(self.CACHE_DIR, self.POP_FILE)
         with open(model_path, "wb") as f:
-            pickle.dump(self.pipeline, f)
+            pickle.dump({"pipeline": self.pipeline, "feature_importances": self._feature_importances}, f)
         # NaN is not valid JSON — replace with null before serialising.
         # On load we convert null (None) back to 0.0 (model was trained on 0.0).
         def _serialise_features(feats):
@@ -659,7 +677,14 @@ class MLRiskScorer:
                 cache_date = meta.get("date", "")
                 if cache_date and (date.today() - date.fromisoformat(cache_date)).days < 7:
                     with open(model_path, "rb") as f:
-                        loaded_pipeline = pickle.load(f)
+                        loaded = pickle.load(f)
+                    if isinstance(loaded, dict):
+                        loaded_pipeline = loaded["pipeline"]
+                        self._feature_importances = loaded.get("feature_importances", {})
+                    else:
+                        # Legacy pickle: bare pipeline object
+                        loaded_pipeline = loaded
+                        self._feature_importances = {}
                     pop = meta["manufacturers"]
                     # Convert null → 0.0 (NaN was serialised as null)
                     feats = np.array(
@@ -909,12 +934,8 @@ class MLRiskScorer:
         else:
             percentile = 50.0
 
-        # ── Feature importances from the GB model ─────────────────────
-        if self.pipeline is not None:
-            gb = self.pipeline.named_steps["model"]
-            importances = dict(zip(self.FEATURE_NAMES, gb.feature_importances_.tolist()))
-        else:
-            importances = {}
+        # ── Feature importances (pre-computed at train time) ─────────────
+        importances = self._feature_importances or {}
 
         # Aggregate feature values for display
         agg_X = estab["aggregate_features"]

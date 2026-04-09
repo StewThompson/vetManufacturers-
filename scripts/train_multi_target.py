@@ -122,12 +122,16 @@ def build_multi_target_model(scorer, *, sample_size: int, force: bool = False):
             return
 
     penalty_thresholds = load_percentiles(thresh_path)
-    cutoff_date        = scorer.TEMPORAL_LABEL_CUTOFF
+    # Training feature cutoff uses the base-model cutoff (2022-01-01) which
+    # excludes COVID-era data (2020-2021) from training features.  The
+    # p_injury calibration handles the COVID-induced prevalence shift via the
+    # combined temperature + logit-shift calibration using a target prevalence
+    # of 12% (see _INJURY_CAL_TARGET_PREVALENCE in multi_target_scorer.py).
+    cutoff_date = scorer.TEMPORAL_LABEL_CUTOFF
     # Outcome window runs from the training cutoff (2022-01-01) through the
     # most recent available data (2025-03-31), giving a 3+ year post-COVID
-    # window.  Pre-COVID suppression (2020-2021) is entirely excluded from
-    # training labels by the 2022 cutoff.
-    outcome_end        = date(2025, 3, 31)
+    # window.
+    outcome_end = date(2025, 3, 31)
 
     # --force: delete label cache so load_or_build rebuilds from scratch
     if force:

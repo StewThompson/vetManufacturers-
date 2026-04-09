@@ -134,14 +134,63 @@ _HGBC_INJURY_PARAMS = dict(
     n_iter_no_change=50,
     random_state=42,
 )
-_GBR_PARAMS = dict(
-    n_estimators=700,
-    max_depth=5,
-    learning_rate=0.03,
+# Conditional log-penalty regressor (Head 2b): Huber loss targets the robust
+# conditional mean of log(penalty) rather than the 80th-percentile quantile.
+# This corrects the systematic over-prediction of expected monetary penalty
+# that the quantile loss caused (scatter-plot shows predictions far above
+# the diagonal for high-actual rows).  Huber is robust to the heavy penalty
+# tail while still targeting E[log(penalty) | penalty > 0].
+_GBR_LOG_PEN_PARAMS = dict(
+    n_estimators=1000,     # was 700 — more capacity for penalty magnitude
+    max_depth=6,           # was 5 — capture more feature interactions
+    learning_rate=0.025,   # slightly lower for more fine-grained fit
     subsample=0.80,
-    loss="quantile",  # 80th-percentile quantile — targets upper tail for aggressive prediction
-    alpha=0.80,
+    loss="huber",   # robust conditional mean (replaces quantile P80)
+    alpha=0.90,     # huber threshold (fraction of inliers, not quantile level)
     min_samples_leaf=2,
+    random_state=42,
+)
+
+# Gravity regression (Head 4): HistGradientBoostingRegressor with squared_error
+# loss.  Key improvements over the old GBR(quantile):
+#   1. squared_error targets E[log1p(gravity)] — better monetary accuracy.
+#   2. HistGBR supports early stopping — prevents overfitting on the 40%
+#      zero-gravity rows that made quantile predictions collapse toward 0.
+#   3. No StandardScaler needed (HistGBR is scale-invariant).
+# The target is log1p-transformed to compress the heavy tail (gravity spans
+# 0–1500).  Inference applies expm1 to recover the original scale.
+from sklearn.ensemble import HistGradientBoostingRegressor as _HGBR  # noqa: E402
+
+_HGBR_GRAVITY_PARAMS = dict(
+    max_iter=1000,
+    max_depth=6,
+    learning_rate=0.02,
+    min_samples_leaf=8,
+    l2_regularization=0.2,
+    loss="squared_error",  # best for unconditional mean; absolute_error hurt Spearman
+    early_stopping=True,
+    validation_fraction=0.15,
+    n_iter_no_change=40,
+    random_state=42,
+)
+
+# Backward-compat alias — old pickles trained with _GBR_PARAMS (quantile).
+# Not used for new training; kept so pickle deserialization of old models works.
+_GBR_PARAMS = _GBR_LOG_PEN_PARAMS
+
+# Dedicated HGBC params for the hurdle binary head (Head 2a: any-penalty?).
+# The hurdle head benefits from a shallower, more regularised model than the
+# WR/Serious head because its target (any future penalty at all) is more
+# diffuse across the feature space; overfitting hurts discrimination.
+_HGBC_HURDLE_PARAMS = dict(
+    max_iter=2000,
+    max_depth=5,
+    learning_rate=0.02,
+    min_samples_leaf=15,
+    l2_regularization=0.5,
+    early_stopping=True,
+    validation_fraction=0.12,
+    n_iter_no_change=50,
     random_state=42,
 )
 
@@ -274,8 +323,8 @@ class MultiTargetRiskScorer:
         self._head_pen_nonzero: Optional[object] = None
         # Hurdle head 2b: conditional log-penalty GBR (trained on positive rows only)
         self._head_log_pen: Optional[Pipeline] = None
-        # Regression head 4: gravity-weighted severity
-        self._head_gravity: Optional[Pipeline] = None
+        # Regression head 4: gravity-weighted severity (HistGBR, unconditional, log1p target)
+        self._head_gravity: Optional[object] = None
 
         # ── Composite weight vector [w1, w2, w3, w4, w5] (5 components) ──
         # Components: p_wr, p_inj, p_pen95, gravity_norm, pen_norm
@@ -303,6 +352,10 @@ class MultiTargetRiskScorer:
         # bias = logit(target_prevalence) - mean(logit(p_raw) / T_inj) on training holdout.
         # Default 0.0 = no bias (backward compat with old pickles that lack this attr).
         self._bias_inj: float = 0.0
+
+        # Flag: gravity head was trained on log1p(y_grav); apply expm1 at inference.
+        # Default False for backward compat with old pickles that used raw-scale GBR.
+        self._gravity_log_transformed: bool = False
 
         self._iso_pen: Optional[object] = None
         self._iso_log_pen: Optional[object] = None
@@ -389,16 +442,25 @@ class MultiTargetRiskScorer:
             hgbc.fit(X_fit, y_fit, sample_weight=sample_weight)
             return hgbc
 
-        def _train_gbr_pipe(X_fit, y_fit, sample_weight=None):
+        def _train_gbr_pipe(X_fit, y_fit, sample_weight=None, gbr_params=None):
+            if gbr_params is None:
+                gbr_params = _GBR_LOG_PEN_PARAMS
             pipe = Pipeline([
                 ("scaler", StandardScaler()),
-                ("model", GradientBoostingRegressor(**_GBR_PARAMS)),
+                ("model", GradientBoostingRegressor(**gbr_params)),
             ])
             if sample_weight is not None:
                 pipe.fit(X_fit, y_fit, model__sample_weight=sample_weight)
             else:
                 pipe.fit(X_fit, y_fit)
             return pipe
+
+        def _train_hgbr_gravity(X_fit, y_fit, sample_weight=None):
+            """Train HistGBR on log1p(gravity) — see _HGBR_GRAVITY_PARAMS docstring."""
+            y_log = np.log1p(np.maximum(0.0, y_fit))
+            hgbr = _HGBR(**_HGBR_GRAVITY_PARAMS)
+            hgbr.fit(X_fit, y_log, sample_weight=sample_weight)
+            return hgbr
 
         logger.info("  [MultiTargetScorer] Training Head 1: WR/Serious event (binary) …")
         self._head_wr = _train_hgbc_raw(
@@ -411,16 +473,17 @@ class MultiTargetRiskScorer:
         logger.info("  [MultiTargetScorer] Training Head 2a: any-penalty binary (hurdle) …")
         self._head_pen_nonzero = _train_hgbc_raw(
             X_tr, y_any_pen[train_idx],
-            hgbc_params=_HGBC_PARAMS,
+            hgbc_params=_HGBC_HURDLE_PARAMS,
             sample_weight=sw_tr,
         )
 
         # 2b: conditional log-penalty GBR — trained on positive-penalty rows only.
-        # Eliminates the zero-inflation anchor that causes scale compression.
+        # Uses Huber loss (robust conditional mean) instead of quantile P80.
+        # This fixes the systematic over-prediction in the monetary scatter plot.
         pos_mask_tr = y_logp[train_idx] > 0
         n_pos_pen = int(pos_mask_tr.sum())
         logger.info(
-            "  [MultiTargetScorer] Training Head 2b: conditional log-penalty GBR (%s positive-penalty rows) …",
+            "  [MultiTargetScorer] Training Head 2b: conditional log-penalty GBR (%s positive-penalty rows, Huber loss) …",
             f"{n_pos_pen:,}",
         )
         if n_pos_pen >= 20:
@@ -428,10 +491,12 @@ class MultiTargetRiskScorer:
                 X_tr[pos_mask_tr],
                 y_logp[train_idx][pos_mask_tr],
                 sample_weight=sw_tr[pos_mask_tr],
+                gbr_params=_GBR_LOG_PEN_PARAMS,
             )
         else:
             logger.warning("  [MultiTargetScorer] Fewer than 20 positive-penalty rows; falling back to unconditional GBR.")
-            self._head_log_pen = _train_gbr_pipe(X_tr, y_logp[train_idx], sample_weight=sw_tr)
+            self._head_log_pen = _train_gbr_pipe(X_tr, y_logp[train_idx], sample_weight=sw_tr,
+                                                  gbr_params=_GBR_LOG_PEN_PARAMS)
 
         logger.info("  [MultiTargetScorer] Training Head 3: hospitalization/fatality (binary) …")
         self._head_injury = _train_hgbc_raw(
@@ -460,8 +525,10 @@ class MultiTargetRiskScorer:
             )
             setattr(self, attr_name, head)
 
-        logger.info("  [MultiTargetScorer] Training Head 4: gravity-weighted severity (regression) …")
-        self._head_gravity = _train_gbr_pipe(X_tr, y_grav[train_idx], sample_weight=sw_tr)
+        logger.info("  [MultiTargetScorer] Training Head 4: gravity-weighted severity (HistGBR, log1p target, unconditional) …")
+        self._head_gravity = _train_hgbr_gravity(X_tr, y_grav[train_idx], sample_weight=sw_tr)
+        # Mark that gravity predictions are in log-space (expm1 applied at inference)
+        self._gravity_log_transformed = True
 
         self._is_fitted = True
 
@@ -584,7 +651,10 @@ class MultiTargetRiskScorer:
             self._iso_log_pen = None
 
             # Isotonic calibration for gravity regression head.
-            raw_grav_val = _reg_predict_batch(self._head_gravity, X_val)
+            # Head predicts in log1p-space (unconditional); apply expm1 before
+            # fitting isotonic calibrator so it maps to the original gravity scale.
+            raw_grav_log = _reg_predict_batch(self._head_gravity, X_val)
+            raw_grav_val = np.expm1(np.maximum(0.0, raw_grav_log))
             iso_grav = IsotonicRegression(out_of_bounds="clip")
             iso_grav.fit(raw_grav_val, y_grav[val_idx])
             self._iso_grav = iso_grav
@@ -698,8 +768,10 @@ class MultiTargetRiskScorer:
         head_pen_nz = getattr(self, "_head_pen_nonzero", None)
         platt_pen   = getattr(self, "_platt_pen", np.array([1.0, 0.0]))
 
-        raw_grav = float(_reg_predict(self._head_gravity, x2d))
-        cal_grav = float(iso_grav.predict([raw_grav])[0]) if iso_grav is not None else raw_grav
+        raw_grav_pred = float(_reg_predict(self._head_gravity, x2d))
+        if getattr(self, "_gravity_log_transformed", False):
+            raw_grav_pred = float(np.expm1(max(0.0, raw_grav_pred)))
+        cal_grav = float(iso_grav.predict([raw_grav_pred])[0]) if iso_grav is not None else raw_grav_pred
 
         if head_pen_nz is not None:
             p_any_pen  = _apply_platt_scalar(float(_clf_proba(head_pen_nz, x2d)), platt_pen)
@@ -775,7 +847,9 @@ class MultiTargetRiskScorer:
         platt_pen   = getattr(self, "_platt_pen", np.array([1.0, 0.0]))
 
         raw_grav = _reg_predict_batch(self._head_gravity, X)
-        grav     = iso_grav.predict(raw_grav) if iso_grav is not None else raw_grav
+        if getattr(self, "_gravity_log_transformed", False):
+            raw_grav = np.expm1(np.maximum(0.0, raw_grav))
+        grav = iso_grav.predict(raw_grav) if iso_grav is not None else raw_grav
 
         if head_pen_nz is not None:
             p_any_pen = _apply_platt_batch(_clf_proba_batch(head_pen_nz, X), platt_pen)
@@ -976,13 +1050,29 @@ def _optimize_weights(
 
     components = np.stack([p_wr, p_inj, p_ext, grav_n, pen_n], axis=1)  # (n, 5)
 
+    # ── Signal-quality gate ─────────────────────────────────────────────
+    # Compute Spearman ρ for the two regression heads against y_adv.
+    # If a head's correlation is below the composite-admission gate threshold
+    # (constants mirror those in test_regression_heads.py), its weight is
+    # pinned to 0 regardless of the optimizer's preference.
+    _PENALTY_SPEARMAN_GATE = 0.30
+    _GRAVITY_SPEARMAN_GATE = 0.28
+
+    rho_grav_n, _ = spearmanr(grav_n, y_adv)
+    rho_pen_n,  _ = spearmanr(pen_n,  y_adv)
+    grav_allowed = float(rho_grav_n) >= _GRAVITY_SPEARMAN_GATE
+    pen_allowed  = float(rho_pen_n)  >= _PENALTY_SPEARMAN_GATE
+
     def _clamp_and_norm(raw_w: np.ndarray) -> np.ndarray:
         """Apply constraints and normalise to sum=1."""
         w = np.maximum(raw_w, 0.0)
-        # p_inj (index 1) capped at 0.15
+        # p_inj (index 1) capped at 0.15 — COVID-era distribution shift
         w[1] = min(w[1], 0.15)
-        # gravity_norm (index 3) floor at 0.10
-        w[3] = max(w[3], 0.10)
+        # Zero out regression heads that lack adequate predictive signal
+        if not grav_allowed:
+            w[3] = 0.0
+        if not pen_allowed:
+            w[4] = 0.0
         s = w.sum()
         if s < 1e-9:
             return np.array([_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3, _DEFAULT_W4, _DEFAULT_W5])

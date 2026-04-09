@@ -137,6 +137,20 @@ function OutlookStat({
 }
 
 export function RiskTargetsPanel({ targets }: { targets: ProbabilisticRiskTargetsOut }) {
+  const gravityLevel =
+    targets.gravity_score >= 200
+      ? { label: 'High', color: 'var(--danger)' }
+      : targets.gravity_score >= 60
+      ? { label: 'Moderate', color: 'var(--warning)' }
+      : { label: 'Low', color: 'var(--success)' }
+
+  const penaltyLevel =
+    targets.expected_penalty_usd_12m >= 100_000
+      ? { label: 'High', color: 'var(--danger)' }
+      : targets.expected_penalty_usd_12m >= 25_000
+      ? { label: 'Moderate', color: 'var(--warning)' }
+      : { label: 'Low', color: 'var(--success)' }
+
   return (
     <div className="card">
       <div
@@ -155,7 +169,7 @@ export function RiskTargetsPanel({ targets }: { targets: ProbabilisticRiskTarget
             padding: '2px 8px',
           }}
         >
-          Multi-Target ML · 4 Heads
+          Multi-Target ML · 5 Heads
         </span>
       </div>
 
@@ -181,8 +195,78 @@ export function RiskTargetsPanel({ targets }: { targets: ProbabilisticRiskTarget
             thresholds={[0.05, 0.15]}
             sub={`Head 2 · probability of penalty ≥ industry P90`}
           />
+          <ProbabilityBar
+            label="Probability of Extreme Penalty"
+            prob={targets.p_penalty_ge_p95}
+            thresholds={[0.03, 0.10]}
+            sub={`Head 2b · probability of penalty ≥ industry P95`}
+          />
         </div>
       </div>
+
+      {/* Legacy regression heads — now active contributors to composite score */}
+      <div
+        style={{
+          borderTop: '1px solid var(--border)',
+          paddingTop: 12,
+          marginTop: 4,
+        }}
+      >
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10, fontWeight: 600 }}>
+          Severity Signal Heads (active in composite)
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 32px' }}>
+          <LegacyMetric
+            label="Gravity-Weighted Severity"
+            value={targets.gravity_score.toFixed(1)}
+            level={gravityLevel}
+            sub={`Head 4 · Σ(gravity × citation weight); composite input`}
+          />
+          <LegacyMetric
+            label="Expected Penalty (12 mo)"
+            value={`$${targets.expected_penalty_usd_12m.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
+            level={penaltyLevel}
+            sub={`Head 2a · hurdle model estimate; industry P90 = $${targets.industry_p90_penalty.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
+          />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function LegacyMetric({
+  label,
+  value,
+  level,
+  sub,
+}: {
+  label: string
+  value: string
+  level: { label: string; color: string }
+  sub?: string
+}) {
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
+        <span style={{ color: 'var(--text-muted)' }}>{label}</span>
+        <span
+          style={{
+            fontWeight: 600,
+            color: level.color,
+            fontSize: 11,
+            padding: '1px 6px',
+            borderRadius: 3,
+            background: `color-mix(in srgb, ${level.color} 12%, transparent)`,
+            border: `1px solid color-mix(in srgb, ${level.color} 25%, transparent)`,
+          }}
+        >
+          {level.label}
+        </span>
+      </div>
+      <div style={{ fontWeight: 700, fontSize: 16, color: level.color }}>{value}</div>
+      {sub && (
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{sub}</div>
+      )}
     </div>
   )
 }

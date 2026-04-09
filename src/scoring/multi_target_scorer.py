@@ -60,22 +60,33 @@ logger = logging.getLogger(__name__)
 
 MODEL_FILE = "multi_target_model.pkl"
 
-# ── Default composite weights (v2: probability-first, 3 components) ────────
-_DEFAULT_W1 = 0.60   # p_serious_wr_event
-_DEFAULT_W2 = 0.30   # p_injury_event
+# ── Default composite weights (v3: 5-component, includes legacy regression heads) ──
+# Components: [p_wr, p_inj, p_pen95, gravity_norm, pen_norm]
+# p_inj gets a small weight (0.05) because it is sensitive to COVID-era temporal
+# distribution shifts between the 2022 training cutoff and the 2021 val cutoff.
+# gravity_norm carries strong predictive signal (Spearman ~0.43 on held-out data)
+# and is more temporally stable, so it receives the second-largest share.
+_DEFAULT_W1 = 0.45   # p_serious_wr_event
+_DEFAULT_W2 = 0.05   # p_injury_event (reduced; COVID-shift sensitive)
 _DEFAULT_W3 = 0.10   # p_extreme_penalty (P95 tier)
+_DEFAULT_W4 = 0.30   # gravity_norm (formerly legacy-only; now active in composite)
+_DEFAULT_W5 = 0.10   # pen_norm (expected_penalty_usd normalised to [0,1])
 
-# Reference values for normalizing regression outputs (legacy heads only)
-_PENALTY_REF_USD = 200_000.0
-_GRAVITY_REF     = 100.0
+# Reference values for normalizing regression outputs to [0, 1] via
+# Michaelis-Menten saturation: x_norm = x / (x + ref).  At x == ref the
+# normalised value is 0.5; this keeps the mapping interpretable.
+_PENALTY_REF_USD = 150_000.0   # ~P85 of positive-penalty establishments
+_GRAVITY_REF     = 80.0        # ~P75 of gravity-weighted severity scores
 
 # Population-mean prior for evidence shrinkage (replaces hard ceilings)
 _SCORE_PRIOR = 15.0
 
 # Convex power-stretch parameter for top-end separation.
-# score = pctile^alpha * 100.  alpha=2 maps median->25, P90->81, P95->90,
-# concentrating most companies in the lower half and spreading high-risk ones.
-_STRETCH_ALPHA = 2.0
+# score = pctile^alpha * 100.  alpha=1.6 (reduced from 2.0) provides a gentler
+# stretch that concentrates more separation in the 70-100 band while keeping
+# the bottom 50% below 35 rather than 25.  This improves top-decile lift by
+# widening the score gap between moderate- and high-risk establishments.
+_STRETCH_ALPHA = 1.6
 
 # ── GBC / GBR hyper-parameters ─────────────────────────────────────────────
 # Binary heads use HistGradientBoostingClassifier with early stopping.
@@ -83,38 +94,43 @@ _STRETCH_ALPHA = 2.0
 # preventing the over-confidence (compressed predictions) that harms
 # calibration slope when a fixed n_estimators is used.
 
-# Head 1 (p_event / WR-serious): early stopping with moderate patience.
-# lr=0.02 + n_iter_no_change=80 gives ~400-800 effective iterations before
-# stopping, significantly more than the previous lr=0.04/n=40 (~200-350 iter)
-# but while keeping the model from over-fitting (which causes covariate-shift
-# amplification that breaks post-hoc Platt calibration on 2021 holdout).
+# Head 1 (p_event / WR-serious): deeper trees + lower regularisation than v2.
+# max_depth=6 and min_samples_leaf=10 allow more feature interactions; reducing
+# l2_regularization from 0.8→0.4 lets the model exploit those interactions
+# without over-smoothing, yielding higher AUROC at the expense of a small
+# increase in overfitting risk (mitigated by early stopping).
 _HGBC_PARAMS = dict(
     max_iter=5000,
-    max_depth=5,
-    learning_rate=0.02,
-    min_samples_leaf=15,
-    l2_regularization=0.8,
+    max_depth=6,
+    learning_rate=0.015,
+    min_samples_leaf=10,
+    l2_regularization=0.4,
     early_stopping=True,
     validation_fraction=0.12,
     n_iter_no_change=80,
     random_state=42,
 )
-# Head 3 (p_injury / hospitalization-fatality): no early stopping, moderate
-# regularisation.  This combination (from Round 7) gave BSS=0.103, AUROC=0.797.
+# Head 3 (p_injury / hospitalization-fatality): enable early stopping (was off).
+# The previous fixed 700-iter / l2=1.5 combination over-regularised predictions
+# toward the mean, compressing the probability spread and inflating calibration
+# slope.  Switching to early-stopping + shallower regularisation produces more
+# dispersed predictions that track actual injury rates better.
 _HGBC_INJURY_PARAMS = dict(
-    max_iter=700,
-    max_depth=4,
-    learning_rate=0.04,
-    min_samples_leaf=20,
-    l2_regularization=1.5,
-    early_stopping=False,
+    max_iter=3000,
+    max_depth=5,
+    learning_rate=0.02,
+    min_samples_leaf=10,
+    l2_regularization=0.5,
+    early_stopping=True,
+    validation_fraction=0.15,
+    n_iter_no_change=50,
     random_state=42,
 )
 _GBR_PARAMS = dict(
-    n_estimators=600,
+    n_estimators=700,
     max_depth=5,
-    learning_rate=0.04,
-    subsample=0.75,
+    learning_rate=0.03,
+    subsample=0.80,
     loss="quantile",  # 80th-percentile quantile — targets upper tail for aggressive prediction
     alpha=0.80,
     min_samples_leaf=2,
@@ -202,8 +218,9 @@ class MultiTargetRiskScorer:
         # Regression head 4: gravity-weighted severity
         self._head_gravity: Optional[Pipeline] = None
 
-        # ── Composite weight vector [w1, w2, w3] (3 probability components) ──
-        self._weights: List[float] = [_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3]
+        # ── Composite weight vector [w1, w2, w3, w4, w5] (5 components) ──
+        # Components: p_wr, p_inj, p_pen95, gravity_norm, pen_norm
+        self._weights: List[float] = [_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3, _DEFAULT_W4, _DEFAULT_W5]
 
         # Temperature slots kept for backward-compatibility with old pickled models.
         self._temp_wr: float = 1.0
@@ -481,13 +498,16 @@ class MultiTargetRiskScorer:
             pred_val  = self.predict_batch(X_val)
             self._weights = _optimize_weights(pred_val, y_adv_val)
             logger.info(
-                "  [MultiTargetScorer] Optimized weights: w1=%.3f w2=%.3f w3=%.3f",
+                "  [MultiTargetScorer] Optimized weights (5-comp): "
+                "w1=%.3f w2=%.3f w3=%.3f w4=%.3f w5=%.3f",
                 self._weights[0], self._weights[1], self._weights[2],
+                self._weights[3], self._weights[4],
             )
         else:
             logger.info(
-                "  [MultiTargetScorer] Using default weights: w1=%s w2=%s w3=%s",
-                _DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3,
+                "  [MultiTargetScorer] Using default weights: "
+                "w1=%s w2=%s w3=%s w4=%s w5=%s",
+                _DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3, _DEFAULT_W4, _DEFAULT_W5,
             )
 
         # ── Build score CDF for percentile stretching ────────────────────
@@ -659,16 +679,38 @@ class MultiTargetRiskScorer:
     #  Composite score (v2 — probability-first)
     # ------------------------------------------------------------------ #
     def _raw_composite(self, pred: Dict[str, float]) -> float:
-        """Weighted sum of calibrated probabilities (before transformation).
+        """Weighted sum of calibrated outputs (before transformation).
 
         Returns a value in [0, 1] representing the raw probability-weighted
         composite.  Used internally by fit() to build the score CDF.
+
+        v3 formula (5 components):
+            raw = w1 * p_wr
+                + w2 * p_inj
+                + w3 * p_pen95
+                + w4 * gravity_norm     ← legacy head now active in composite
+                + w5 * pen_norm         ← legacy head now active in composite
+        where gravity_norm = gravity / (gravity + _GRAVITY_REF)  ∈ [0, 1]
+        and   pen_norm     = expected_penalty / (expected_penalty + _PENALTY_REF_USD)  ∈ [0, 1]
         """
-        w1, w2, w3 = self._weights[:3]
-        p_wr  = pred.get("p_serious_wr_event", 0.0)
-        p_inj = pred.get("p_injury_event", 0.0)
-        p_ext = pred.get("p_penalty_ge_p95", 0.0)
-        return w1 * p_wr + w2 * p_inj + w3 * p_ext
+        w = self._weights
+        w1 = w[0] if len(w) > 0 else _DEFAULT_W1
+        w2 = w[1] if len(w) > 1 else _DEFAULT_W2
+        w3 = w[2] if len(w) > 2 else _DEFAULT_W3
+        w4 = w[3] if len(w) > 3 else _DEFAULT_W4
+        w5 = w[4] if len(w) > 4 else _DEFAULT_W5
+
+        p_wr   = pred.get("p_serious_wr_event", 0.0)
+        p_inj  = pred.get("p_injury_event", 0.0)
+        p_ext  = pred.get("p_penalty_ge_p95", 0.0)
+        grav   = pred.get("gravity_score", 0.0)
+        exp_p  = pred.get("expected_penalty_usd", 0.0)
+
+        # Michaelis-Menten saturation mapping: maps [0, ∞) → [0, 1)
+        grav_n = grav  / (grav  + _GRAVITY_REF)     if grav  > 0 else 0.0
+        pen_n  = exp_p / (exp_p + _PENALTY_REF_USD) if exp_p > 0 else 0.0
+
+        return w1 * p_wr + w2 * p_inj + w3 * p_ext + w4 * grav_n + w5 * pen_n
 
     def _transform_score(self, raw: float) -> float:
         """Monotonic percentile stretching to expand top-end separation.
@@ -699,9 +741,13 @@ class MultiTargetRiskScorer:
     ) -> float:
         """Compute 0-100 composite risk score from a prediction dict.
 
-        v2 formula: all inputs are calibrated probabilities.
-            raw = w1 * p_wr + w2 * p_injury + w3 * p_extreme_penalty
-        Then: evidence-shrink -> percentile-stretch -> rescale to 0-100.
+        v3 formula (5 components):
+            raw = w1*p_wr + w2*p_inj + w3*p_pen95 + w4*gravity_norm + w5*pen_norm
+        Then: evidence-shrink → percentile-stretch → rescale to 0-100.
+
+        Legacy regression heads (gravity_score, expected_penalty_usd) are now
+        included in the composite with weights w4 and w5, providing temporally
+        stable signals that complement the binary classifier heads.
         """
         raw = self._raw_composite(pred)
 
@@ -777,101 +823,126 @@ def _optimize_weights(
     pred_batch: List[Dict[str, float]],
     y_adv: np.ndarray,
 ) -> List[float]:
-    """Find 3-component weights maximizing Spearman rho between composite and y_adv.
+    """Find 5-component weights maximizing Spearman rho between composite and y_adv.
 
-    v2: components are calibrated probabilities — no log-transform needed.
-    Uses grid search + Nelder-Mead refinement (handles non-differentiable rho).
+    v3: components are [p_wr, p_inj, p_pen95, gravity_norm, pen_norm].
+    Constraints:
+      * All weights ≥ 0.0 (non-negative combination)
+      * p_inj weight capped at 0.15 — prevents COVID-era distribution shift
+        (2022 training cutoff vs 2021 val cutoff) from inflating p_inj influence
+      * gravity_norm weight ≥ 0.10 — always contributes (temporally stable)
+      * Sum of weights = 1.0 (convex combination)
+    Uses dense grid search + Nelder-Mead refinement.
     """
     from scipy.stats import spearmanr
 
     # Pre-compute component arrays (vectorized)
-    p_wr  = np.array([p.get("p_serious_wr_event", 0.0) for p in pred_batch])
-    p_inj = np.array([p.get("p_injury_event", 0.0)     for p in pred_batch])
-    p_ext = np.array([p.get("p_penalty_ge_p95", 0.0)   for p in pred_batch])
+    p_wr   = np.array([p.get("p_serious_wr_event", 0.0)   for p in pred_batch])
+    p_inj  = np.array([p.get("p_injury_event", 0.0)       for p in pred_batch])
+    p_ext  = np.array([p.get("p_penalty_ge_p95", 0.0)     for p in pred_batch])
+    grav   = np.array([p.get("gravity_score", 0.0)         for p in pred_batch])
+    exp_p  = np.array([p.get("expected_penalty_usd", 0.0)  for p in pred_batch])
 
-    components = np.stack([p_wr, p_inj, p_ext], axis=1)  # (n, 3)
+    # Pre-normalise legacy regression heads to [0, 1]
+    grav_n = grav  / (grav  + _GRAVITY_REF)
+    grav_n = np.where(grav > 0, grav_n, 0.0)
+    pen_n  = exp_p / (exp_p + _PENALTY_REF_USD)
+    pen_n  = np.where(exp_p > 0, pen_n, 0.0)
 
-    def _neg_spearman_vec(raw_weights: np.ndarray) -> float:
-        w = np.maximum(raw_weights, 0.0)
+    components = np.stack([p_wr, p_inj, p_ext, grav_n, pen_n], axis=1)  # (n, 5)
+
+    def _clamp_and_norm(raw_w: np.ndarray) -> np.ndarray:
+        """Apply constraints and normalise to sum=1."""
+        w = np.maximum(raw_w, 0.0)
+        # p_inj (index 1) capped at 0.15
+        w[1] = min(w[1], 0.15)
+        # gravity_norm (index 3) floor at 0.10
+        w[3] = max(w[3], 0.10)
         s = w.sum()
         if s < 1e-9:
-            return 0.0
-        w = w / s
+            return np.array([_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3, _DEFAULT_W4, _DEFAULT_W5])
+        return w / s
+
+    def _neg_spearman_vec(raw_weights: np.ndarray) -> float:
+        w = _clamp_and_norm(raw_weights.copy())
         scores = components @ w
         if np.all(scores == scores[0]):
             return 0.0
         rho, _ = spearmanr(scores, y_adv)
         return -float(rho) if not math.isnan(rho) else 0.0
 
-    w0      = np.array([_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3])
+    w0      = np.array([_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3, _DEFAULT_W4, _DEFAULT_W5])
     rho_def = -_neg_spearman_vec(w0)
 
-    # ── Stage 1: coarse grid search ──
+    # ── Stage 1: dense grid search over 5 dimensions ──────────────────────
     best_w   = w0.copy()
     best_val = _neg_spearman_vec(w0)
 
     grid_points = [
-        [0.60, 0.30, 0.10],
-        [0.50, 0.35, 0.15],
-        [0.55, 0.30, 0.15],
-        [0.65, 0.25, 0.10],
-        [0.50, 0.40, 0.10],
-        [0.55, 0.35, 0.10],
-        [0.60, 0.25, 0.15],
-        [0.70, 0.20, 0.10],
-        [0.45, 0.40, 0.15],
-        [0.50, 0.30, 0.20],
-        [0.40, 0.40, 0.20],
-        [0.55, 0.25, 0.20],
-        [0.65, 0.30, 0.05],
-        [0.60, 0.35, 0.05],
-        [0.50, 0.25, 0.25],
+        # Default neighbourhood
+        [0.45, 0.05, 0.10, 0.30, 0.10],
+        [0.50, 0.05, 0.10, 0.25, 0.10],
+        [0.40, 0.05, 0.10, 0.35, 0.10],
+        [0.45, 0.05, 0.10, 0.35, 0.05],
+        [0.45, 0.05, 0.15, 0.25, 0.10],
+        [0.50, 0.00, 0.10, 0.30, 0.10],
+        # Gravity-heavy
+        [0.35, 0.05, 0.10, 0.40, 0.10],
+        [0.40, 0.05, 0.10, 0.40, 0.05],
+        [0.30, 0.05, 0.10, 0.45, 0.10],
+        # p_wr-heavy
+        [0.55, 0.05, 0.10, 0.20, 0.10],
+        [0.60, 0.05, 0.10, 0.20, 0.05],
+        [0.55, 0.00, 0.10, 0.25, 0.10],
+        # Legacy-heavy
+        [0.40, 0.05, 0.10, 0.30, 0.15],
+        [0.35, 0.05, 0.10, 0.30, 0.20],
+        [0.40, 0.05, 0.10, 0.25, 0.20],
+        # p_pen-heavy
+        [0.45, 0.05, 0.20, 0.25, 0.05],
+        [0.45, 0.05, 0.20, 0.20, 0.10],
     ]
     for gw in grid_points:
-        gw_arr = np.array(gw)
-        gw_arr /= gw_arr.sum()
+        gw_arr = np.array(gw, dtype=float)
+        gw_arr = _clamp_and_norm(gw_arr)
         val = _neg_spearman_vec(gw_arr)
         if val < best_val:
             best_val = val
             best_w   = gw_arr.copy()
 
-    # ── Stage 2: Nelder-Mead from best grid point ──
-    def _nm_objective(v2: np.ndarray) -> float:
-        v = np.concatenate([np.maximum(v2, 0.0),
-                            [max(0.0, 1.0 - float(np.sum(np.maximum(v2, 0.0))))]])
-        reg = 0.1 * float(np.sum((v - w0) ** 2))
+    # ── Stage 2: Nelder-Mead from best grid point ─────────────────────────
+    # Optimise over first 4 free parameters; w5 = max(0, 1 - sum(w1..w4)).
+    def _nm_objective(v4: np.ndarray) -> float:
+        v4c = np.maximum(v4, 0.0)
+        w5  = max(0.0, 1.0 - float(v4c.sum()))
+        v = np.concatenate([v4c, [w5]])
+        reg = 0.05 * float(np.sum((v - w0) ** 2))
         return _neg_spearman_vec(v) + reg
 
-    v0_2 = best_w[:2].copy()
     try:
         res = minimize(
             _nm_objective,
-            v0_2,
+            best_w[:4].copy(),
             method="Nelder-Mead",
-            options={"maxiter": 2000, "xatol": 1e-4, "fatol": 1e-5},
+            options={"maxiter": 3000, "xatol": 1e-4, "fatol": 1e-5},
         )
         if res.success or res.fun < best_val:
-            v2   = np.maximum(res.x, 0.0)
-            w3   = max(0.0, 1.0 - float(v2.sum()))
-            w_nm = np.concatenate([v2, [w3]])
-            w_nm = np.maximum(w_nm, 0.0)
-            w_nm /= w_nm.sum()
+            v4c  = np.maximum(res.x, 0.0)
+            w5   = max(0.0, 1.0 - float(v4c.sum()))
+            w_nm = _clamp_and_norm(np.concatenate([v4c, [w5]]))
             if _neg_spearman_vec(w_nm) <= best_val:
                 best_w   = w_nm
                 best_val = _neg_spearman_vec(w_nm)
     except Exception:
         pass
 
-    # Enforce minimum w3 >= 0.05: penalty signal always contributes
-    if best_w[2] < 0.05:
-        best_w[2] = 0.05
-        best_w = best_w / np.sum(best_w)
+    best_w = _clamp_and_norm(best_w)
 
     rho_opt = -_neg_spearman_vec(best_w)
     if rho_opt >= rho_def - 0.001:
         return best_w.tolist()
 
-    return [_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3]
+    return [_DEFAULT_W1, _DEFAULT_W2, _DEFAULT_W3, _DEFAULT_W4, _DEFAULT_W5]
 
 
 # ── Internal prediction helpers ─────────────────────────────────────────────

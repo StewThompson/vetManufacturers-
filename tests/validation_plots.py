@@ -26,6 +26,7 @@ Usage (from code)
     generate_all_validation_plots(RealWorldData.get())
 """
 
+import math
 import os
 import sys
 
@@ -219,46 +220,102 @@ def _plot_regression_heads(rw_data: RealWorldData, plots_dir: str,
     actual_penalty = np.array([
         o["future_total_penalty"] for o in rw_data.paired_outcomes
     ])
+    # Use the actual gravity-weighted-score target (Σ gravity × viol_weight).
+    # NOTE: earlier versions incorrectly used future_adverse_outcome_score here,
+    # causing vertical-stripe artifacts and misleading ρ/r values because the
+    # gravity head was being compared against a different composite target.
     actual_gravity = np.array([
-        o["future_adverse_outcome_score"] for o in rw_data.paired_outcomes
+        o.get("future_gravity_weighted_score", 0.0) or 0.0
+        for o in rw_data.paired_outcomes
     ])
+
+    from scipy.stats import spearmanr, pearsonr
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    panels = [
-        (pred_penalty, actual_penalty, COLOR_PEN,
-         "Penalty Head", "Predicted ($)", "Actual Future Penalty ($)"),
-        (pred_gravity, actual_gravity, COLOR_GRAV,
-         "Gravity Head", "Predicted Gravity Score", "Actual Adverse Outcome Score"),
-    ]
+    # ── Panel A: Penalty — log1p scale on both axes ───────────────────────
+    # Monetary predictions span 3+ orders of magnitude ($0–$130k+).
+    # Log-log scale is the standard display for regression across wide ranges;
+    # it reveals rank correlation far better than linear scale where
+    # near-zero cases dominate the visual space.
+    ax = axes[0]
+    log_pred   = np.log1p(pred_penalty)
+    log_actual = np.log1p(actual_penalty)
 
-    for ax, (pred, actual, color, title, xlabel, ylabel) in zip(axes, panels):
-        # Clip extreme outliers for display (keep 99th pct)
-        p99_pred   = float(np.percentile(pred,   99))
-        p99_actual = float(np.percentile(actual, 99))
-        mask = (pred <= p99_pred) & (actual <= p99_actual)
+    # Clip both at 99th pct for display (remove extreme outliers)
+    p99_lp = float(np.percentile(log_pred,   99))
+    p99_la = float(np.percentile(log_actual, 99))
+    mask_p = (log_pred <= p99_lp) & (log_actual <= p99_la)
 
-        ax.scatter(pred[mask], actual[mask], alpha=0.3, s=5,
-                   color=color, rasterized=True)
+    ax.scatter(log_pred[mask_p], log_actual[mask_p], alpha=0.25, s=5,
+               color=COLOR_PEN, rasterized=True)
 
-        # Identity line
-        xy_max = max(float(pred[mask].max()), float(actual[mask].max()))
-        ax.plot([0, xy_max], [0, xy_max], color=COLOR_REF,
-                linewidth=1.5, linestyle="--", label="Perfect prediction")
+    xy_max_p = max(float(log_pred[mask_p].max()), float(log_actual[mask_p].max()))
+    ax.plot([0, xy_max_p], [0, xy_max_p], color=COLOR_REF,
+            linewidth=1.5, linestyle="--", label="Perfect prediction")
 
-        from scipy.stats import spearmanr, pearsonr
-        rho = float(spearmanr(pred, actual)[0])
-        r   = float(pearsonr(pred, actual)[0])
+    rho_p = float(spearmanr(pred_penalty, actual_penalty)[0])
+    r_p   = float(pearsonr(log_pred, log_actual)[0])
 
-        ax.set_title(f"{title}  (ρ={rho:+.3f}  r={r:+.3f})",
-                     fontsize=FONT_LABEL, fontweight="bold")
-        ax.set_xlabel(xlabel, fontsize=FONT_LABEL - 1)
-        ax.set_ylabel(ylabel, fontsize=FONT_LABEL - 1)
-        ax.tick_params(labelsize=FONT_TICK)
-        ax.legend(fontsize=FONT_ANNOT)
-        ax.grid(True, linewidth=0.4)
+    ax.set_title(f"Penalty Head  (ρ={rho_p:+.3f}  r(log)={r_p:+.3f})",
+                 fontsize=FONT_LABEL, fontweight="bold")
+    ax.set_xlabel("log1p(Predicted $)", fontsize=FONT_LABEL - 1)
+    ax.set_ylabel("log1p(Actual Future Penalty $)", fontsize=FONT_LABEL - 1)
 
-    fig.suptitle("Regression Heads: Actual vs Predicted",
+    # Add readable tick labels in dollar scale
+    tick_vals = [0, 100, 1_000, 5_000, 20_000, 100_000]
+    tick_pos  = [math.log1p(v) for v in tick_vals]
+    ax.set_xticks(tick_pos)
+    ax.set_xticklabels([f"${v:,.0f}" if v > 0 else "$0" for v in tick_vals],
+                       fontsize=FONT_TICK - 1, rotation=30, ha="right")
+    ax.set_yticks(tick_pos)
+    ax.set_yticklabels([f"${v:,.0f}" if v > 0 else "$0" for v in tick_vals],
+                       fontsize=FONT_TICK - 1)
+
+    ax.tick_params(labelsize=FONT_TICK)
+    ax.legend(fontsize=FONT_ANNOT)
+    ax.grid(True, linewidth=0.4)
+
+    # ── Panel B: Gravity — log1p scale ────────────────────────────────────
+    # gravity_weighted_score = Σ(gravity × viol_weight) spans 0–1500+.
+    # Log1p scale compresses the tail for better visual clarity.
+    ax = axes[1]
+    log_pred_g   = np.log1p(np.maximum(0.0, pred_gravity))
+    log_actual_g = np.log1p(np.maximum(0.0, actual_gravity))
+
+    p99_lpg = float(np.percentile(log_pred_g,   99))
+    p99_lag = float(np.percentile(log_actual_g, 99))
+    mask_g = (log_pred_g <= p99_lpg) & (log_actual_g <= p99_lag)
+
+    ax.scatter(log_pred_g[mask_g], log_actual_g[mask_g], alpha=0.25, s=5,
+               color=COLOR_GRAV, rasterized=True)
+
+    xy_max_g = max(float(log_pred_g[mask_g].max()), float(log_actual_g[mask_g].max()))
+    ax.plot([0, xy_max_g], [0, xy_max_g], color=COLOR_REF,
+            linewidth=1.5, linestyle="--", label="Perfect prediction")
+
+    rho_g = float(spearmanr(pred_gravity, actual_gravity)[0])
+    r_g   = float(pearsonr(log_pred_g, log_actual_g)[0])
+
+    ax.set_title(f"Gravity Head  (ρ={rho_g:+.3f}  r(log)={r_g:+.3f})",
+                 fontsize=FONT_LABEL, fontweight="bold")
+    ax.set_xlabel("log1p(Predicted Gravity Score)", fontsize=FONT_LABEL - 1)
+    ax.set_ylabel("log1p(Actual Gravity-Weighted Score)", fontsize=FONT_LABEL - 1)
+
+    grav_tick_vals = [0, 1, 5, 20, 50, 150, 500]
+    grav_tick_pos  = [math.log1p(v) for v in grav_tick_vals]
+    ax.set_xticks(grav_tick_pos)
+    ax.set_xticklabels([str(v) for v in grav_tick_vals],
+                       fontsize=FONT_TICK - 1)
+    ax.set_yticks(grav_tick_pos)
+    ax.set_yticklabels([str(v) for v in grav_tick_vals],
+                       fontsize=FONT_TICK - 1)
+
+    ax.tick_params(labelsize=FONT_TICK)
+    ax.legend(fontsize=FONT_ANNOT)
+    ax.grid(True, linewidth=0.4)
+
+    fig.suptitle("Regression Heads: Actual vs Predicted  (log1p scale)",
                  fontsize=FONT_TITLE, fontweight="bold")
     fig.tight_layout()
     path = os.path.join(plots_dir, "03_regression_head_actual_vs_pred.png")

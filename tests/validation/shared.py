@@ -293,6 +293,7 @@ def _compute_future_outcomes(
             "future_any_serious_or_willful_repeat": None,
             "future_fatality_or_catastrophe": None,
             "future_adverse_outcome_score": None,
+            "future_gravity_weighted_score": None,
         }
 
     viols: list = []
@@ -326,6 +327,21 @@ def _compute_future_outcomes(
     any_swr         = int(serious > 0 or willful_repeat > 0)
     any_fatal       = int(fat_count > 0)
 
+    # ── Gravity-weighted score ────────────────────────────────────────────
+    # Same formula used in multi_target_labeler.py: Σ(gravity × viol_weight)
+    # viol_weight: W/R → 3,  S → 2,  all others → 1
+    # This is the TARGET variable for Head 4 (gravity_score prediction).
+    grav_total = 0.0
+    for v in viols:
+        raw_g = v.get("gravity", "")
+        try:
+            g = float(str(raw_g).strip()) if raw_g else 0.0
+        except ValueError:
+            g = 0.0
+        vt = v.get("viol_type", "")
+        weight = 3.0 if vt in ("W", "R") else (2.0 if vt == "S" else 1.0)
+        grav_total += g * weight
+
     # ── Composite adverse outcome score ───────────────────────────────
     # Purpose: a single summary of future compliance severity that gives
     # appropriate weight to different harm types for rank-correlation tests.
@@ -354,6 +370,7 @@ def _compute_future_outcomes(
         "future_any_serious_or_willful_repeat": any_swr,
         "future_fatality_or_catastrophe": any_fatal,
         "future_adverse_outcome_score": adv,
+        "future_gravity_weighted_score": grav_total,
     }
 
 

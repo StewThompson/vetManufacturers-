@@ -7,8 +7,28 @@ from src.models.osha_record import OSHARecord
 class ProbabilisticRiskTargets(BaseModel):
     """Multi-target probabilistic predictions for the next 12 months.
 
+    Architecture: Sequential conditional multi-stage pipeline.
+    Zero future outcome does not always mean low compliance risk; it may mean
+    no inspection exposure.  This model separates inspection exposure from
+    violation severity so risk estimates are more interpretable and less
+    distorted by structural zeros.
+
     All probabilities are in [0, 1]; monetary values are in USD.
     """
+    # ── Stage 1: Inspection Exposure (unconditional) ──────────────────
+    pred_p_inspection: float = 0.0         # P(≥1 OSHA inspection in 12mo)
+
+    # ── Stage 2: Violation | Inspection (conditional) ─────────────────
+    pred_p_violation_given_insp: float = 0.0  # P(any violation | inspected)
+    pred_p_serious_given_insp: float = 0.0    # P(S/W/R violation | inspected)
+
+    # ── Composite unconditional expected values ───────────────────────
+    p_serious_unconditional: float = 0.0   # P(insp) × P(serious|insp)
+    expected_penalty: float = 0.0          # P(insp) × P(viol|insp) × E[pen|viol]
+    expected_gravity: float = 0.0          # P(insp) × P(viol|insp) × E[grav|viol]
+    expected_citations: float = 0.0        # P(insp) × P(viol|insp) × E[cit|viol]
+
+    # ── Backward-compat fields (from old flat model) ──────────────────
     # Primary heads (drive composite score)
     p_serious_wr_event: float = 0.0   # P(≥1 Serious/Willful/Repeat)
     p_injury_event: float = 0.0       # P(hospitalization or fatality)

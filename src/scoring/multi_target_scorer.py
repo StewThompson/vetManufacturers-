@@ -813,14 +813,28 @@ class MultiTargetRiskScorer:
             raw_viol = float(_clf_proba(head_viol, x2d))
             p_viol = float(iso_viol.predict([raw_viol])[0]) if iso_viol is not None else raw_viol
         else:
-            p_viol = 1.0
+            # Backward compat: old pickles don't separate violation from inspection.
+            # Fall back to hurdle penalty head (P(any penalty) ≈ P(any violation)).
+            head_pen_nz = getattr(self, "_head_pen_nonzero", None)
+            platt_pen   = getattr(self, "_platt_pen", np.array([1.0, 0.0]))
+            if head_pen_nz is not None:
+                p_viol = _apply_platt_scalar(float(_clf_proba(head_pen_nz, x2d)), platt_pen)
+            else:
+                p_viol = 1.0
 
         if head_ser is not None:
             iso_ser = getattr(self, "_iso_serious", None)
             raw_ser = float(_clf_proba(head_ser, x2d))
             p_ser = float(iso_ser.predict([raw_ser])[0]) if iso_ser is not None else raw_ser
         else:
-            p_ser = 0.0
+            # Backward compat: fall back to flat WR head for old pickles
+            iso_wr_fb = getattr(self, "_iso_wr", None)
+            head_wr_fb = getattr(self, "_head_wr", None)
+            if head_wr_fb is not None:
+                raw_wr_fb = float(_clf_proba(head_wr_fb, x2d))
+                p_ser = float(iso_wr_fb.predict([raw_wr_fb])[0]) if iso_wr_fb is not None else _apply_platt_scalar(raw_wr_fb, getattr(self, "_platt_wr", np.array([1.0, 0.0])))
+            else:
+                p_ser = 0.0
 
         # Injury head (conditional on inspection)
         iso_inj = getattr(self, "_iso_inj", None)
@@ -951,14 +965,27 @@ class MultiTargetRiskScorer:
             raw_viol = _clf_proba_batch(head_viol, X)
             p_viol = iso_viol.predict(raw_viol) if iso_viol is not None else raw_viol
         else:
-            p_viol = np.ones(n)
+            # Backward compat: fall back to hurdle penalty head
+            head_pen_nz = getattr(self, "_head_pen_nonzero", None)
+            platt_pen   = getattr(self, "_platt_pen", np.array([1.0, 0.0]))
+            if head_pen_nz is not None:
+                p_viol = _apply_platt_batch(_clf_proba_batch(head_pen_nz, X), platt_pen)
+            else:
+                p_viol = np.ones(n)
 
         if head_ser is not None:
             iso_ser = getattr(self, "_iso_serious", None)
             raw_ser = _clf_proba_batch(head_ser, X)
             p_ser = iso_ser.predict(raw_ser) if iso_ser is not None else raw_ser
         else:
-            p_ser = np.zeros(n)
+            # Backward compat: fall back to flat WR head for old pickles
+            head_wr_fb = getattr(self, "_head_wr", None)
+            iso_wr_fb  = getattr(self, "_iso_wr", None)
+            if head_wr_fb is not None:
+                raw_wr_fb = _clf_proba_batch(head_wr_fb, X)
+                p_ser = iso_wr_fb.predict(raw_wr_fb) if iso_wr_fb is not None else _apply_platt_batch(raw_wr_fb, getattr(self, "_platt_wr", np.array([1.0, 0.0])))
+            else:
+                p_ser = np.zeros(n)
 
         # Injury head (conditional on inspection)
         iso_inj  = getattr(self, "_iso_inj", None)
@@ -1067,8 +1094,18 @@ class MultiTargetRiskScorer:
         ]
 
     # ------------------------------------------------------------------ #
-    #  Composite score (v2 — probability-first)
+    #  Composite score (v3 — sequential conditional pipeline)
     # ------------------------------------------------------------------ #
+
+    @property
+    def _is_staged_model(self) -> bool:
+        """True if this model was trained with the 3-stage pipeline (v3+).
+
+        Old pickles (v2) lack _head_inspection, _head_violation, _head_serious
+        and should use the old 5-component composite formula for backward compat.
+        """
+        return getattr(self, "_head_inspection", None) is not None
+
     def _raw_composite(self, pred: Dict[str, float]) -> float:
         """Weighted sum of calibrated outputs (before transformation).
 
@@ -1084,8 +1121,32 @@ class MultiTargetRiskScorer:
         where:
             expected_penalty_norm = E[pen] / (E[pen] + _PENALTY_REF_USD)
             expected_gravity_norm = E[grav] / (E[grav] + _GRAVITY_REF)
+
+        For old pickles (v2 — 5-component), falls back to the old formula:
+            raw = w1*p_wr + w2*p_inj + w3*p_pen95 + w4*gravity_norm + w5*pen_norm
         """
         w = self._weights
+
+        if not self._is_staged_model:
+            # ── Old pickle backward compat (5-component formula) ──────────
+            w1 = w[0] if len(w) > 0 else 0.45
+            w2 = w[1] if len(w) > 1 else 0.05
+            w3 = w[2] if len(w) > 2 else 0.10
+            w4 = w[3] if len(w) > 3 else 0.30
+            w5 = w[4] if len(w) > 4 else 0.10
+
+            p_wr   = pred.get("p_serious_wr_event", 0.0)
+            p_inj  = pred.get("p_injury_event", 0.0)
+            p_ext  = pred.get("p_penalty_ge_p95", 0.0)
+            grav   = pred.get("gravity_score", 0.0)
+            exp_p  = pred.get("expected_penalty_usd", 0.0)
+
+            grav_n = grav  / (grav  + _GRAVITY_REF)     if grav  > 0 else 0.0
+            pen_n  = exp_p / (exp_p + _PENALTY_REF_USD) if exp_p > 0 else 0.0
+
+            return w1 * p_wr + w2 * p_inj + w3 * p_ext + w4 * grav_n + w5 * pen_n
+
+        # ── New staged pipeline (4-component formula) ─────────────────────
         w1 = w[0] if len(w) > 0 else _DEFAULT_W1
         w2 = w[1] if len(w) > 1 else _DEFAULT_W2
         w3 = w[2] if len(w) > 2 else _DEFAULT_W3

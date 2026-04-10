@@ -159,6 +159,12 @@ class RiskAssessor:
                         "p_penalty_ge_p95":    _wavg("p_penalty_ge_p95"),
                         "expected_penalty_usd": _wavg("expected_penalty_usd"),
                         "gravity_score":       _wavg("gravity_score"),
+                        # New staged pipeline keys (unconditional composites)
+                        "pred_p_inspection":        _wavg("pred_p_inspection"),
+                        "p_serious_unconditional":  _wavg("p_serious_unconditional"),
+                        "expected_penalty":         _wavg("expected_penalty"),
+                        "expected_gravity":         _wavg("expected_gravity"),
+                        "expected_citations":       _wavg("expected_citations"),
                     }
 
                 else:
@@ -181,6 +187,17 @@ class RiskAssessor:
                 mt_predictions["industry_p90_penalty"] = p90_thresh
 
                 risk_targets_obj = ProbabilisticRiskTargets(
+                    # Stage 1
+                    pred_p_inspection=round(mt_predictions.get("pred_p_inspection", 0.0), 4),
+                    # Stage 2
+                    pred_p_violation_given_insp=round(mt_predictions.get("pred_p_violation_given_insp", 0.0), 4),
+                    pred_p_serious_given_insp=round(mt_predictions.get("pred_p_serious_given_insp", 0.0), 4),
+                    # Composite unconditional
+                    p_serious_unconditional=round(mt_predictions.get("p_serious_unconditional", 0.0), 4),
+                    expected_penalty=round(mt_predictions.get("expected_penalty", 0.0), 2),
+                    expected_gravity=round(mt_predictions.get("expected_gravity", 0.0), 2),
+                    expected_citations=round(mt_predictions.get("expected_citations", 0.0), 2),
+                    # Backward compat
                     p_serious_wr_event=round(mt_predictions["p_serious_wr_event"], 4),
                     p_injury_event=round(mt_predictions["p_injury_event"], 4),
                     p_penalty_ge_p75=round(mt_predictions.get("p_penalty_ge_p75", 0.0), 4),

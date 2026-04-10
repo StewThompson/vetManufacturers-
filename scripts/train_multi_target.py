@@ -166,9 +166,15 @@ def build_multi_target_model(scorer, *, sample_size: int, force: bool = False):
         print(f"  ERROR: only {len(rows)} rows; cannot train.")
         return
 
-    # Target distributions
+    # Target distributions (staged pipeline)
+    insp_rate = sum(r.get("future_has_inspection", 1) for r in rows) / len(rows)
+    viol_rate_all = sum(r.get("future_has_violation", 0) for r in rows) / len(rows)
     wr_rate  = sum(r["any_wr_serious"]   for r in rows) / len(rows)
     inj_rate = sum(r["any_injury_fatal"] for r in rows) / len(rows)
+    n_inspected = sum(1 for r in rows if r.get("future_has_inspection", 1))
+    n_violated  = sum(1 for r in rows if r.get("future_has_violation", 0))
+    print(f"  Stage 1 — Inspection rate:   {insp_rate:.1%}  ({n_inspected:,} inspected)")
+    print(f"  Stage 2 — Violation rate:    {viol_rate_all:.1%}  ({n_violated:,} with violations)")
     print(f"  WR/Serious positive rate:    {wr_rate:.1%}")
     print(f"  Injury/Fatal positive rate:  {inj_rate:.1%}")
 

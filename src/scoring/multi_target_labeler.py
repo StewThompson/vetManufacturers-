@@ -292,6 +292,7 @@ def build_multi_target_sample(
     sample_size: int = 50_000,
     rng_seed: int = 42,
     min_hist_insp: int = 2,
+    include_uninspected: bool = False,
 ) -> List[Dict]:
     """Build a stratified sample of (features, multi-targets) training rows.
 
@@ -397,10 +398,13 @@ def build_multi_target_sample(
     # negative class for the inspection-exposure model.  Including them
     # enables the sequential pipeline to separate "not inspected" from
     # "inspected but clean" — critical for handling zero-inflation.
-    unpaired_names = [
-        n for n in estab_hist
-        if len(estab_hist[n]) >= min_hist_insp and len(estab_future.get(n, [])) == 0
-    ]
+    if include_uninspected:
+        unpaired_names = [
+            n for n in estab_hist
+            if len(estab_hist[n]) >= min_hist_insp and len(estab_future.get(n, [])) == 0
+        ]
+    else:
+        unpaired_names = []
     all_names = paired_names + unpaired_names
     logger.info(
         "  [MultiTargetLabeler] %s total establishments (%s paired + %s unpaired for Stage 1).",
@@ -627,6 +631,7 @@ def load_or_build(
         penalty_thresholds=penalty_thresholds,
         sample_size=sample_size,
         min_hist_insp=min_hist_insp,
+        include_uninspected=True,   # Stage 1 needs uninspected rows
     )
 
     try:

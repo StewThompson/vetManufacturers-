@@ -1,16 +1,34 @@
 """multi_target_labeler.py — Build multi-target training labels for the
 probabilistic risk model.
 
-Unlike the single-target ``temporal_labeler`` (which returns one composite
-adverse-outcome score), this module produces **6 target columns** per
-establishment that directly correspond to the 4 prediction heads:
+Architecture: Sequential Conditional Multi-Stage Pipeline
+---------------------------------------------------------
+Zero future outcome does not always mean low compliance risk; it may mean
+no inspection exposure. This model separates inspection exposure from
+violation severity so risk estimates are more interpretable and less
+distorted by structural zeros.
 
-    1. any_wr_serious       — 0/1, any Willful/Repeat/Serious violation post-cutoff
-    2. future_total_penalty — float ($), total OSHA penalties in the outcome window
-    3. log_penalty          — log1p(future_total_penalty)
-    4. any_injury_fatal     — 0/1, any hospitalization OR fatality event post-cutoff
-    5. gravity_weighted_score — float, Σ(gravity × viol_weight) for future violations
-    6. real_label           — 0-100 composite adverse outcome (for calibration/weight opt)
+The labeler produces per-establishment labels for a 3-stage pipeline:
+
+  **Stage 1 — Inspection Exposure** (ALL establishments):
+    future_has_inspection   — 0/1, establishment inspected in the future window
+    future_inspection_count — int, count of future inspections
+
+  **Stage 2 — Violation | Inspection** (inspection rows only):
+    future_has_violation    — 0/1, any violation in the future window
+    future_violation_count  — int, total violation count
+    future_has_serious      — 0/1, any S/W/R violation
+    any_injury_fatal        — 0/1, any hospitalization or fatality
+
+  **Stage 3 — Magnitude | Violation** (violation rows only):
+    future_total_penalty    — float ($), total penalties
+    log_penalty             — log1p(penalty)
+    gravity_weighted_score  — float, Σ(gravity × viol_weight)
+    future_citation_count   — int, total citation count
+
+  **Backward compat**:
+    any_wr_serious          — alias for future_has_serious
+    real_label              — 0-100 composite adverse outcome score
 
 Design notes
 ------------
@@ -19,11 +37,16 @@ Design notes
   centrally maintained.
 * Penalty tier thresholds come from ``penalty_percentiles.py`` and MUST be
   pre-computed on training-fold data before calling this module.
-* The stratified sampling strategy is NAICS sector × binary WR/Serious outcome
-  quartile — ensuring broad coverage across industries and risk levels.
+* The stratified sampling strategy is NAICS sector × staged-outcome quartile
+  — ensuring broad coverage across industries and risk levels.
 * Returns dict rows that include both ``features_46`` (pre-log-transform) and
-  all 7 target scalars, plus the ``real_label`` composite score for backward
+  all target scalars, plus the ``real_label`` composite score for backward
   compatibility with diagnostics.
+* **Stage filtering**: callers (the scorer's fit method) must filter rows to
+  the proper training subset for each stage:
+    - Stage 1: all rows
+    - Stage 2: rows where ``future_has_inspection == 1``
+    - Stage 3: rows where ``future_has_violation == 1``
 """
 from __future__ import annotations
 
@@ -124,6 +147,12 @@ def _compute_multi_targets(
 ) -> Dict[str, float]:
     """Compute all target variables from post-cutoff violations and injuries.
 
+    Returns labels for ALL three pipeline stages:
+      Stage 1: future_has_inspection, future_inspection_count
+      Stage 2: future_has_violation, future_violation_count, future_has_serious
+      Stage 3: future_total_penalty, log_penalty, gravity_weighted_score,
+               future_citation_count
+
     Parameters
     ----------
     future_viols : list of dicts with keys ``viol_type``, ``current_penalty``,
@@ -142,11 +171,20 @@ def _compute_multi_targets(
     Returns
     -------
     dict with keys:
-        any_wr_serious, future_total_penalty, log_penalty,
-        any_injury_fatal, gravity_weighted_score,
+        # Stage 1 — Inspection exposure
+        future_has_inspection, future_inspection_count,
+        # Stage 2 — Violation given inspection
+        future_has_violation, future_violation_count,
+        future_has_serious, any_wr_serious (alias), any_injury_fatal,
+        # Stage 3 — Magnitude given violation
+        future_total_penalty, log_penalty, gravity_weighted_score,
+        future_citation_count,
+        # Penalty tiers
         is_moderate_penalty, is_large_penalty, is_extreme_penalty,
+        # Backward compat
         real_label_raw, real_label
     """
+    n_viols = len(future_viols)
     total_penalty = sum(
         float(v.get("current_penalty") or v.get("initial_penalty") or 0)
         for v in future_viols
@@ -190,15 +228,25 @@ def _compute_multi_targets(
             is_extreme = 1
 
     return {
-        "any_wr_serious":        int(wr_serious > 0),
-        "future_total_penalty":  total_penalty,
-        "log_penalty":           math.log1p(total_penalty),
-        "any_injury_fatal":      int(any_injury_fatal),
+        # ── Stage 1: Inspection exposure ──────────────────────────────────
+        "future_has_inspection":  int(n_future_insp >= 1),
+        "future_inspection_count": n_future_insp,
+        # ── Stage 2: Violation conditional on inspection ──────────────────
+        "future_has_violation":   int(n_viols > 0),
+        "future_violation_count": n_viols,
+        "future_has_serious":     int(wr_serious > 0),
+        "any_wr_serious":         int(wr_serious > 0),   # backward compat alias
+        "any_injury_fatal":       int(any_injury_fatal),
+        # ── Stage 3: Magnitude conditional on violation ───────────────────
+        "future_total_penalty":   total_penalty,
+        "log_penalty":            math.log1p(total_penalty),
         "gravity_weighted_score": grav_total,
-        "is_moderate_penalty":   is_moderate,
-        "is_large_penalty":      is_large,
-        "is_extreme_penalty":    is_extreme,
-        # Kept for diagnostics / weight optimization
+        "future_citation_count":  n_viols,  # citation count = violation count
+        # ── Penalty tiers ─────────────────────────────────────────────────
+        "is_moderate_penalty":    is_moderate,
+        "is_large_penalty":       is_large,
+        "is_extreme_penalty":     is_extreme,
+        # ── Backward compat ───────────────────────────────────────────────
         "real_label_raw":  raw_adv,
         "real_label":      real_label,
     }
@@ -225,7 +273,7 @@ def _build_fingerprint(
         "sample_size": sample_size,
         "insp_mtime":  _mtime(inspections_path),
         "viol_mtime":  _mtime(violations_path),
-        "schema":      "multi_target_v10",  # bumped: +penalty tier targets (is_moderate/large/extreme_penalty)
+        "schema":      "multi_target_v11",  # bumped: +staged pipeline labels (future_has_inspection, future_has_violation, etc.)
     }
 
 
@@ -282,13 +330,25 @@ def build_multi_target_sample(
     List of row dicts:
         name               : str
         features_46        : list[float]  — pre-log-transform, len 47
-        any_wr_serious     : int (0/1)
+        # Stage 1 — Inspection exposure
+        future_has_inspection   : int (0/1)
+        future_inspection_count : int
+        # Stage 2 — Violation given inspection
+        future_has_violation    : int (0/1)
+        future_violation_count  : int
+        future_has_serious      : int (0/1)
+        any_wr_serious          : int (0/1, backward compat alias)
+        any_injury_fatal        : int (0/1)
+        # Stage 3 — Magnitude given violation
         future_total_penalty : float
         log_penalty        : float
+        gravity_weighted_score : float
         future_citation_count : int
+        # Penalty tiers
         is_moderate_penalty : int (0/1)
         is_large_penalty   : int (0/1)
         is_extreme_penalty : int (0/1)
+        # Meta
         real_label_raw     : float
         real_label         : float
         naics_2digit       : str
@@ -332,22 +392,27 @@ def build_multi_target_sample(
     ]
     logger.info("  [MultiTargetLabeler] %s paired establishments found.", f"{len(paired_names):,}")
 
-    if not paired_names:
-        return []
-
-    # ── IPW: fit industry-stratified inspection propensity model ──────────
-    # Unpaired: ≥ min_hist_insp pre-cutoff inspections but 0 future.
-    # We deliberately include them only in propensity estimation (not training)
-    # so the IPW weights correct for inspection-selection bias without leaking
-    # future outcome information.
+    # ── Include UNPAIRED establishments for Stage 1 (inspection exposure) ──
+    # These have historical data but NO future inspections — they are the
+    # negative class for the inspection-exposure model.  Including them
+    # enables the sequential pipeline to separate "not inspected" from
+    # "inspected but clean" — critical for handling zero-inflation.
     unpaired_names = [
         n for n in estab_hist
         if len(estab_hist[n]) >= min_hist_insp and len(estab_future.get(n, [])) == 0
     ]
+    all_names = paired_names + unpaired_names
     logger.info(
-        "  [MultiTargetLabeler] %s unpaired establishments (used for IPW only).",
-        f"{len(unpaired_names):,}",
+        "  [MultiTargetLabeler] %s total establishments (%s paired + %s unpaired for Stage 1).",
+        f"{len(all_names):,}", f"{len(paired_names):,}", f"{len(unpaired_names):,}",
     )
+
+    if not all_names:
+        return []
+
+    # ── IPW: fit industry-stratified inspection propensity model ──────────
+    # IPW weights are only meaningful for paired (inspected) establishments.
+    # Unpaired establishments get weight=1.0 by default.
     ipw_model = InspectionPropensityModel(naics_sectors=scorer.NAICS_SECTORS)
     ipw_model.fit(
         paired_hist=[estab_hist[n] for n in paired_names],
@@ -361,10 +426,10 @@ def build_multi_target_sample(
 
     # ── PASS 2: build violation/accident indices ───────────────────────────
     all_hist_acts: set = {
-        r["activity_nr"] for n in paired_names for r in estab_hist[n]
+        r["activity_nr"] for n in all_names for r in estab_hist[n]
     }
     all_future_acts: set = {
-        r["activity_nr"] for n in paired_names for r in estab_future.get(n, [])
+        r["activity_nr"] for n in all_names for r in estab_future.get(n, [])
     }
 
     logger.info(
@@ -379,11 +444,11 @@ def build_multi_target_sample(
     future_hosp_fatal = _build_hosp_fatal_stats(accidents_path, injuries_path, all_future_acts)
 
     # ── PASS 3: aggregate features and targets ─────────────────────────────
-    logger.info("  [MultiTargetLabeler] Computing features + targets for %s establishments …", f"{len(paired_names):,}")
+    logger.info("  [MultiTargetLabeler] Computing features + targets for %s establishments …", f"{len(all_names):,}")
     rows_raw: list = []
     scratch_industry: list = []
 
-    for name in paired_names:
+    for name in all_names:
         hist_insp   = estab_hist[name]
         future_insp = estab_future.get(name, [])
 
@@ -396,6 +461,8 @@ def build_multi_target_sample(
         features_17, naics_group, raw_vpi, raw_avg_pen, raw_sr, raw_wr = agg
 
         # LEAKAGE GUARD: outcomes from future_insp only
+        # For unpaired establishments (no future inspections), all future
+        # targets will be zero — this is the negative class for Stage 1.
         fut_acts       = [r["activity_nr"] for r in future_insp]
         fut_viols      = [v for act in fut_acts for v in future_viol_index.get(act, [])]
         fut_any_injury = any(future_hosp_fatal.get(act, False) for act in fut_acts)
@@ -474,6 +541,8 @@ def build_multi_target_sample(
         row.pop("naics_group")
 
     # ── Stratified sampling ────────────────────────────────────────────────
+    # Stratify by NAICS × inspection/no-inspection × WR outcome to ensure
+    # balanced coverage across all pipeline stages.
     strata_keys = []
     for row in rows_raw:
         f46 = row["features_46"]
@@ -482,8 +551,9 @@ def build_multi_target_sample(
             if f46[22 + j] == 1:
                 naics_prefix = sector
                 break
-        q_label = int(row.get("any_wr_serious", 0))
-        strata_keys.append(f"{naics_prefix}_Q{q_label}")
+        has_insp = row.get("future_has_inspection", 0)
+        q_label = int(row.get("any_wr_serious", 0)) if has_insp else 0
+        strata_keys.append(f"{naics_prefix}_I{has_insp}_Q{q_label}")
 
     indices   = list(range(len(rows_raw)))
     selected  = _stratified_sample(indices, strata_keys, sample_size, rng)
@@ -496,10 +566,17 @@ def build_multi_target_sample(
     pos   = sum(1 for r in sampled if r["any_wr_serious"])
     neg   = len(sampled) - pos
     inj   = sum(1 for r in sampled if r["any_injury_fatal"])
+    n_insp = sum(1 for r in sampled if r["future_has_inspection"])
+    n_viol = sum(1 for r in sampled if r["future_has_violation"])
     logger.info(
-        "  [MultiTargetLabeler] Sample: %s rows, WR/Serious: %s pos / %s neg (%.1f%%), "
+        "  [MultiTargetLabeler] Sample: %s rows — "
+        "Inspected: %s (%.1f%%), Has Violation: %s (%.1f%%), "
+        "WR/Serious: %s pos / %s neg (%.1f%%), "
         "Injury/Fatal: %s (%.1f%%)",
-        f"{len(sampled):,}", f"{pos:,}", f"{neg:,}",
+        f"{len(sampled):,}",
+        f"{n_insp:,}", n_insp / max(1, len(sampled)) * 100,
+        f"{n_viol:,}", n_viol / max(1, len(sampled)) * 100,
+        f"{pos:,}", f"{neg:,}",
         pos / max(1, len(sampled)) * 100,
         f"{inj:,}", inj / max(1, len(sampled)) * 100,
     )

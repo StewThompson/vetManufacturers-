@@ -466,10 +466,8 @@ class MultiTargetRiskScorer:
             self._iso_log_pen = None
 
             # Isotonic calibration for gravity regression head.
-            raw_grav_val = _reg_predict_batch(self._head_gravity, X_val)
-            iso_grav = IsotonicRegression(out_of_bounds="clip")
-            iso_grav.fit(raw_grav_val, y_grav[val_idx])
-            self._iso_grav = iso_grav
+            # Disabled: causes heavy vertical banding / quantization in continuous outputs.
+            self._iso_grav = None
 
         # Temperature slots kept for backward-compat with old pickled models.
         self._temp_wr  = 1.0

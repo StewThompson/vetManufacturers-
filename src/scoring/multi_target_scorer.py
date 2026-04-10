@@ -34,15 +34,16 @@ All heads share the same 46-feature input vector (log-transformed).
   gravity_score        = expected_gravity
   p_penalty_ge_p75/p90/p95 = (kept)
 
-Composite risk score formula (v3 — 4-component)
-------------------------------------------------
-  risk_score_raw = w1 * p_inspection_exposure_norm
-                 + w2 * p_serious_unconditional
-                 + w3 * expected_penalty_norm
-                 + w4 * expected_gravity_norm
+Composite risk score formula (v3 — 4-component conditional)
+-------------------------------------------------------------
+  risk_score_raw = w1 * p_inspection
+                 + w2 * p_serious_given_insp
+                 + w3 * conditional_penalty_norm
+                 + w4 * conditional_gravity_norm
 
-Each component is normalized to [0, 1] before combining.  The raw score is:
-  1. Evidence-shrunk toward population mean
+Components use CONDITIONAL predictions (given inspection) to avoid
+P(inspection) suppressing the risk signal.  P(inspection) is retained as
+a small additive component reflecting inspection exposure.
   2. Transformed via monotonic percentile stretching
   3. Rescaled to 0–100
 
@@ -74,13 +75,16 @@ logger = logging.getLogger(__name__)
 MODEL_FILE = "multi_target_model.pkl"
 
 # ── Default composite weights (v3: 4-component sequential pipeline) ──
-# Components: [p_inspection, p_serious_unconditional, expected_penalty_norm, expected_gravity_norm]
-# The inspection exposure component captures the probability of being inspected;
-# the other three components capture conditional risk given inspection/violation.
-_DEFAULT_W1 = 0.15   # p_inspection (exposure component)
-_DEFAULT_W2 = 0.40   # p_serious_unconditional (= p_insp × p_serious|insp)
-_DEFAULT_W3 = 0.20   # expected_penalty_norm (= p_insp × p_viol|insp × E[pen|viol], normalized)
-_DEFAULT_W4 = 0.25   # expected_gravity_norm (= p_insp × p_viol|insp × E[grav|viol], normalized)
+# Components: [p_inspection, p_serious_given_insp, conditional_penalty_norm,
+#              conditional_gravity_norm]
+# The composite uses CONDITIONAL predictions (given inspection/violation)
+# rather than unconditional ones.  This avoids multiplying all components
+# by P(inspection), which crushes the signal for high-risk establishments
+# that happen to be in industries with low inspection rates.
+_DEFAULT_W1 = 0.10   # p_inspection (exposure component — small weight)
+_DEFAULT_W2 = 0.45   # p_serious_given_insp (conditional risk signal)
+_DEFAULT_W3 = 0.20   # conditional_penalty_norm (= p_viol|insp × E[pen|viol], normalized)
+_DEFAULT_W4 = 0.25   # conditional_gravity_norm (= p_viol|insp × E[grav|viol], normalized)
 
 # Reference values for normalizing regression outputs to [0, 1] via
 # Michaelis-Menten saturation: x_norm = x / (x + ref).  At x == ref the
@@ -638,14 +642,17 @@ class MultiTargetRiskScorer:
             )
 
         # ── Backward-compat: flat WR head + hurdle penalty head ──────────
+        # Train on INSPECTED rows only — uninspected rows have y_wr=0
+        # artificially (they weren't inspected, not because they're safe).
         logger.info("  [MultiTargetScorer] Training backward-compat flat heads …")
         self._head_wr = _train_hgbc_raw(
-            X_tr, y_wr[train_idx], hgbc_params=_HGBC_PARAMS, sample_weight=sw_tr,
+            X_tr_insp, y_wr[insp_train_idx],
+            hgbc_params=_HGBC_PARAMS, sample_weight=sw_tr_insp,
         )
         y_any_pen = (y_logp > 0).astype(int)
         self._head_pen_nonzero = _train_hgbc_raw(
-            X_tr, y_any_pen[train_idx],
-            hgbc_params=_HGBC_HURDLE_PARAMS, sample_weight=sw_tr,
+            X_tr_insp, y_any_pen[insp_train_idx],
+            hgbc_params=_HGBC_HURDLE_PARAMS, sample_weight=sw_tr_insp,
         )
 
         self._is_fitted = True
@@ -726,16 +733,17 @@ class MultiTargetRiskScorer:
                     setattr(self, iso_attr, iso)
 
             # Backward-compat: calibrate flat WR head and hurdle penalty
+            # Use inspected-only validation rows (same population as training)
             self._iso_wr = _calibrate_binary(
-                self._head_wr, X_val, y_wr[val_idx], "WR/Serious (flat)"
+                self._head_wr, X_val_insp, y_wr[val_insp_idx], "WR/Serious (flat)"
             )
-            p_pen_val = _clf_proba_batch(self._head_pen_nonzero, X_val)
-            self._platt_wr  = _fit_platt(y_wr[val_idx].astype(float), _clf_proba_batch(self._head_wr, X_val))
+            p_pen_val = _clf_proba_batch(self._head_pen_nonzero, X_val_insp)
+            self._platt_wr  = _fit_platt(y_wr[val_insp_idx].astype(float), _clf_proba_batch(self._head_wr, X_val_insp))
             self._platt_inj = _fit_platt(
-                y_inj[val_idx].astype(float),
-                _clf_proba_batch(self._head_injury, X_val) if val_insp_mask.sum() > 0 else np.zeros(len(val_idx)),
+                y_inj[val_insp_idx].astype(float),
+                _clf_proba_batch(self._head_injury, X_val_insp) if val_insp_mask.sum() > 0 else np.zeros(len(val_insp_idx)),
             )
-            self._platt_pen = _fit_platt((y_logp[val_idx] > 0).astype(float), p_pen_val)
+            self._platt_pen = _fit_platt((y_logp[val_insp_idx] > 0).astype(float), p_pen_val)
             self._iso_log_pen = None  # quantile loss already calibrated
 
             # Gravity isotonic on violated validation rows
@@ -750,9 +758,18 @@ class MultiTargetRiskScorer:
                 self._iso_grav = iso_grav
 
         # ── Composite weight optimization ────────────────────────────────
+        # Optimize on INSPECTED-ONLY validation rows so the optimizer
+        # focuses on conditional risk heads (p_serious, penalty, gravity)
+        # rather than p_insp which dominates uninspected rows.
         if optimize_weights and len(val_idx) >= 50:
-            y_adv_val = np.array([rows[i]["real_label"] for i in val_idx])
-            pred_val  = self.predict_batch(X_val)
+            val_insp_idx = val_idx[inspected_mask[val_idx]]
+            if len(val_insp_idx) >= 30:
+                y_adv_val = np.array([rows[i]["real_label"] for i in val_insp_idx])
+                X_val_insp_opt = X[val_insp_idx]
+                pred_val = self.predict_batch(X_val_insp_opt)
+            else:
+                y_adv_val = np.array([rows[i]["real_label"] for i in val_idx])
+                pred_val = self.predict_batch(X_val)
             self._weights = _optimize_weights(pred_val, y_adv_val)
             logger.info(
                 "  [MultiTargetScorer] Optimized weights (4-comp): "
@@ -889,6 +906,12 @@ class MultiTargetRiskScorer:
         expected_citations = p_insp_viol * cond_citations
         p_serious_unconditional = p_insp * p_ser
 
+        # Conditional (given inspection): E[X | inspected]
+        # These are used by the composite formula to avoid P(inspection)
+        # suppressing the signal for risk ranking purposes.
+        cond_on_insp_penalty   = p_viol * cond_penalty
+        cond_on_insp_gravity   = p_viol * cond_gravity
+
         # ── Penalty tiers (backward compat) ───────────────────────────────
         p_pen_p75 = p_pen_p90 = p_pen_p95 = 0.0
         for attr_head, attr_iso, setter in [
@@ -932,6 +955,9 @@ class MultiTargetRiskScorer:
             "expected_gravity":               float(max(0.0, expected_gravity)),
             "expected_citations":             float(max(0.0, expected_citations)),
             "p_serious_unconditional":        float(max(0.0, min(1.0, p_serious_unconditional))),
+            # ── Conditional on inspection (for composite scoring) ─────────
+            "conditional_penalty":            float(max(0.0, cond_on_insp_penalty)),
+            "conditional_gravity":            float(max(0.0, cond_on_insp_gravity)),
             # ── Backward-compat outputs ───────────────────────────────────
             "p_serious_wr_event":   float(max(0.0, min(1.0, p_wr_flat))),
             "p_injury_event":       float(max(0.0, min(1.0, p_inj))),
@@ -1041,6 +1067,10 @@ class MultiTargetRiskScorer:
         expected_citations = p_insp_viol * cond_citations
         p_serious_uncond   = p_insp * p_ser
 
+        # Conditional on inspection: E[X | inspected]
+        cond_on_insp_penalty = p_viol * cond_penalty
+        cond_on_insp_gravity = p_viol * cond_gravity
+
         # ── Penalty tiers (backward compat) ───────────────────────────────
         pen_p75 = pen_p90 = pen_p95 = np.zeros(n)
         for attr_head, attr_iso, tier in [
@@ -1085,6 +1115,9 @@ class MultiTargetRiskScorer:
                 "expected_gravity":           float(max(0.0, float(expected_gravity[i]))),
                 "expected_citations":         float(max(0.0, float(expected_citations[i]))),
                 "p_serious_unconditional":    float(max(0.0, min(1.0, float(p_serious_uncond[i])))),
+                # Conditional on inspection (for composite scoring)
+                "conditional_penalty":        float(max(0.0, float(cond_on_insp_penalty[i]))),
+                "conditional_gravity":        float(max(0.0, float(cond_on_insp_gravity[i]))),
                 # Backward compat
                 "p_serious_wr_event":   float(wr[i]),
                 "p_injury_event":       float(inj[i]),
@@ -1116,15 +1149,22 @@ class MultiTargetRiskScorer:
         Returns a value in [0, 1] representing the raw probability-weighted
         composite.  Used internally by fit() to build the score CDF.
 
-        v3 formula (4 components — sequential conditional pipeline):
+        v3 formula (4 components — conditional risk scoring):
             raw = w1 * p_inspection
-                + w2 * p_serious_unconditional
-                + w3 * expected_penalty_norm
-                + w4 * expected_gravity_norm
+                + w2 * p_serious_given_insp
+                + w3 * conditional_penalty_norm
+                + w4 * conditional_gravity_norm
 
         where:
-            expected_penalty_norm = E[pen] / (E[pen] + _PENALTY_REF_USD)
-            expected_gravity_norm = E[grav] / (E[grav] + _GRAVITY_REF)
+            conditional_penalty_norm = cond_pen / (cond_pen + REF)
+            conditional_gravity_norm = cond_grav / (cond_grav + REF)
+            cond_pen  = P(viol|insp) × E[pen|viol]   (expected penalty given inspection)
+            cond_grav = P(viol|insp) × E[grav|viol]   (expected gravity given inspection)
+
+        Using conditional (given inspection) rather than unconditional values
+        prevents P(inspection) from suppressing the signal for high-risk
+        establishments that happen to be in industries with low inspection
+        rates.  P(inspection) is retained as a small additive component.
 
         For old pickles (v2 — 5-component), falls back to the old formula:
             raw = w1*p_wr + w2*p_inj + w3*p_pen95 + w4*gravity_norm + w5*pen_norm
@@ -1150,25 +1190,25 @@ class MultiTargetRiskScorer:
 
             return w1 * p_wr + w2 * p_inj + w3 * p_ext + w4 * grav_n + w5 * pen_n
 
-        # ── New staged pipeline (4-component formula) ─────────────────────
+        # ── New staged pipeline (4-component conditional formula) ─────────
         w1 = w[0] if len(w) > 0 else _DEFAULT_W1
         w2 = w[1] if len(w) > 1 else _DEFAULT_W2
         w3 = w[2] if len(w) > 2 else _DEFAULT_W3
         w4 = w[3] if len(w) > 3 else _DEFAULT_W4
 
         p_insp    = pred.get("pred_p_inspection", 1.0)
-        p_ser_unc = pred.get("p_serious_unconditional",
+        p_ser     = pred.get("pred_p_serious_given_insp",
                              pred.get("p_serious_wr_event", 0.0))
-        exp_pen   = pred.get("expected_penalty",
-                             pred.get("expected_penalty_usd", 0.0))
-        exp_grav  = pred.get("expected_gravity",
-                             pred.get("gravity_score", 0.0))
+        cond_pen  = pred.get("conditional_penalty",
+                             pred.get("expected_penalty", 0.0))
+        cond_grav = pred.get("conditional_gravity",
+                             pred.get("expected_gravity", 0.0))
 
         # Michaelis-Menten saturation mapping: maps [0, ∞) → [0, 1)
-        pen_n  = exp_pen / (exp_pen + _PENALTY_REF_USD) if exp_pen > 0 else 0.0
-        grav_n = exp_grav / (exp_grav + _GRAVITY_REF)   if exp_grav > 0 else 0.0
+        pen_n  = cond_pen  / (cond_pen  + _PENALTY_REF_USD) if cond_pen  > 0 else 0.0
+        grav_n = cond_grav / (cond_grav + _GRAVITY_REF)     if cond_grav > 0 else 0.0
 
-        return w1 * p_insp + w2 * p_ser_unc + w3 * pen_n + w4 * grav_n
+        return w1 * p_insp + w2 * p_ser + w3 * pen_n + w4 * grav_n
 
     def _transform_score(self, raw: float) -> float:
         """Monotonic percentile stretching to expand top-end separation.
@@ -1299,8 +1339,11 @@ def _optimize_weights(
 ) -> List[float]:
     """Find 4-component weights maximizing Spearman rho between composite and y_adv.
 
-    v3: components are [p_inspection, p_serious_unconditional,
-                        expected_penalty_norm, expected_gravity_norm].
+    v3: components are [p_inspection, p_serious_given_insp,
+                        conditional_penalty_norm, conditional_gravity_norm].
+    Uses conditional (given inspection) predictions to avoid P(inspection)
+    suppressing the signal from the risk heads.
+
     Constraints:
       * All weights ≥ 0.0 (non-negative combination)
       * Sum of weights = 1.0 (convex combination)
@@ -1310,17 +1353,17 @@ def _optimize_weights(
 
     # Pre-compute component arrays (vectorized)
     p_insp    = np.array([p.get("pred_p_inspection", 1.0) for p in pred_batch])
-    p_ser_unc = np.array([p.get("p_serious_unconditional",
+    p_ser     = np.array([p.get("pred_p_serious_given_insp",
                                  p.get("p_serious_wr_event", 0.0)) for p in pred_batch])
-    exp_pen   = np.array([p.get("expected_penalty",
-                                 p.get("expected_penalty_usd", 0.0)) for p in pred_batch])
-    exp_grav  = np.array([p.get("expected_gravity",
-                                 p.get("gravity_score", 0.0)) for p in pred_batch])
+    cond_pen  = np.array([p.get("conditional_penalty",
+                                 p.get("expected_penalty", 0.0)) for p in pred_batch])
+    cond_grav = np.array([p.get("conditional_gravity",
+                                 p.get("expected_gravity", 0.0)) for p in pred_batch])
 
-    pen_norm  = exp_pen / (exp_pen + _PENALTY_REF_USD)
-    grav_norm = exp_grav / (exp_grav + _GRAVITY_REF)
+    pen_norm  = cond_pen / (cond_pen + _PENALTY_REF_USD)
+    grav_norm = cond_grav / (cond_grav + _GRAVITY_REF)
 
-    comps = np.column_stack([p_insp, p_ser_unc, pen_norm, grav_norm])  # n × 4
+    comps = np.column_stack([p_insp, p_ser, pen_norm, grav_norm])  # n × 4
 
     def neg_spearman(w4: np.ndarray) -> float:
         w = w4 / w4.sum()

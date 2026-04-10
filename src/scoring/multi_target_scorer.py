@@ -486,12 +486,13 @@ class MultiTargetRiskScorer:
         )
 
         # 2b: conditional log-penalty GBR — trained on positive-penalty rows only.
-        # Uses Huber loss (robust conditional mean) instead of quantile P80.
-        # This fixes the systematic over-prediction in the monetary scatter plot.
+        # Uses quantile(α=0.75) loss to target the 75th percentile of the
+        # conditional log(penalty) distribution — better upper-tail coverage than
+        # Huber mean, reducing the scatter-plot compression issue.
         pos_mask_tr = y_logp[train_idx] > 0
         n_pos_pen = int(pos_mask_tr.sum())
         logger.info(
-            "  [MultiTargetScorer] Training Head 2b: conditional log-penalty GBR (%s positive-penalty rows, Huber loss) …",
+            "  [MultiTargetScorer] Training Head 2b: conditional log-penalty GBR (%s positive-penalty rows, quantile α=0.75) …",
             f"{n_pos_pen:,}",
         )
         if n_pos_pen >= 20:

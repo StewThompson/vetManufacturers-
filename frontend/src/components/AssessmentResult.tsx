@@ -226,7 +226,7 @@ export function RiskTargetsPanel({ targets }: { targets: ProbabilisticRiskTarget
             label="Expected Penalty (12 mo)"
             value={`$${targets.expected_penalty_usd_12m.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
             level={penaltyLevel}
-            sub={`Head 2a · hurdle model estimate; industry P90 = $${targets.industry_p90_penalty.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
+            sub={`Head 2a×2b · hurdle × conditional log-penalty estimate; industry P90 = $${targets.industry_p90_penalty.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
           />
         </div>
       </div>

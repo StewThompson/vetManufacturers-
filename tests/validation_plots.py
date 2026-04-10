@@ -225,7 +225,7 @@ def _plot_regression_heads(rw_data: RealWorldData, plots_dir: str,
     # causing vertical-stripe artifacts and misleading ρ/r values because the
     # gravity head was being compared against a different composite target.
     actual_gravity = np.array([
-        o.get("future_gravity_weighted_score", 0.0) or 0.0
+        o.get("future_gravity_weighted_score", 0.0)
         for o in rw_data.paired_outcomes
     ])
 

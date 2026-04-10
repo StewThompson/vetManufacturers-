@@ -396,13 +396,37 @@ def _plot_score_decile_adverse(rw_data: RealWorldData, plots_dir: str) -> str:
 # ====================================================================== #
 
 def _plot_stage1_inspection(rw_data: RealWorldData, plots_dir: str,
-                            preds: list) -> str:
-    """Stage 1 evaluation: ROC-AUC, PR-AUC, and calibration curve for
-    the inspection exposure model (CONDITIONAL label: was this establishment
-    inspected in the future window?)."""
-    from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+                            preds: list,
+                            mt_scorer: "MultiTargetRiskScorer | None" = None) -> str:
+    """Stage 1 evaluation: ROC-AUC and calibration-decile plot for the
+    inspection exposure head.
 
-    if not preds or "pred_p_inspection" not in preds[0]:
+    The inspection head predicts P(≥1 future inspection).  In the paired
+    subset every establishment was inspected (has_future_data=True), so
+    there is zero target variance and ROC is meaningless.  We therefore
+    evaluate on the **full** historical population (inspected + non-
+    inspected) using ``has_future_data`` as the binary ground truth.
+    """
+    from sklearn.metrics import roc_curve, auc
+
+    # ── Score the FULL population through the inspection head ──────────
+    # The paired subset has has_future_data ≡ 1, so it cannot discriminate.
+    # We need both inspected AND non-inspected establishments.
+    full_p_insp = None
+    full_y_insp = None
+
+    if mt_scorer is not None and len(rw_data.hist_X) > 0:
+        hist_X_log = MLRiskScorer._log_transform_features(
+            np.nan_to_num(rw_data.hist_X, nan=0.0)
+        )
+        full_preds = mt_scorer.predict_batch(hist_X_log)
+        full_p_insp = np.array([p["pred_p_inspection"] for p in full_preds])
+        full_y_insp = np.array([
+            1 if o["has_future_data"] else 0
+            for o in rw_data.future_outcomes
+        ])
+
+    if full_p_insp is None or full_y_insp is None:
         fig, ax = plt.subplots(figsize=FIG_SIZE)
         ax.text(0.5, 0.5, "Stage 1 predictions not available", ha="center",
                 va="center", transform=ax.transAxes, fontsize=FONT_LABEL)
@@ -410,52 +434,78 @@ def _plot_stage1_inspection(rw_data: RealWorldData, plots_dir: str,
         fig.savefig(path, dpi=FIG_DPI); plt.close(fig)
         return path
 
-    # For the paired subset, future_has_inspection is always 1 — so we need
-    # to check if we have a mix of inspected/not-inspected in the full data.
-    # Since validation_plots only has the paired subset, we plot ROC vs
-    # the SWR flag to show that inspection probability discriminates risk.
-    p_insp = np.array([p["pred_p_inspection"] for p in preds])
-    swr    = rw_data.paired_swr_flags
-
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    # Panel A: ROC curve (inspection prob vs SWR outcome)
+    # ── Panel A: ROC (pred_p_inspection vs actual has_future_data) ─────
     ax = axes[0]
-    n_pos = int(swr.sum())
-    if n_pos >= 5 and len(np.unique(swr)) >= 2:
-        fpr, tpr, _ = roc_curve(swr, p_insp)
+    n_pos = int(full_y_insp.sum())
+    n_neg = len(full_y_insp) - n_pos
+    if n_pos >= 5 and n_neg >= 5:
+        fpr, tpr, _ = roc_curve(full_y_insp, full_p_insp)
         roc_auc_val = auc(fpr, tpr)
         ax.plot(fpr, tpr, color=COLOR_WR, linewidth=2.2,
-                label=f"Inspection exposure\nAUROC={roc_auc_val:.3f}")
+                label=f"P(inspection)\nAUROC={roc_auc_val:.3f}\n"
+                      f"n+={n_pos:,}  n−={n_neg:,}")
+    else:
+        ax.text(0.5, 0.5, f"Insufficient class balance\nn+={n_pos}, n−={n_neg}",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=FONT_LABEL)
     ax.plot([0, 1], [0, 1], color=COLOR_REF, linewidth=1.2, linestyle="--",
             label="Random")
     ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
     ax.set_xlabel("FPR", fontsize=FONT_LABEL)
     ax.set_ylabel("TPR", fontsize=FONT_LABEL)
-    ax.set_title("Stage 1: Inspection Exposure ROC\n(unconditional)",
+    ax.set_title("Stage 1: Inspection Exposure ROC\n(full population — inspected vs not)",
                  fontsize=FONT_LABEL, fontweight="bold")
     ax.legend(fontsize=FONT_ANNOT, loc="lower right")
     ax.grid(True, linewidth=0.5)
 
-    # Panel B: Calibration-style decile plot
+    # ── Panel B: Calibration — actual inspection rate per decile ───────
     ax = axes[1]
-    n = len(p_insp)
-    decile_labels = pd.qcut(pd.Series(p_insp).rank(method="first"),
-                            q=10, labels=False, duplicates="drop")
-    decile_means = []
+    decile_labels = pd.qcut(
+        pd.Series(full_p_insp).rank(method="first"),
+        q=10, labels=False, duplicates="drop",
+    )
+    decile_actual_rates = []
+    decile_pred_means = []
     for d in sorted(decile_labels.unique()):
-        mask = decile_labels == d
-        decile_means.append(float(p_insp[mask.values].mean()))
-    ax.bar(range(1, len(decile_means) + 1), decile_means, color=COLOR_WR,
-           edgecolor="white", width=0.7)
+        mask = (decile_labels == d).values
+        decile_actual_rates.append(float(full_y_insp[mask].mean()))
+        decile_pred_means.append(float(full_p_insp[mask].mean()))
+
+    n_deciles = len(decile_actual_rates)
+    x_pos = np.arange(1, n_deciles + 1)
+    bar_width = 0.35
+
+    bars_actual = ax.bar(x_pos - bar_width / 2, decile_actual_rates,
+                         bar_width, color=COLOR_WR, edgecolor="white",
+                         label="Actual inspection rate")
+    bars_pred = ax.bar(x_pos + bar_width / 2, decile_pred_means,
+                       bar_width, color=COLOR_PEN, edgecolor="white",
+                       alpha=0.7, label="Mean predicted P(insp)")
+
+    # Annotate actual rates
+    y_max = max(max(decile_actual_rates), max(decile_pred_means)) if decile_actual_rates else 1.0
+    for bar, rate in zip(bars_actual, decile_actual_rates):
+        bx = bar.get_x() + bar.get_width() / 2
+        ax.text(bx, bar.get_height() + y_max * 0.01, f"{rate:.0%}",
+                ha="center", va="bottom", fontsize=FONT_ANNOT - 1, fontweight="bold")
+
+    pop_rate = float(full_y_insp.mean())
+    ax.axhline(y=pop_rate, color=COLOR_REF, linewidth=1.5, linestyle="--",
+               label=f"Population rate ({pop_rate:.0%})")
+
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([f"D{i}" for i in x_pos], fontsize=FONT_TICK)
     ax.set_xlabel("Predicted Inspection Prob Decile", fontsize=FONT_LABEL)
-    ax.set_ylabel("Mean P(inspection)", fontsize=FONT_LABEL)
-    ax.set_title("Stage 1: Inspection Probability Deciles",
+    ax.set_ylabel("Inspection Rate", fontsize=FONT_LABEL)
+    ax.set_title("Stage 1: Actual vs Predicted Inspection Rate\n(calibration by decile)",
                  fontsize=FONT_LABEL, fontweight="bold")
+    ax.legend(fontsize=FONT_ANNOT, loc="upper left")
     ax.grid(True, axis="y", linewidth=0.5)
 
-    fig.suptitle("Stage 1 — Inspection Exposure Model", fontsize=FONT_TITLE,
-                 fontweight="bold")
+    fig.suptitle("Stage 1 — Inspection Exposure Model  (full population)",
+                 fontsize=FONT_TITLE, fontweight="bold")
     fig.tight_layout()
     path = os.path.join(plots_dir, "05_stage1_inspection_exposure.png")
     fig.savefig(path, dpi=FIG_DPI); plt.close(fig)
@@ -725,7 +775,7 @@ def generate_all_validation_plots(
         ("02  Binary head ROC curves",                   lambda rd, pd: _plot_binary_head_roc(rd, pd, preds)),
         ("03  Regression head actual vs predicted",      lambda rd, pd: _plot_regression_heads(rd, pd, preds)),
         ("04  Score decile → mean adverse (decile lift)", lambda rd, pd: _plot_score_decile_adverse(rd, pd)),
-        ("05  Stage 1: Inspection exposure",             lambda rd, pd: _plot_stage1_inspection(rd, pd, preds)),
+        ("05  Stage 1: Inspection exposure",             lambda rd, pd: _plot_stage1_inspection(rd, pd, preds, mt_scorer)),
         ("06  Stage 2: Violation given inspection",      lambda rd, pd: _plot_stage2_violation(rd, pd, preds)),
         ("07  Stage 3: Magnitude given violation",       lambda rd, pd: _plot_stage3_magnitude(rd, pd, preds)),
         ("08  Unconditional risk decile",                lambda rd, pd: _plot_unconditional_decile_table(rd, pd, preds)),

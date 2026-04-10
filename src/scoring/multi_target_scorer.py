@@ -85,8 +85,12 @@ _DEFAULT_W4 = 0.25   # expected_gravity_norm (= p_insp × p_viol|insp × E[grav|
 # Reference values for normalizing regression outputs to [0, 1] via
 # Michaelis-Menten saturation: x_norm = x / (x + ref).  At x == ref the
 # normalised value is 0.5; this keeps the mapping interpretable.
-_PENALTY_REF_USD = 75_000.0    # ~P80 of positive-penalty establishments (lower = more aggressive)
-_GRAVITY_REF     = 40.0        # ~P65 of gravity-weighted severity scores (lower = more aggressive)
+# Reference values for Michaelis-Menten saturation (derived from
+# pre-2022 training population distributions):
+# _PENALTY_REF_USD ≈ P80 of non-zero future total penalty
+# _GRAVITY_REF     ≈ P65 of non-zero future gravity-weighted score
+_PENALTY_REF_USD = 75_000.0    # lower = more aggressive separation
+_GRAVITY_REF     = 40.0        # lower = more aggressive separation
 
 # Target prevalence for the injury/fatality head calibration.
 # The model is trained on post-2022 outcomes (~6% injury rate) but the
@@ -1331,9 +1335,8 @@ def _optimize_weights(
         for w2 in np.arange(0.0, 1.0 - w1 + step, step):
             for w3 in np.arange(0.0, 1.0 - w1 - w2 + step, step):
                 w4 = 1.0 - w1 - w2 - w3
-                if w4 < -0.001:
+                if w4 < 0.0:
                     continue
-                w4 = max(0.0, w4)
                 trial = np.array([w1, w2, w3, w4])
                 scores = comps @ trial
                 rho, _ = spearmanr(scores, y_adv)

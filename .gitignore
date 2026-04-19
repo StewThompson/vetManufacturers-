@@ -1,6 +1,6 @@
 OshaData/
 ml_cache/
-
+.env
 # Frontend
 frontend/node_modules/
 frontend/dist/

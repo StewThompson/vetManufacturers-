@@ -115,8 +115,10 @@ def _compute_multi_targets(
     future_viols: List[dict],
     any_injury_fatal: bool,
     n_future_insp: int,
+    penalty_thresholds: Optional[Dict] = None,
+    naics_2digit: Optional[str] = None,
 ) -> Dict[str, float]:
-    """Compute all 6 target variables from post-cutoff violations and injuries.
+    """Compute all target variables from post-cutoff violations and injuries.
 
     Parameters
     ----------
@@ -127,8 +129,9 @@ def _compute_multi_targets(
         hospitalized or fatal injury (from ``_build_hosp_fatal_stats``).
     n_future_insp : int
         Number of post-cutoff inspections.
-    penalty_thresholds : dict
+    penalty_thresholds : dict, optional
         Output of ``penalty_percentiles.compute_penalty_percentiles()``.
+        When provided, computes is_moderate/large/extreme_penalty tier labels.
     naics_2digit : str or None
         2-digit NAICS sector for per-industry threshold lookup.
 
@@ -136,7 +139,9 @@ def _compute_multi_targets(
     -------
     dict with keys:
         any_wr_serious, future_total_penalty, log_penalty,
-        any_injury_fatal, gravity_weighted_score, real_label_raw, real_label
+        any_injury_fatal, gravity_weighted_score,
+        is_moderate_penalty, is_large_penalty, is_extreme_penalty,
+        real_label_raw, real_label
     """
     total_penalty = sum(
         float(v.get("current_penalty") or v.get("initial_penalty") or 0)
@@ -160,6 +165,16 @@ def _compute_multi_targets(
         weight = 3.0 if vt in ("W", "R") else (2.0 if vt == "S" else 1.0)
         grav_total += g * weight
 
+    # Penalty tier labels using per-NAICS percentile thresholds
+    is_moderate = is_large = is_extreme = 0
+    if penalty_thresholds is not None:
+        t75 = lookup_threshold(penalty_thresholds, naics_2digit, "p75")
+        t90 = lookup_threshold(penalty_thresholds, naics_2digit, "p90")
+        t95 = lookup_threshold(penalty_thresholds, naics_2digit, "p95")
+        is_moderate = int(total_penalty >= t75)
+        is_large    = int(total_penalty >= t90)
+        is_extreme  = int(total_penalty >= t95)
+
     # Composite adverse (for calibration / backward compat)
     # Pass 0 fatalities for the composite calc — injury data now drives p_injury
     raw_adv   = _compute_adverse(future_viols, 0, n_future_insp)
@@ -171,6 +186,9 @@ def _compute_multi_targets(
         "log_penalty":           math.log1p(total_penalty),
         "any_injury_fatal":      int(any_injury_fatal),
         "gravity_weighted_score": grav_total,
+        "is_moderate_penalty":   is_moderate,
+        "is_large_penalty":      is_large,
+        "is_extreme_penalty":    is_extreme,
         # Kept for diagnostics / weight optimization
         "real_label_raw":  raw_adv,
         "real_label":      real_label,
@@ -198,7 +216,7 @@ def _build_fingerprint(
         "sample_size": sample_size,
         "insp_mtime":  _mtime(inspections_path),
         "viol_mtime":  _mtime(violations_path),
-        "schema":      "multi_target_v2",  # bumped: p_injury + p_gravity heads
+        "schema":      "multi_target_v3",  # bumped: penalty tier labels populated
     }
 
 
@@ -352,6 +370,8 @@ def build_multi_target_sample(
         naics_2d = naics_group[:2] if naics_group else None
         targets = _compute_multi_targets(
             fut_viols, fut_any_injury, len(future_insp),
+            penalty_thresholds=penalty_thresholds,
+            naics_2digit=naics_2d,
         )
 
         rows_raw.append({
